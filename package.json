@@ -1,0 +1,63 @@
+{
+  "name": "pi-tasked-subagents",
+  "version": "0.0.0",
+  "description": "Plan-first subagent orchestration for Pi: phases contain tasks, and tasks are assigned to background subagents with evidence.",
+  "license": "MIT",
+  "author": "bnema",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "subagents",
+    "orchestration",
+    "planning",
+    "task-assignments"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bnema/pi-tasked-subagents.git"
+  },
+  "homepage": "https://github.com/bnema/pi-tasked-subagents",
+  "bugs": {
+    "url": "https://github.com/bnema/pi-tasked-subagents/issues"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.78.0 <1",
+    "@earendil-works/pi-coding-agent": ">=0.78.0 <1",
+    "@earendil-works/pi-tui": ">=0.78.0 <1",
+    "typebox": ">=1.1.0 <2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.78.1",
+    "@earendil-works/pi-coding-agent": "^0.78.1",
+    "@earendil-works/pi-tui": "^0.78.1",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.13.0",
+    "eslint": "^10.5.0",
+    "typebox": "^1.2.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.61.1",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "lint": "eslint \"{extensions,src,tests}/**/*.ts\" --max-warnings=0",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "verify": "npm run typecheck && npm test && npm run lint"
+  }
+}
