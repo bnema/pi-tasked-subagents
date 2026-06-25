@@ -145,6 +145,44 @@ function findAssignment(state: TaskedSubagentsState, id: string): { plan: PlanRe
   return undefined;
 }
 
+function assignmentsForTask(plan: PlanRecord, task: PlanRecord["phases"][number]["tasks"][number]): TaskAssignmentRecord[] {
+  return task.assignmentIds
+    .map((assignmentId) => plan.assignments.find((assignment) => assignment.id === assignmentId))
+    .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
+}
+
+function assignmentSummaryLine(plan: PlanRecord, assignment: TaskAssignmentRecord): string {
+  const task = plan.phases.flatMap((phase) => phase.tasks).find((candidate) => candidate.id === assignment.taskId);
+  const summary = assignment.result?.summary ? ` · ${shortTitle(assignment.result.summary, 80)}` : "";
+  return `${assignment.id} · ${statusLabel(assignment.status)} · ${assignment.taskId}${task?.text ? ` · ${shortTitle(task.text, 80)}` : ""}${summary}`;
+}
+
+function taskAssignmentSummary(plan: PlanRecord, task: PlanRecord["phases"][number]["tasks"][number]): string {
+  const assignmentIds = assignmentsForTask(plan, task).map((assignment) => assignment.id);
+  return assignmentIds.length > 0 ? assignmentIds.join(", ") : "no assignment";
+}
+
+function assignmentsForTarget(state: TaskedSubagentsState, targetId: string): TaskAssignmentRecord[] | undefined {
+  const assignment = findAssignment(state, targetId);
+  if (assignment) return [assignment.assignment];
+  const task = findTask(state, targetId);
+  if (task) return assignmentsForTask(task.plan, task.task);
+  const phase = findPhase(state, targetId);
+  if (phase) {
+    const ids = new Set(phase.phase.tasks.flatMap((taskRecord) => taskRecord.assignmentIds));
+    return phase.plan.assignments.filter((candidate) => ids.has(candidate.id));
+  }
+  const plan = findPlan(state, targetId);
+  if (plan) return plan.assignments;
+  return undefined;
+}
+
+export function resolveResultAssignmentId(state: TaskedSubagentsState, targetId: string): string | undefined {
+  const assignments = assignmentsForTarget(state, targetId);
+  return assignments?.length === 1 ? assignments[0].id : undefined;
+}
+
+
 export function formatStatusReport(state: TaskedSubagentsState, targetId?: string): string {
   if (state.plans.length === 0) return "No tracked plans.";
   if (targetId) {
@@ -214,8 +252,14 @@ export function formatInspectReport(state: TaskedSubagentsState, targetId: strin
 
 function formatPlanDetail(plan: PlanRecord): string {
   const lines = [`Plan: ${plan.id}`, `  title: ${plan.title}`, `  status: ${statusLabel(plan.status)}`, `  request: ${plan.request}`, `  spec: ${plan.spec}`, "", `Phases (${plan.phases.length}):`];
-  for (const phase of plan.phases) lines.push(`  ${phase.id} · ${statusLabel(phase.status)} · ${phase.title}`);
-  if (plan.assignments.length > 0) lines.push("", `Assignments: ${plan.assignments.length}`);
+  for (const phase of plan.phases) {
+    lines.push(`  ${phase.id} · ${statusLabel(phase.status)} · ${phase.title}`);
+    for (const task of phase.tasks) lines.push(`    ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(plan, task)} · ${task.text}`);
+  }
+  if (plan.assignments.length > 0) {
+    lines.push("", `Assignments (${plan.assignments.length}):`);
+    for (const assignment of plan.assignments) lines.push(`  ${assignmentSummaryLine(plan, assignment)}`);
+  }
   if (plan.artifacts.length > 0) lines.push(`Artifacts: ${plan.artifacts.length}`);
   return lines.join("\n");
 }
@@ -225,7 +269,13 @@ function formatPhaseDetail(plan: PlanRecord, phase: PlanRecord["phases"][number]
   if (phase.goal) lines.push(`  goal: ${phase.goal}`);
   if (phase.dependsOn.length) lines.push(`  depends on: ${phase.dependsOn.join(", ")}`);
   lines.push("", `Tasks (${phase.tasks.length}):`);
-  for (const task of phase.tasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${task.text}`);
+  for (const task of phase.tasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(plan, task)} · ${task.text}`);
+  const ids = new Set(phase.tasks.flatMap((task) => task.assignmentIds));
+  const assignments = plan.assignments.filter((assignment) => ids.has(assignment.id));
+  if (assignments.length > 0) {
+    lines.push("", `Assignments (${assignments.length}):`);
+    for (const assignment of assignments) lines.push(`  ${assignmentSummaryLine(plan, assignment)}`);
+  }
   return lines.join("\n");
 }
 
@@ -246,10 +296,19 @@ function formatAssignmentDetail(plan: PlanRecord, assignment: TaskAssignmentReco
   return lines.join("\n");
 }
 
-export function formatResultReport(state: TaskedSubagentsState, assignmentId: string): string {
-  const assignment = findAssignment(state, assignmentId);
-  if (!assignment) return `Assignment not found: ${assignmentId}. Use /tasked-subagents status to list active assignments.`;
-  return formatAssignmentDetail(assignment.plan, assignment.assignment);
+export function formatResultReport(state: TaskedSubagentsState, targetId: string): string {
+  const assignments = assignmentsForTarget(state, targetId);
+  if (!assignments) return `Assignment not found: ${targetId}. Use /tasked-subagents status to list active assignments.`;
+  if (assignments.length === 0) return `No assignments for result target: ${targetId}. Use /tasked-subagents inspect ${targetId} for details.`;
+  if (assignments.length === 1) {
+    const assignment = findAssignment(state, assignments[0].id);
+    return assignment ? formatAssignmentDetail(assignment.plan, assignment.assignment) : `Assignment not found: ${targetId}.`;
+  }
+  return [
+    `Ambiguous result target: ${targetId}. Use /tasked-subagents result <assignmentId>.`,
+    "Assignments:",
+    ...assignments.map((assignment) => `  ${assignmentSummaryLine(state.plans.find((plan) => plan.id === assignment.planId)!, assignment)}`),
+  ].join("\n");
 }
 
 export function formatContinueAcknowledgement(targetId: string, prompt: string): string {
@@ -309,7 +368,7 @@ export function buildHelpText(): string {
     "  /tasked-subagents help",
     "  /tasked-subagents status [planId|phaseId|taskId|assignmentId]",
     "  /tasked-subagents inspect <planId|phaseId|taskId|assignmentId>",
-    "  /tasked-subagents result <assignmentId>",
+    "  /tasked-subagents result <planId|phaseId|taskId|assignmentId>  (plan/phase/task must resolve to one assignment)",
     "  /tasked-subagents dispatch",
     "  /tasked-subagents stop <assignmentId>",
     "  /tasked-subagents continue <taskId|assignmentId|phaseId> <prompt>",

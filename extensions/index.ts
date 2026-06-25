@@ -22,6 +22,7 @@ import {
   formatInspectReport,
   formatResolveAcknowledgement,
   formatResultReport,
+  resolveResultAssignmentId,
   formatStatusReport,
   formatStopAcknowledgement,
   parseCommand,
@@ -197,7 +198,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
       "Use edit_plan with targetId plus a phase/task patch for targeted validated changes.",
       "After replace_plan, edit_plan, or dispatch, do not poll immediately; wait for the automatic completion/attention/failure follow-up signal.",
       "Use status for human-requested health checks, suspected stalls, or after about 60s with no signal.",
-      "Use result after a terminal follow-up signal or explicit human request.",
+      "Use result with an assignmentId, or with a planId/phaseId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",
       "Use resolve with targetId and prompt after fixing an attention/failure finding; the verification assignment decides whether the target is complete.",
       "Use continue, stop, and cancel to manage task assignments.",
       "Use list_agents to discover available subagent profile names before choosing an agentHint.",
@@ -232,12 +233,13 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           break;
         }
         case "result": {
-          const assignmentId = params.assignmentId ?? params.targetId;
-          if (!assignmentId) {
+          const target = params.assignmentId ?? params.targetId ?? params.taskId ?? params.phaseId ?? params.planId;
+          if (!target) {
             text = buildHelpText();
             break;
           }
-          text = await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId);
+          const assignmentId = resolveResultAssignmentId(controller.getState(), target);
+          text = assignmentId ? await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), target);
           break;
         }
         case "replace_plan": {
@@ -349,9 +351,15 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
         case "inspect":
           output = parsed.targetId ? formatInspectReport(controller.getState(), parsed.targetId) : buildHelpText();
           break;
-        case "result":
-          output = parsed.assignmentId ? await controller.getRunResult(parsed.assignmentId) ?? formatResultReport(controller.getState(), parsed.assignmentId) : buildHelpText();
+        case "result": {
+          if (!parsed.assignmentId) {
+            output = buildHelpText();
+            break;
+          }
+          const assignmentId = resolveResultAssignmentId(controller.getState(), parsed.assignmentId);
+          output = assignmentId ? await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), parsed.assignmentId);
           break;
+        }
         case "continue": {
           if (!parsed.targetId || !parsed.prompt) {
             output = buildHelpText();
