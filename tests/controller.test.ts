@@ -369,6 +369,29 @@ describe("TaskedSubagentsController", () => {
     expect(state.plans[0].status).toBe("completed");
   });
 
+  test("emits compact follow-up messages without raw task report JSON", async () => {
+    const launcher = new CompletingLauncher();
+    const pi = fakePi() as { sendMessage: ReturnType<typeof vi.fn> };
+    const controller = new TaskedSubagentsController(pi as never, { launcher });
+
+    await controller.acceptValidatedPlan({
+      title: "Plan",
+      spec: "Spec",
+      phases: [{ id: "main", title: "Main", tasks: [{ id: "task", text: "Do task", criteria: ["Done"] }] }],
+    });
+    await controller.awaitLastWork();
+
+    const message = pi.sendMessage.mock.calls.at(-1)?.[0] as { content?: string; display?: boolean };
+    expect(message.display).toBe(false);
+    expect(message.content).toContain("[tasked-subagents] completed: plan-1 · Plan");
+    expect(message.content).toContain("plan-1-main-task-a1");
+    expect(message.content).toContain("task done");
+    expect(message.content).toContain("Use tasked_subagents result plan-1-main-task-a1 for details.");
+    expect(message.content).not.toContain("criteriaEvidence");
+    expect(message.content).not.toContain('"planId"');
+    expect(message.content).not.toContain("{");
+  });
+
   test("one-off freeform ask becomes a one-phase one-task plan", async () => {
     const launcher = new CompletingLauncher();
     const controller = new TaskedSubagentsController(fakePi(), { launcher });

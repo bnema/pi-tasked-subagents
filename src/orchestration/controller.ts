@@ -31,6 +31,7 @@ import { PiRunnerAdapter } from "../launcher/pi-runner-adapter.js";
 import { type LauncherRuntimeContext } from "../launcher/interface.js";
 import { cloneState, createEmptyState, createStateLock, ensureState } from "../state/store.js";
 import { normalizePlanInput, validatePlanInput } from "../state/plan-validation.js";
+import { statusLabel } from "../ui/messages.js";
 import { buildFooterStatus } from "../ui/status.js";
 import { buildWidgetLines, createWidgetContent } from "../ui/widget.js";
 import { shortTitle } from "../utils/text.js";
@@ -779,7 +780,7 @@ export class TaskedSubagentsController {
       this.persistState();
       this.updateUI(ctx ?? this.lastContext);
     });
-    if (planForSignal && terminalStatus(status)) this.emitRunSignal(planForSignal, runId, status, raw);
+    if (planForSignal && terminalStatus(status)) this.emitRunSignal(planForSignal, runId, status);
   }
 
   private async markRunStatus(runId: string, status: RunStatus): Promise<void> {
@@ -801,7 +802,7 @@ export class TaskedSubagentsController {
     });
   }
 
-  private emitRunSignal(plan: PlanRecord, runId: string, status: RunStatus, raw: string | undefined): void {
+  private emitRunSignal(plan: PlanRecord, runId: string, status: RunStatus): void {
     const label = plan.status === "cancelled" || status === "cancelled"
       ? "cancelled"
       : plan.status === "failed" || status === "failed"
@@ -810,16 +811,26 @@ export class TaskedSubagentsController {
           ? "attention"
           : "completed";
     const customType = label === "completed" ? ENTRY_TYPE_COMPLETION : label === "attention" ? ENTRY_TYPE_ATTENTION : ENTRY_TYPE_FAILURE;
-    const preview = raw ? `\n\n${raw.slice(0, 1200)}` : "";
-    const assignmentIds = plan.assignments.filter((assignment) => assignment.runId === runId).map((assignment) => assignment.id);
+    const assignments = plan.assignments.filter((assignment) => assignment.runId === runId);
+    const assignmentIds = assignments.map((assignment) => assignment.id);
+    const assignmentLines = assignments.map((assignment) => {
+      const summary = assignment.result?.summary.replace(/\s+/gu, " ").trim();
+      return `- ${statusLabel(assignment.status)} ${assignment.id}${summary ? ` · ${summary}` : ""}`;
+    });
+    const detailsHint = assignmentIds.length === 1
+      ? `Use tasked_subagents result ${assignmentIds[0]} for details.`
+      : assignmentIds.length > 1
+        ? "Use tasked_subagents result <assignmentId> for details."
+        : undefined;
     try {
       this.pi.sendMessage({
         customType,
         content: [
           `[tasked-subagents] ${label}: ${plan.id} · ${plan.title}`,
-          assignmentIds.length > 0 ? `assignments: ${assignmentIds.join(", ")}` : undefined,
+          assignmentLines.length > 0 ? "assignments:" : undefined,
+          ...assignmentLines,
           `plan: ${plan.status}`,
-          preview,
+          detailsHint,
         ].filter(Boolean).join("\n"),
         display: false,
         details: { planId: plan.id, assignmentIds, status: label, routedCompletion: true },
