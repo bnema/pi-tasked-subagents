@@ -210,7 +210,7 @@ function normalizePlan(raw: unknown, index: number): PlanRecord | undefined {
 
 export function createEmptyState(): TaskedSubagentsState {
   return {
-    version: STATE_VERSION as 2,
+    version: STATE_VERSION as 3,
     plans: [],
     updatedAt: now(),
   };
@@ -221,9 +221,9 @@ export function cloneState(state: TaskedSubagentsState): TaskedSubagentsState {
 }
 
 /**
- * Normalize only valid v2 state. Older ask/run/workflow snapshots are
- * intentionally reset because the plugin is still unreleased and the v2
- * model is a clean break.
+ * Normalize only valid current-version state. Older ask/run/workflow snapshots
+ * and incompatible pre-run-handle snapshots are intentionally reset because the
+ * plugin is still unreleased and the current model is a clean break.
  */
 export function ensureState(raw: unknown): TaskedSubagentsState {
   const input = objectRecord(raw);
@@ -234,7 +234,7 @@ export function ensureState(raw: unknown): TaskedSubagentsState {
     : [];
   const currentPlanId = optionalString(input.currentPlanId);
   return {
-    version: STATE_VERSION as 2,
+    version: STATE_VERSION as 3,
     plans,
     currentPlanId: currentPlanId && plans.some((plan) => plan.id === currentPlanId) ? currentPlanId : plans.at(-1)?.id,
     updatedAt: numberValue(input.updatedAt, now()),

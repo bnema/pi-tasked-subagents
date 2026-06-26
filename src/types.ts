@@ -235,7 +235,7 @@ export interface PlanRecord {
 }
 
 export interface TaskedSubagentsState {
-  version: 2;
+  version: 3;
   plans: PlanRecord[];
   currentPlanId?: string;
   updatedAt: number;
@@ -332,45 +332,16 @@ export interface LaunchTaskGraphRequest {
   cwd?: string;
 }
 
-export interface SubagentMessageTarget {
-  assignmentId?: string;
-  agentPath?: string;
-}
-
-export interface SubagentMessageOptions {
-  triggerTurn?: boolean;
-}
-
-export interface SubagentActivityWaitOptions {
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  ctx?: unknown;
-}
-
-export interface SubagentActivityWaitResult {
-  timedOut: boolean;
-  message: string;
-}
-
-export interface SubagentRuntime {
-  launchTaskGraph(request: LaunchTaskGraphRequest, ctx: unknown): Promise<SubagentRunHandle>;
-  stopRun(handle: SubagentRunHandle, ctx: unknown): Promise<boolean>;
-  cancelRun(handle: SubagentRunHandle, ctx: unknown): Promise<boolean>;
-  sendMessage?(
-    target: SubagentMessageTarget,
-    message: string,
-    options?: SubagentMessageOptions,
-  ): Promise<boolean>;
-  waitForActivity?(
-    handle: SubagentRunHandle | undefined,
-    options?: SubagentActivityWaitOptions,
-  ): Promise<SubagentActivityWaitResult>;
+export interface SubagentRuntime<Context = unknown> {
+  launchTaskGraph(request: LaunchTaskGraphRequest, ctx: Context): Promise<SubagentRunHandle>;
+  stopRun(handle: SubagentRunHandle, ctx: Context): Promise<boolean>;
+  cancelRun(handle: SubagentRunHandle, ctx: Context): Promise<boolean>;
   waitForRunSignal(
     handle: SubagentRunHandle | undefined,
     options?: {
       timeoutMs?: number;
       signal?: AbortSignal;
-      ctx?: unknown;
+      ctx?: Context;
       onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void>;
     },
   ): Promise<RunStatus>;

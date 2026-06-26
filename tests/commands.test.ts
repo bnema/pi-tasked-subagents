@@ -4,7 +4,7 @@ import { buildHelpText, formatAgentsReport, formatInspectReport, formatResultRep
 import type { TaskedSubagentsState } from "../src/types.js";
 
 const state: TaskedSubagentsState = {
-  version: 2,
+  version: 3,
   currentPlanId: "plan-1",
   updatedAt: 1,
   plans: [{

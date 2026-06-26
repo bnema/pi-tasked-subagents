@@ -4,8 +4,8 @@ import { ENTRY_TYPE_STATE } from "../src/defaults.js";
 import { buildStateEntryData, restoreStateFromSessionEntries, stateFromEntryData } from "../src/state/persistence.js";
 import { createEmptyState, deserializeState, ensureState, serializeState } from "../src/state/store.js";
 
-const v2State = {
-  version: 2 as const,
+const currentState = {
+  version: 3 as const,
   plans: [{
     id: "plan-1",
     title: "Plan",
@@ -25,31 +25,36 @@ const v2State = {
 describe("plan-first state store", () => {
   test("creates empty v2 state", () => {
     const state = createEmptyState();
-    expect(state.version).toBe(2);
+    expect(state.version).toBe(3);
     expect(state.plans).toEqual([]);
   });
 
   test("resets old ask/run state instead of migrating", () => {
     const state = ensureState({ version: 1, asks: [{ id: "ask-1" }], runRegistry: { runs: [] }, updatedAt: 1 });
-    expect(state).toMatchObject({ version: 2, plans: [] });
+    expect(state).toMatchObject({ version: 3, plans: [] });
   });
 
-  test("round-trips valid v2 state", () => {
-    const serialized = serializeState(v2State);
+  test("round-trips valid v3 state", () => {
+    const serialized = serializeState(currentState);
     expect(deserializeState(serialized).plans[0].id).toBe("plan-1");
+  });
+
+  test("resets serialized v2 state to empty current-version state", () => {
+    const serialized = JSON.stringify({ ...currentState, version: 2 });
+    expect(deserializeState(serialized)).toEqual(createEmptyState());
   });
 
   test("restores last custom state entry", () => {
     const restored = restoreStateFromSessionEntries([
       { type: "custom", customType: ENTRY_TYPE_STATE, data: createEmptyState() },
-      { type: "custom", customType: ENTRY_TYPE_STATE, data: v2State },
+      { type: "custom", customType: ENTRY_TYPE_STATE, data: currentState },
     ]);
     expect(restored.currentPlanId).toBe("plan-1");
   });
 
   test("builds appendEntry data with plans only", () => {
-    expect(buildStateEntryData(v2State)).toEqual(v2State);
-    expect(stateFromEntryData(JSON.stringify(v2State)).plans).toHaveLength(1);
+    expect(buildStateEntryData(currentState)).toEqual(currentState);
+    expect(stateFromEntryData(JSON.stringify(currentState)).plans).toHaveLength(1);
   });
 
   test("malformed JSON string input throws a clear error", () => {
@@ -58,12 +63,12 @@ describe("plan-first state store", () => {
 
   test("currentPlanId falls back to the last valid plan when stored id is missing", () => {
     const restored = ensureState({
-      version: 2,
+      version: 3,
       currentPlanId: "missing",
       updatedAt: 1,
       plans: [
-        { ...v2State.plans[0], id: "plan-1" },
-        { ...v2State.plans[0], id: "plan-2" },
+        { ...currentState.plans[0], id: "plan-1" },
+        { ...currentState.plans[0], id: "plan-2" },
       ],
     });
 
@@ -72,11 +77,11 @@ describe("plan-first state store", () => {
 
   test("invalid nested assignment and evidence entries are dropped without crashing", () => {
     const restored = ensureState({
-      version: 2,
+      version: 3,
       currentPlanId: "plan-1",
       updatedAt: 1,
       plans: [{
-        ...v2State.plans[0],
+        ...currentState.plans[0],
         phases: [{
           id: "phase",
           title: "Phase",

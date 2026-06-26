@@ -13,6 +13,8 @@ function fakePi() {
 
 class CompletingRuntime implements SubagentRuntime {
   requests: LaunchTaskGraphRequest[] = [];
+  waitHandles: Array<SubagentRunHandle | undefined> = [];
+  resultHandles: SubagentRunHandle[] = [];
 
   async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
     this.requests.push(request);
@@ -27,7 +29,8 @@ class CompletingRuntime implements SubagentRuntime {
   async stopRun(_handle: SubagentRunHandle, _ctx?: unknown): Promise<boolean> { return true; }
   async cancelRun(_handle: SubagentRunHandle, _ctx?: unknown): Promise<boolean> { return true; }
 
-  async waitForRunSignal(_handle: SubagentRunHandle | undefined, options?: { onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void> }): Promise<RunStatus> {
+  async waitForRunSignal(handle: SubagentRunHandle | undefined, options?: { onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void> }): Promise<RunStatus> {
+    this.waitHandles.push(handle);
     const request = this.requests[this.requests.length - 1]!;
     await options?.onUpdate?.({
       runId: request.runId,
@@ -37,7 +40,8 @@ class CompletingRuntime implements SubagentRuntime {
     return "completed";
   }
 
-  async getRunResult(_handle: SubagentRunHandle): Promise<string | undefined> {
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
     const request = this.requests[this.requests.length - 1]!;
     const reports = request.tasks.map((task) => JSON.stringify({
       planId: "plan-1",
@@ -234,9 +238,21 @@ class StaleRunningRuntime extends CompletingRuntime {
   }
 }
 
+function mixedLaunchRef(): SubagentRunHandle {
+  return {
+    runId: "run-1",
+    asyncId: "run-1",
+    resultPath: "/tmp/run-1.json",
+    assignments: [
+      { assignmentId: "a1", runId: "run-1", resultPath: "/tmp/run-1.json" },
+      { assignmentId: "a2", runId: "run-1" },
+    ],
+  };
+}
+
 function restoreMixedRun(controller: TaskedSubagentsController, activeStatus: "running" | "attention" | "failed" | "blocked" | "cancelled" = "running", launchRef?: SubagentRunHandle) {
   controller.restoreState({
-    version: 2,
+    version: 3,
     currentPlanId: "plan-1",
     updatedAt: 1,
     plans: [{
@@ -369,6 +385,23 @@ describe("TaskedSubagentsController", () => {
     const state = controller.getState();
     expect(state.plans[0].phases[0].tasks[0].status).toBe("completed");
     expect(state.plans[0].status).toBe("completed");
+  });
+
+  test("passes the persisted launch handle through wait and result collection", async () => {
+    const runtime = new CompletingRuntime();
+    const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
+
+    await controller.acceptValidatedPlan({
+      title: "Plan",
+      spec: "Spec",
+      phases: [{ id: "main", title: "Main", tasks: [{ id: "task", text: "Do task", criteria: ["Done"] }] }],
+    });
+    await controller.awaitLastWork();
+
+    const launchRef = controller.getState().plans[0].assignments[0].launchRef;
+    expect(launchRef).toEqual(expect.objectContaining({ runId: runtime.requests[0].runId }));
+    expect(runtime.waitHandles).toEqual([launchRef]);
+    expect(runtime.resultHandles).toEqual([launchRef]);
   });
 
   test("emits compact follow-up messages without raw task report JSON", async () => {
@@ -673,7 +706,7 @@ describe("TaskedSubagentsController", () => {
   test("replacing phase tasks removes assignments and artifacts for old phase tasks", async () => {
     const controller = new TaskedSubagentsController(fakePi(), { launcher: new CompletingRuntime() });
     controller.restoreState({
-      version: 2,
+      version: 3,
       currentPlanId: "plan-1",
       updatedAt: 1,
       plans: [{
@@ -758,7 +791,7 @@ describe("TaskedSubagentsController", () => {
     const runtime = new CompletingRuntime();
     const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
     controller.restoreState({
-      version: 2,
+      version: 3,
       currentPlanId: "plan-1",
       updatedAt: 1,
       plans: [{
@@ -814,8 +847,9 @@ describe("TaskedSubagentsController", () => {
   test("stop preserves completed assignments while pausing active assignments in the same run", async () => {
     const runtime = new StopSpyRuntime();
     const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
+    const launchRef = mixedLaunchRef();
     controller.restoreState({
-      version: 2,
+      version: 3,
       currentPlanId: "plan-1",
       updatedAt: 1,
       plans: [{
@@ -865,6 +899,7 @@ describe("TaskedSubagentsController", () => {
             prompt: "done",
             status: "completed",
             runId: "run-1",
+            launchRef,
             result: { assignmentId: "a1", status: "completed", summary: "done", criteriaEvidence: [{ criteriaIndex: 0, criterionId: "C1", evidence: "done" }], artifacts: [], followUps: [], createdAt: 1 },
             createdAt: 1,
             updatedAt: 1,
@@ -878,6 +913,7 @@ describe("TaskedSubagentsController", () => {
             prompt: "active",
             status: "running",
             runId: "run-1",
+            launchRef,
             createdAt: 1,
             updatedAt: 1,
           },
@@ -915,7 +951,7 @@ describe("TaskedSubagentsController", () => {
   test("cancel resolves an assignment id to its owning run handle and cancels non-final assignments in the same run", async () => {
     const runtime = new CancelSpyRuntime();
     const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
-    restoreMixedRun(controller);
+    restoreMixedRun(controller, "running", mixedLaunchRef());
 
     await expect(controller.cancelRun("a2")).resolves.toBe(true);
 
@@ -957,7 +993,7 @@ describe("TaskedSubagentsController", () => {
     expect(runtime.cancelled[0]).toEqual(launchRef);
   });
 
-  test("cancel augments a persisted launchRef missing assignments", async () => {
+  test("cancel rejects a persisted launchRef missing assignments", async () => {
     const runtime = new CancelSpyRuntime();
     const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
     const launchRef = {
@@ -967,41 +1003,61 @@ describe("TaskedSubagentsController", () => {
     } as SubagentRunHandle;
     restoreMixedRun(controller, "running", launchRef);
 
-    await expect(controller.cancelRun("a1")).resolves.toBe(true);
+    await expect(controller.cancelRun("a1")).resolves.toBe(false);
 
-    expect(runtime.cancelled[0]).toEqual({
-      runId: "run-1",
-      asyncId: "async-1",
-      resultPath: "/tmp/persisted-run-1.json",
-      assignments: [
-        { assignmentId: "a1", runId: "run-1", resultPath: "/tmp/run-1.json" },
-        { assignmentId: "a2", runId: "run-1", resultPath: undefined },
-      ],
-    });
+    expect(runtime.cancelled).toEqual([]);
   });
 
-  test("cancel builds a compatible fallback handle from legacy runId-only restored assignment state", async () => {
+  test("cancel rejects legacy runId-only restored assignment state", async () => {
     const runtime = new CancelSpyRuntime();
     const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
     restoreMixedRun(controller);
 
-    await expect(controller.cancelRun("a1")).resolves.toBe(true);
+    await expect(controller.cancelRun("a1")).resolves.toBe(false);
 
-    expect(runtime.cancelled).toEqual([{
-      runId: "run-1",
-      asyncId: "run-1",
-      resultPath: "/tmp/run-1.json",
-      assignments: [
-        { assignmentId: "a1", runId: "run-1", resultPath: "/tmp/run-1.json" },
-        { assignmentId: "a2", runId: "run-1", resultPath: undefined },
-      ],
-    }]);
+    expect(runtime.cancelled).toEqual([]);
+  });
+
+  test("cancel rejects a launchRef whose run id does not match the assignment", async () => {
+    const runtime = new CancelSpyRuntime();
+    const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
+    restoreMixedRun(controller, "running", { ...mixedLaunchRef(), runId: "other-run" });
+
+    await expect(controller.cancelRun("a1")).resolves.toBe(false);
+
+    expect(runtime.cancelled).toEqual([]);
+  });
+
+  test("cancel rejects a launchRef missing the target assignment", async () => {
+    const runtime = new CancelSpyRuntime();
+    const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
+    restoreMixedRun(controller, "running", {
+      ...mixedLaunchRef(),
+      assignments: [{ assignmentId: "a2", runId: "run-1" }],
+    });
+
+    await expect(controller.cancelRun("a1")).resolves.toBe(false);
+
+    expect(runtime.cancelled).toEqual([]);
+  });
+
+  test("cancel rejects a launchRef when the assignment has no run id", async () => {
+    const runtime = new CancelSpyRuntime();
+    const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
+    restoreMixedRun(controller, "running", mixedLaunchRef());
+    const state = controller.getState();
+    delete state.plans[0].assignments[0].runId;
+    controller.restoreState(state);
+
+    await expect(controller.cancelRun("a1")).resolves.toBe(false);
+
+    expect(runtime.cancelled).toEqual([]);
   });
 
   test("failed stop and cancel runtime returns do not mutate state", async () => {
     const runtime = new RefusingControlRuntime();
     const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
-    restoreMixedRun(controller);
+    restoreMixedRun(controller, "running", mixedLaunchRef());
     const beforeStop = JSON.stringify(controller.getState());
 
     await expect(controller.stopRun("a2")).resolves.toBe(false);
@@ -1109,7 +1165,7 @@ describe("TaskedSubagentsController", () => {
     const runtime = new CompletingRuntime();
     const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
     controller.restoreState({
-      version: 2,
+      version: 3,
       currentPlanId: "plan-1",
       updatedAt: 1,
       plans: [{

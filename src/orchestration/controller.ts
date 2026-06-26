@@ -29,6 +29,7 @@ import type {
   ValidatedPlanInput,
 } from "../types.js";
 import { PiRunnerAdapter } from "../launcher/pi-runner-adapter.js";
+import type { RunnerRuntimeContext } from "../launcher/interface.js";
 import { cloneState, createEmptyState, createStateLock, ensureState } from "../state/store.js";
 import { normalizePlanInput, validatePlanInput } from "../state/plan-validation.js";
 import { statusLabel } from "../ui/messages.js";
@@ -61,14 +62,15 @@ export interface DispatchResult {
 }
 
 export interface TaskedSubagentsControllerOptions {
-  launcher?: SubagentRuntime;
+  runtime?: SubagentRuntime<RunnerRuntimeContext>;
+  launcher?: SubagentRuntime<RunnerRuntimeContext>;
   defaultAgent?: string;
 }
 
 const DEFAULT_OPTIONS = {
   runtime: new PiRunnerAdapter(),
   defaultAgent: "delegate",
-} satisfies { runtime: SubagentRuntime; defaultAgent: string };
+} satisfies { runtime: SubagentRuntime<RunnerRuntimeContext>; defaultAgent: string };
 
 function terminalStatus(status: RunStatus): boolean {
   return status !== "queued" && status !== "running";
@@ -265,7 +267,7 @@ function buildResolutionPrompt(plan: PlanRecord, task: TaskRecord, prompt: strin
 export class TaskedSubagentsController {
   private state: TaskedSubagentsState = createEmptyState();
   private readonly lock = createStateLock();
-  private readonly runtime: SubagentRuntime;
+  private readonly runtime: SubagentRuntime<RunnerRuntimeContext>;
   private readonly defaultAgent: string;
   private readonly pi: ExtensionAPI;
   private planCounter = 0;
@@ -275,7 +277,7 @@ export class TaskedSubagentsController {
 
   constructor(pi: ExtensionAPI, options?: TaskedSubagentsControllerOptions) {
     this.pi = pi;
-    this.runtime = options?.launcher ?? DEFAULT_OPTIONS.runtime;
+    this.runtime = options?.runtime ?? options?.launcher ?? DEFAULT_OPTIONS.runtime;
     this.defaultAgent = options?.defaultAgent ?? DEFAULT_OPTIONS.defaultAgent;
   }
 
@@ -775,7 +777,7 @@ export class TaskedSubagentsController {
       }
       derivePlanStatus(plan, timestamp);
 
-      planForSignal = cloneState({ version: 2, plans: [plan], currentPlanId: plan.id, updatedAt: plan.updatedAt }).plans[0];
+      planForSignal = cloneState({ version: 3, plans: [plan], currentPlanId: plan.id, updatedAt: plan.updatedAt }).plans[0];
       this.persistState();
       this.updateUI(ctx ?? this.lastContext);
     });
@@ -839,7 +841,7 @@ export class TaskedSubagentsController {
     }
   }
 
-  private runtimeContext(ctx?: ExtensionContext): { pi: ExtensionAPI; cwd: string; sessionId: string; currentModelProvider?: string } {
+  private runtimeContext(ctx?: ExtensionContext): RunnerRuntimeContext {
     return {
       pi: this.pi,
       cwd: ctx?.cwd ?? process.cwd(),
@@ -858,29 +860,14 @@ export class TaskedSubagentsController {
     for (const plan of this.state.plans) {
       const assignment = plan.assignments.find((candidate) => candidate.id === assignmentId);
       if (!assignment) continue;
-      const launchRef = assignment.launchRef as Partial<SubagentRunHandle> | undefined;
-      const runId = launchRef?.runId ?? assignment.runId;
-      if (!runId) return undefined;
-      const sameRunAssignments = plan.assignments.filter((candidate) => (candidate.launchRef?.runId ?? candidate.runId) === runId);
-      const resultPath = launchRef?.resultPath
-        ?? assignment.result?.rawResultPath
-        ?? sameRunAssignments.find((candidate) => candidate.result?.rawResultPath)?.result?.rawResultPath;
-      const runAssignments = Array.isArray(launchRef?.assignments) && launchRef.assignments.length > 0
-        ? launchRef.assignments
-        : sameRunAssignments.map((candidate) => ({
-          assignmentId: candidate.id,
-          runId: candidate.runId ?? runId,
-          resultPath: candidate.result?.rawResultPath,
-        }));
-      return {
-        runId,
-        asyncId: launchRef?.asyncId ?? runId,
-        asyncDir: launchRef?.asyncDir,
-        resultPath,
-        sessionFile: launchRef?.sessionFile,
-        artifactPath: launchRef?.artifactPath,
-        assignments: runAssignments,
-      };
+      const launchRef = assignment.launchRef;
+      if (!launchRef?.runId || !launchRef.asyncId || !Array.isArray(launchRef.assignments) || launchRef.assignments.length === 0) {
+        return undefined;
+      }
+      if (!assignment.runId || assignment.runId !== launchRef.runId) return undefined;
+      const ownsAssignment = launchRef.assignments.some((entry) => entry.assignmentId === assignment.id && entry.runId === launchRef.runId);
+      if (!ownsAssignment) return undefined;
+      return launchRef;
     }
     return undefined;
   }

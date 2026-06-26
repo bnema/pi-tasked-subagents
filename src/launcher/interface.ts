@@ -14,6 +14,9 @@ export interface RunnerRuntimeContext {
   currentModelProvider?: string;
 }
 
+/** @deprecated Use RunnerRuntimeContext. */
+export type LauncherRuntimeContext = RunnerRuntimeContext;
+
 export interface LaunchResult {
   runId: string;
   asyncId: string;

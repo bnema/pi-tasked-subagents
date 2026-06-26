@@ -18,7 +18,7 @@ export const ENTRY_TYPE_FAILURE = "pi-tasked-subagents:failure";
 export const ENTRY_TYPE_ARTIFACT = "pi-tasked-subagents:artifact";
 
 // State version for the plan-first state model.
-export const STATE_VERSION = 2;
+export const STATE_VERSION = 3;
 
 // Defaults for launcher / dispatch
 export const DEFAULT_POLL_INTERVAL_MS = 500;

@@ -180,7 +180,7 @@ export interface PiRunnerAdapterOptions {
   resultsDirOverride?: string;
 }
 
-export class PiRunnerAdapter implements SubagentRuntime {
+export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   private readonly piBin: string;
   private readonly asyncRoot: string;
   private readonly resultsRoot: string;
@@ -192,11 +192,14 @@ export class PiRunnerAdapter implements SubagentRuntime {
     this.resultsRoot = options.resultsDirOverride ?? defaultResultsRoot();
   }
 
-  async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: unknown): Promise<SubagentRunHandle> {
+  async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: RunnerRuntimeContext): Promise<SubagentRunHandle> {
     ensureTaskGraphRequest(request);
-    const runtimeCtx = ctx as RunnerRuntimeContext;
     const paths = this.requireRunPaths(request.runId);
-    const cwd = request.cwd ?? runtimeCtx.cwd;
+    const runtimeCtx = ctx && typeof ctx === "object" ? ctx as Partial<RunnerRuntimeContext> : undefined;
+    const requestCwd = typeof request.cwd === "string" && request.cwd.trim() ? request.cwd.trim() : undefined;
+    const contextCwd = typeof runtimeCtx?.cwd === "string" && runtimeCtx.cwd.trim() ? runtimeCtx.cwd.trim() : undefined;
+    const cwd = requestCwd ?? contextCwd;
+    if (!cwd) throw new Error("Task graph cwd is required");
     const children = this.buildChildren(request.tasks, cwd, paths.asyncDir);
     const config: RunnerConfig = {
       runId: request.runId,
@@ -240,10 +243,9 @@ export class PiRunnerAdapter implements SubagentRuntime {
   ): Promise<RunStatus> {
     if (!handle) return "completed";
     const { runId } = handle;
-    const paths = this.runPathsForHandle(handle);
-    if (!paths) return "failed";
-    const launch = this.resolveLaunch(handle);
-    if (!launch) return "failed";
+    const resolved = this.resolveRunHandle(handle);
+    if (!resolved) return "failed";
+    const { paths, launch } = resolved;
 
     const deadline = now() + (options?.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
     let terminalResultStatus: RunStatus | undefined;
@@ -272,9 +274,9 @@ export class PiRunnerAdapter implements SubagentRuntime {
 
   async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
     const { runId } = handle;
-    const launch = this.resolveLaunch(handle);
-    if (!launch) return undefined;
-    const result = await readJsonFile<RunnerResultFile>(launch.resultPath);
+    const resolved = this.resolveRunHandle(handle);
+    if (!resolved) return undefined;
+    const result = await readJsonFile<RunnerResultFile>(resolved.launch.resultPath);
     if (!result) return undefined;
     if (typeof result.rawOutput === "string" && result.rawOutput.trim()) return result.rawOutput;
     if (Array.isArray(result.results) && result.results.length > 1) {
@@ -303,18 +305,6 @@ export class PiRunnerAdapter implements SubagentRuntime {
     return {
       asyncDir,
       resultPath: safeJoin(this.resultsRoot, `${runId}.json`),
-      statusPath: safeJoin(asyncDir, "status.json"),
-      eventsPath: safeJoin(asyncDir, "events.jsonl"),
-    };
-  }
-
-  private runPathsForHandle(handle: SubagentRunHandle): RunPaths | undefined {
-    const fallback = this.runPaths(handle.runId);
-    if (!fallback) return undefined;
-    const asyncDir = handle.asyncDir ?? fallback.asyncDir;
-    return {
-      asyncDir,
-      resultPath: handle.resultPath ?? fallback.resultPath,
       statusPath: safeJoin(asyncDir, "status.json"),
       eventsPath: safeJoin(asyncDir, "events.jsonl"),
     };
@@ -383,25 +373,34 @@ export class PiRunnerAdapter implements SubagentRuntime {
     return launch;
   }
 
-  private resolveLaunch(handle: SubagentRunHandle): LaunchResult | undefined {
-    const paths = this.runPathsForHandle(handle);
-    if (!paths) return undefined;
-    return this.trackedRuns.get(handle.runId)?.launch ?? {
+  private resolveRunHandle(handle: SubagentRunHandle): { paths: RunPaths; launch: LaunchResult } | undefined {
+    const fallback = this.runPaths(handle.runId);
+    if (!fallback) return undefined;
+    const asyncDir = handle.asyncDir ?? fallback.asyncDir;
+    const paths = {
+      asyncDir,
+      resultPath: handle.resultPath ?? fallback.resultPath,
+      statusPath: safeJoin(asyncDir, "status.json"),
+      eventsPath: safeJoin(asyncDir, "events.jsonl"),
+    };
+    const trackedLaunch = this.trackedRuns.get(handle.runId)?.launch;
+    const launch = {
+      ...trackedLaunch,
       runId: handle.runId,
       asyncId: handle.asyncId,
       asyncDir: paths.asyncDir,
       resultPath: paths.resultPath,
-      sessionFile: handle.sessionFile,
-      artifactPath: handle.artifactPath,
+      sessionFile: handle.sessionFile ?? trackedLaunch?.sessionFile,
+      artifactPath: handle.artifactPath ?? trackedLaunch?.artifactPath,
     };
+    return { paths, launch };
   }
 
   private async terminate(handle: SubagentRunHandle, state: "paused" | "cancelled", summary: string): Promise<boolean> {
     const { runId } = handle;
-    const paths = this.runPathsForHandle(handle);
-    if (!paths) return false;
-    const launch = this.resolveLaunch(handle);
-    if (!launch) return false;
+    const resolved = this.resolveRunHandle(handle);
+    if (!resolved) return false;
+    const { paths, launch } = resolved;
     const tracked = this.trackedRuns.get(runId);
     const existingStatus = await readJsonFile<RunnerStatusFile>(paths.statusPath);
     const resultPath = launch.resultPath ?? paths.resultPath;
