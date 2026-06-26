@@ -6,21 +6,22 @@ import { describe, expect, test } from "vitest";
 
 import { ensureTaskGraphRequest } from "../src/launcher/interface.js";
 import { PiRunnerAdapter } from "../src/launcher/pi-runner-adapter.js";
+import type { SubagentRunHandle, SubagentRuntime } from "../src/types.js";
 
-async function withLaunchedAdapter(runId: string, result: unknown, testBody: (adapter: PiRunnerAdapter) => Promise<void>) {
+async function withLaunchedAdapter(runId: string, result: unknown, testBody: (adapter: PiRunnerAdapter, handle: SubagentRunHandle) => Promise<void>) {
   const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
   try {
     const asyncRoot = path.join(root, "async");
     const resultsRoot = path.join(root, "results");
     const adapter = new PiRunnerAdapter({ piBin: "true", asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
-    await adapter.launchTaskGraph({
+    const handle = await adapter.launchTaskGraph({
       runId,
       title: "Run",
       taskSummary: "Run",
       tasks: [{ assignmentId: "a1", phaseId: "p1", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
     }, { cwd: process.cwd(), sessionId: "test", pi: {} as never });
     await writeFile(path.join(resultsRoot, `${runId}.json`), JSON.stringify(result), "utf8");
-    await testBody(adapter);
+    await testBody(adapter, handle);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -34,6 +35,13 @@ describe("PiRunnerAdapter task graph boundary", () => {
       taskSummary: "Run",
       tasks: [{ phaseId: "p1", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
     } as never)).toThrow("Task assignment id is required");
+  });
+
+  test("does not expose mailbox capabilities before mailbox support exists", () => {
+    const adapter: SubagentRuntime = new PiRunnerAdapter({ piBin: "true" });
+
+    expect(adapter.sendMessage).toBeUndefined();
+    expect(adapter.waitForActivity).toBeUndefined();
   });
 
   test("rejects unsafe run ids", async () => {
@@ -61,7 +69,14 @@ describe("PiRunnerAdapter task graph boundary", () => {
       }), "utf8");
 
       const adapter = new PiRunnerAdapter({ piBin: "true", asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
-      const status = await adapter.waitForRunSignal("run-1", { timeoutMs: 25 });
+      const handle: SubagentRunHandle = {
+        runId: "run-1",
+        asyncId: "run-1",
+        asyncDir: runDir,
+        resultPath: path.join(resultsRoot, "run-1.json"),
+        assignments: [],
+      };
+      const status = await adapter.waitForRunSignal(handle, { timeoutMs: 25 });
 
       expect(status).toBe("attention");
     } finally {
@@ -90,7 +105,14 @@ describe("PiRunnerAdapter task graph boundary", () => {
 
       const snapshots: string[] = [];
       const adapter = new PiRunnerAdapter({ piBin: "true", asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
-      const status = await adapter.waitForRunSignal("run-1", {
+      const handle: SubagentRunHandle = {
+        runId: "run-1",
+        asyncId: "run-1",
+        asyncDir: runDir,
+        resultPath: path.join(resultsRoot, "run-1.json"),
+        assignments: [],
+      };
+      const status = await adapter.waitForRunSignal(handle, {
         timeoutMs: 1_000,
         onUpdate: async (snapshot) => {
           snapshots.push(snapshot.steps.map((step) => `${step.id}:${step.status}`).join(","));
@@ -115,8 +137,8 @@ describe("PiRunnerAdapter task graph boundary", () => {
   });
 
   test("raw output wins when reading run results", async () => {
-    await withLaunchedAdapter("run-raw", { rawOutput: "raw report", summary: "summary" }, async (adapter) => {
-      await expect(adapter.getRunResult("run-raw")).resolves.toBe("raw report");
+    await withLaunchedAdapter("run-raw", { rawOutput: "raw report", summary: "summary" }, async (adapter, handle) => {
+      await expect(adapter.getRunResult(handle)).resolves.toBe("raw report");
     });
   });
 
@@ -126,8 +148,8 @@ describe("PiRunnerAdapter task graph boundary", () => {
         { stepId: "a1", rawOutput: "raw one", output: "output one", summary: "one", success: true },
         { stepId: "a2", output: "output two", summary: "two", error: "boom", success: false },
       ],
-    }, async (adapter) => {
-      const raw = await adapter.getRunResult("run-multi");
+    }, async (adapter, handle) => {
+      const raw = await adapter.getRunResult(handle);
       expect(JSON.parse(raw ?? "{}")).toEqual({
         runId: "run-multi",
         results: [
@@ -144,8 +166,8 @@ describe("PiRunnerAdapter task graph boundary", () => {
     ["root summary", { results: [{ stepId: "a1" }], summary: "root summary" }, "root summary"],
   ] as const)("single result falls back to %s", async (_name, result, expected) => {
     const runId = `run-single-${_name.replace(/\s/gu, "-")}`;
-    await withLaunchedAdapter(runId, result, async (adapter) => {
-      await expect(adapter.getRunResult(runId)).resolves.toBe(expected);
+    await withLaunchedAdapter(runId, result, async (adapter, handle) => {
+      await expect(adapter.getRunResult(handle)).resolves.toBe(expected);
     });
   });
 
@@ -162,10 +184,52 @@ describe("PiRunnerAdapter task graph boundary", () => {
         tasks: [{ assignmentId: "a1", phaseId: "p1", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
       }, { cwd: process.cwd(), sessionId: "test", pi: {} as never });
 
-      expect(ref.assignments[0]).toMatchObject({ assignmentId: "a1", runId: "run-1" });
+      expect(ref).toEqual({
+        runId: "run-1",
+        asyncId: "run-1",
+        asyncDir: path.join(asyncRoot, "run-1"),
+        resultPath: path.join(resultsRoot, "run-1.json"),
+        sessionFile: undefined,
+        artifactPath: undefined,
+        assignments: [{ assignmentId: "a1", runId: "run-1", resultPath: path.join(resultsRoot, "run-1.json") }],
+      });
       const config = JSON.parse(await readFile(path.join(asyncRoot, "run-1", "config.json"), "utf8"));
       expect(config.mode).toBe("task_graph");
       expect(config.children[0].id).toBe("a1");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses restored handle paths outside configured roots", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    try {
+      const asyncDir = path.join(root, "restored-async");
+      const resultPath = path.join(root, "restored-results", "run-restored.json");
+      await mkdir(asyncDir, { recursive: true });
+      await mkdir(path.dirname(resultPath), { recursive: true });
+      await writeFile(path.join(asyncDir, "status.json"), JSON.stringify({
+        runId: "run-restored",
+        state: "complete",
+        steps: [{ id: "a1", status: "completed", agent: "delegate" }],
+      }), "utf8");
+      await writeFile(resultPath, JSON.stringify({ runId: "run-restored", state: "complete", rawOutput: "restored output" }), "utf8");
+
+      const adapter = new PiRunnerAdapter({
+        piBin: "true",
+        asyncDirRootOverride: path.join(root, "unused-async-root"),
+        resultsDirOverride: path.join(root, "unused-results-root"),
+      });
+      const handle: SubagentRunHandle = {
+        runId: "run-restored",
+        asyncId: "run-restored",
+        asyncDir,
+        resultPath,
+        assignments: [{ assignmentId: "a1", runId: "run-restored", resultPath }],
+      };
+
+      await expect(adapter.waitForRunSignal(handle, { timeoutMs: 25 })).resolves.toBe("completed");
+      await expect(adapter.getRunResult(handle)).resolves.toBe("restored output");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

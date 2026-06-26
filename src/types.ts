@@ -208,7 +208,7 @@ export interface TaskAssignmentRecord {
   prompt: string;
   status: AssignmentStatus;
   runId?: string;
-  launchRef?: RunLaunchRef;
+  launchRef?: SubagentRunHandle;
   result?: TaskResultRecord;
   currentTool?: string;
   lastActionAt?: number;
@@ -261,16 +261,23 @@ export interface SubagentTaskReport {
 }
 
 // ──────────────────────────────────────────────
-// Launcher boundary
+// Subagent runtime boundary
 // ──────────────────────────────────────────────
 
-export interface RunLaunchRef {
+export interface SubagentRunAssignmentHandle {
+  assignmentId: string;
+  runId: string;
+  resultPath?: string;
+}
+
+export interface SubagentRunHandle {
   runId: string;
   asyncId: string;
   asyncDir?: string;
   resultPath?: string;
   sessionFile?: string;
   artifactPath?: string;
+  assignments: SubagentRunAssignmentHandle[];
 }
 
 export interface RunProgressStepSnapshot {
@@ -325,20 +332,41 @@ export interface LaunchTaskGraphRequest {
   cwd?: string;
 }
 
-export interface TaskGraphLaunchRef extends RunLaunchRef {
-  assignments: Array<{
-    assignmentId: string;
-    runId: string;
-    resultPath?: string;
-  }>;
+export interface SubagentMessageTarget {
+  assignmentId?: string;
+  agentPath?: string;
 }
 
-export interface Launcher {
-  launchTaskGraph(request: LaunchTaskGraphRequest, ctx: unknown): Promise<TaskGraphLaunchRef>;
-  stopRun(runId: string, ctx: unknown): Promise<boolean>;
-  cancelRun(runId: string, ctx: unknown): Promise<boolean>;
+export interface SubagentMessageOptions {
+  triggerTurn?: boolean;
+}
+
+export interface SubagentActivityWaitOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  ctx?: unknown;
+}
+
+export interface SubagentActivityWaitResult {
+  timedOut: boolean;
+  message: string;
+}
+
+export interface SubagentRuntime {
+  launchTaskGraph(request: LaunchTaskGraphRequest, ctx: unknown): Promise<SubagentRunHandle>;
+  stopRun(handle: SubagentRunHandle, ctx: unknown): Promise<boolean>;
+  cancelRun(handle: SubagentRunHandle, ctx: unknown): Promise<boolean>;
+  sendMessage?(
+    target: SubagentMessageTarget,
+    message: string,
+    options?: SubagentMessageOptions,
+  ): Promise<boolean>;
+  waitForActivity?(
+    handle: SubagentRunHandle | undefined,
+    options?: SubagentActivityWaitOptions,
+  ): Promise<SubagentActivityWaitResult>;
   waitForRunSignal(
-    runId: string | undefined,
+    handle: SubagentRunHandle | undefined,
     options?: {
       timeoutMs?: number;
       signal?: AbortSignal;
@@ -346,6 +374,6 @@ export interface Launcher {
       onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void>;
     },
   ): Promise<RunStatus>;
-  getRunResult(runId: string): Promise<string | undefined>;
+  getRunResult(handle: SubagentRunHandle): Promise<string | undefined>;
   getSnapshot(): { assignments: TaskAssignmentRecord[]; counts: RunCounts };
 }

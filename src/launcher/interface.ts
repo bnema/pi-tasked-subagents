@@ -7,7 +7,7 @@ import type { LaunchTaskGraphRequest, OutputMode } from "../types.js";
 
 export type { LaunchTaskEntry, LaunchTaskGraphRequest } from "../types.js";
 
-export interface LauncherRuntimeContext {
+export interface RunnerRuntimeContext {
   pi: ExtensionAPI;
   cwd: string;
   sessionId: string;

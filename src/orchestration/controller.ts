@@ -17,10 +17,11 @@ import type {
   AcceptedPlanResult,
   EditPlanInput,
   EditPlanResult,
-  Launcher,
   PlanRecord,
   RunProgressSnapshot,
   RunStatus,
+  SubagentRunHandle,
+  SubagentRuntime,
   SubagentTaskReport,
   TaskAssignmentRecord,
   TaskRecord,
@@ -28,7 +29,6 @@ import type {
   ValidatedPlanInput,
 } from "../types.js";
 import { PiRunnerAdapter } from "../launcher/pi-runner-adapter.js";
-import { type LauncherRuntimeContext } from "../launcher/interface.js";
 import { cloneState, createEmptyState, createStateLock, ensureState } from "../state/store.js";
 import { normalizePlanInput, validatePlanInput } from "../state/plan-validation.js";
 import { statusLabel } from "../ui/messages.js";
@@ -61,14 +61,14 @@ export interface DispatchResult {
 }
 
 export interface TaskedSubagentsControllerOptions {
-  launcher?: Launcher;
+  launcher?: SubagentRuntime;
   defaultAgent?: string;
 }
 
-const DEFAULT_OPTIONS: Required<TaskedSubagentsControllerOptions> = {
-  launcher: new PiRunnerAdapter(),
+const DEFAULT_OPTIONS = {
+  runtime: new PiRunnerAdapter(),
   defaultAgent: "delegate",
-};
+} satisfies { runtime: SubagentRuntime; defaultAgent: string };
 
 function terminalStatus(status: RunStatus): boolean {
   return status !== "queued" && status !== "running";
@@ -265,7 +265,7 @@ function buildResolutionPrompt(plan: PlanRecord, task: TaskRecord, prompt: strin
 export class TaskedSubagentsController {
   private state: TaskedSubagentsState = createEmptyState();
   private readonly lock = createStateLock();
-  private readonly launcher: Launcher;
+  private readonly runtime: SubagentRuntime;
   private readonly defaultAgent: string;
   private readonly pi: ExtensionAPI;
   private planCounter = 0;
@@ -274,10 +274,9 @@ export class TaskedSubagentsController {
   private readonly runProgressSignatures = new Map<string, string>();
 
   constructor(pi: ExtensionAPI, options?: TaskedSubagentsControllerOptions) {
-    const opts = { ...DEFAULT_OPTIONS, ...options };
     this.pi = pi;
-    this.launcher = opts.launcher;
-    this.defaultAgent = opts.defaultAgent;
+    this.runtime = options?.launcher ?? DEFAULT_OPTIONS.runtime;
+    this.defaultAgent = options?.defaultAgent ?? DEFAULT_OPTIONS.defaultAgent;
   }
 
   getState(): TaskedSubagentsState {
@@ -345,7 +344,7 @@ export class TaskedSubagentsController {
   async dispatchReady(options: DispatchOptions = {}): Promise<DispatchResult> {
     if (options.ctx) this.lastContext = options.ctx;
     const aggregate: DispatchResult = { launched: 0, skipped: 0, errors: [], hasBlockingIssue: false };
-    const runtimeCtx = this.launcherContext(options.ctx);
+    const runtimeCtx = this.runtimeContext(options.ctx);
 
     while (true) {
       const launch = await this.lock.withLock(() => {
@@ -371,7 +370,7 @@ export class TaskedSubagentsController {
       try {
         const plan = this.state.plans.find((candidate) => candidate.id === launch.planId);
         if (!plan) return aggregate;
-        const ref = await this.launcher.launchTaskGraph({
+        const ref = await this.runtime.launchTaskGraph({
           runId: launch.runId,
           title: `Plan ${plan.id}: ${plan.title}`,
           taskSummary: plan.title,
@@ -397,11 +396,11 @@ export class TaskedSubagentsController {
         });
         aggregate.launched += launch.assignments.length;
 
-        const status = finalWaitStatus(await this.launcher.waitForRunSignal(ref.runId, {
+        const status = finalWaitStatus(await this.runtime.waitForRunSignal(ref, {
           ctx: runtimeCtx,
           onUpdate: (snapshot) => this.applyRunProgressUpdate(launch.planId, snapshot, options.ctx ?? this.lastContext),
         }));
-        const raw = await this.launcher.getRunResult(ref.runId);
+        const raw = await this.runtime.getRunResult(ref);
         await this.applyRunOutcome(launch.planId, ref.runId, status, raw, options.ctx ?? this.lastContext);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -452,27 +451,27 @@ export class TaskedSubagentsController {
   }
 
   async stopRun(assignmentId: string): Promise<boolean> {
-    const resolvedRunId = this.resolveRunIdForAssignment(assignmentId);
-    if (!resolvedRunId) return false;
-    const ok = await this.launcher.stopRun(resolvedRunId, this.launcherContext(this.lastContext));
+    const handle = this.resolveHandleForAssignment(assignmentId);
+    if (!handle) return false;
+    const ok = await this.runtime.stopRun(handle, this.runtimeContext(this.lastContext));
     if (!ok) return false;
-    await this.markRunStatus(resolvedRunId, "paused");
+    await this.markRunStatus(handle.runId, "paused");
     return true;
   }
 
   async cancelRun(assignmentId: string): Promise<boolean> {
-    const resolvedRunId = this.resolveRunIdForAssignment(assignmentId);
-    if (!resolvedRunId) return false;
-    const ok = await this.launcher.cancelRun(resolvedRunId, this.launcherContext(this.lastContext));
+    const handle = this.resolveHandleForAssignment(assignmentId);
+    if (!handle) return false;
+    const ok = await this.runtime.cancelRun(handle, this.runtimeContext(this.lastContext));
     if (!ok) return false;
-    await this.markRunStatus(resolvedRunId, "cancelled");
+    await this.markRunStatus(handle.runId, "cancelled");
     return true;
   }
 
   async getRunResult(assignmentId: string): Promise<string | undefined> {
-    const resolvedRunId = this.resolveRunIdForAssignment(assignmentId);
-    if (!resolvedRunId) return undefined;
-    const raw = await this.launcher.getRunResult(resolvedRunId);
+    const handle = this.resolveHandleForAssignment(assignmentId);
+    if (!handle) return undefined;
+    const raw = await this.runtime.getRunResult(handle);
     return resultForAssignment(raw, assignmentId);
   }
 
@@ -840,7 +839,7 @@ export class TaskedSubagentsController {
     }
   }
 
-  private launcherContext(ctx?: ExtensionContext): LauncherRuntimeContext {
+  private runtimeContext(ctx?: ExtensionContext): { pi: ExtensionAPI; cwd: string; sessionId: string; currentModelProvider?: string } {
     return {
       pi: this.pi,
       cwd: ctx?.cwd ?? process.cwd(),
@@ -855,10 +854,33 @@ export class TaskedSubagentsController {
     return this.state.plans.at(-1);
   }
 
-  private resolveRunIdForAssignment(assignmentId: string): string | undefined {
+  private resolveHandleForAssignment(assignmentId: string): SubagentRunHandle | undefined {
     for (const plan of this.state.plans) {
       const assignment = plan.assignments.find((candidate) => candidate.id === assignmentId);
-      if (assignment?.runId) return assignment.runId;
+      if (!assignment) continue;
+      const launchRef = assignment.launchRef as Partial<SubagentRunHandle> | undefined;
+      const runId = launchRef?.runId ?? assignment.runId;
+      if (!runId) return undefined;
+      const sameRunAssignments = plan.assignments.filter((candidate) => (candidate.launchRef?.runId ?? candidate.runId) === runId);
+      const resultPath = launchRef?.resultPath
+        ?? assignment.result?.rawResultPath
+        ?? sameRunAssignments.find((candidate) => candidate.result?.rawResultPath)?.result?.rawResultPath;
+      const runAssignments = Array.isArray(launchRef?.assignments) && launchRef.assignments.length > 0
+        ? launchRef.assignments
+        : sameRunAssignments.map((candidate) => ({
+          assignmentId: candidate.id,
+          runId: candidate.runId ?? runId,
+          resultPath: candidate.result?.rawResultPath,
+        }));
+      return {
+        runId,
+        asyncId: launchRef?.asyncId ?? runId,
+        asyncDir: launchRef?.asyncDir,
+        resultPath,
+        sessionFile: launchRef?.sessionFile,
+        artifactPath: launchRef?.artifactPath,
+        assignments: runAssignments,
+      };
     }
     return undefined;
   }
