@@ -12,7 +12,7 @@ import {
   GLYPH_DONE,
   GLYPH_FAILED,
   GLYPH_PAUSED,
-  GLYPH_PHASE,
+  GLYPH_GROUP,
   GLYPH_QUEUED,
   GLYPH_READY,
   GLYPH_RUNNING,
@@ -37,7 +37,7 @@ export interface WidgetBuildOptions {
 export const COMPACT_WIDGET_MAX_WIDTH = 88;
 
 const SUMMARY_TITLE_WIDTH = 48;
-const PHASE_TITLE_WIDTH = 44;
+const GROUP_TITLE_WIDTH = 44;
 const TASK_TITLE_WIDTH = 46;
 const ACTIVITY_TEXT_WIDTH = 50;
 const ASSIGNMENT_ID_WIDTH = 24;
@@ -229,7 +229,7 @@ function buildSummaryLine(taskRun: TaskRunRecord, theme?: WidgetThemeLike, optio
 }
 
 function buildGroupLine(taskRun: TaskRunRecord, group: WidgetGroupView, isLast: boolean, theme?: WidgetThemeLike): string {
-  return `${linePrefix(isLast, theme)}${color(GLYPH_PHASE, "accent", theme)} ${bold(shortTitle(group.title, PHASE_TITLE_WIDTH), theme)} ${statusProgressLabel(group.status, groupProgress(taskRun, group), theme)}`;
+  return `${linePrefix(isLast, theme)}${color(GLYPH_GROUP, "accent", theme)} ${bold(shortTitle(group.title, GROUP_TITLE_WIDTH), theme)} ${statusProgressLabel(group.status, groupProgress(taskRun, group), theme)}`;
 }
 
 function formatElapsed(startedAt: number | undefined, currentTime: number): string | undefined {

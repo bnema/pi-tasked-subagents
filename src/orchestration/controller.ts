@@ -99,7 +99,7 @@ function statusForUnhandledAssignment(
   if (assignment.status === "completed") return assignment.result ? undefined : "attention";
   if (assignment.status === "failed" || assignment.status === "skipped" || assignment.status === "cancelled") return undefined;
   if (completedStatus(runStatus)) return "attention";
-  if (runStatus === "blocked" || runStatus === "paused") return "attention";
+  if (runStatus === "blocked") return "attention";
   return runStatus;
 }
 
@@ -280,6 +280,8 @@ export class TaskedSubagentsController {
   private lastContext: ExtensionContext | undefined;
   private lastDispatchWork: Promise<void> = Promise.resolve();
   private readonly runProgressSignatures = new Map<string, string>();
+  private readonly liveRunIds = new Set<string>();
+  private stateEpoch = 0;
 
   constructor(pi: ExtensionAPI, options?: TaskedSubagentsControllerOptions) {
     this.pi = pi;
@@ -295,6 +297,8 @@ export class TaskedSubagentsController {
     this.state = ensureState(state);
     this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
     this.runProgressSignatures.clear();
+    this.liveRunIds.clear();
+    this.stateEpoch += 1;
   }
 
   async awaitLastWork(): Promise<void> {
@@ -320,10 +324,11 @@ export class TaskedSubagentsController {
       const errors = validateTaskRunInput(input);
       if (errors.length > 0) return { accepted: false, errors, dispatchScheduled: false } satisfies SetTasksResult;
 
-      const taskRunId = normalizeTargetId(input.taskRunId) ?? this.state.currentTaskRunId ?? this.nextTaskRunId();
+      const taskRunId = normalizeTargetId(input.taskRunId) ?? this.nextTaskRunId();
       const normalized = normalizeTaskRunInput(input, { taskRunId });
       if (!normalized.taskRun) return { accepted: false, errors: normalized.errors, dispatchScheduled: false } satisfies SetTasksResult;
 
+      this.stateEpoch += 1;
       const existingIndex = this.state.taskRuns.findIndex((candidate) => candidate.id === normalized.taskRun!.id);
       if (existingIndex >= 0) this.state.taskRuns[existingIndex] = normalized.taskRun;
       else this.state.taskRuns.push(normalized.taskRun);
@@ -357,9 +362,11 @@ export class TaskedSubagentsController {
     if (options.ctx) this.lastContext = options.ctx;
     const aggregate: DispatchResult = { launched: 0, skipped: 0, errors: [], hasBlockingIssue: false };
     const runtimeCtx = this.runtimeContext(options.ctx);
+    const dispatchEpoch = this.stateEpoch;
 
     while (true) {
       const launch = await this.lock.withLock(() => {
+        if (this.stateEpoch !== dispatchEpoch) return undefined;
         const taskRun = this.resolveTaskRunMutable(options.taskRunId);
         if (!taskRun) return undefined;
         const scheduled = createReadyAssignments(taskRun, {
@@ -379,10 +386,11 @@ export class TaskedSubagentsController {
 
       if (!launch) return aggregate;
 
+      let ref: SubagentRunHandle | undefined;
       try {
         const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
         if (!taskRun) return aggregate;
-        const ref = launchRefForAssignments(await this.runtime.launchTaskGraph({
+        const launchedRef = launchRefForAssignments(await this.runtime.launchTaskGraph({
           runId: launch.runId,
           title: `TaskRun ${taskRun.id}: ${taskRun.title}`,
           taskSummary: taskRun.title,
@@ -390,16 +398,20 @@ export class TaskedSubagentsController {
           maxConcurrency: options.maxConcurrency ?? launch.maxConcurrency,
           cwd: options.defaultCwd ?? runtimeCtx.cwd,
         }, runtimeCtx), launch.assignments);
+        ref = launchedRef;
+        this.liveRunIds.add(launchedRef.runId);
+        if (this.stateEpoch !== dispatchEpoch) return aggregate;
 
         await this.lock.withLock(() => {
+          if (this.stateEpoch !== dispatchEpoch) return;
           const current = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
           if (!current) return;
           for (const assignment of launch.assignments) {
             const stored = current.assignments.find((candidate) => candidate.id === assignment.id);
             if (!stored) continue;
             stored.status = "running";
-            stored.runId = ref.runId;
-            stored.launchRef = ref;
+            stored.runId = launchedRef.runId;
+            stored.launchRef = launchedRef;
             stored.updatedAt = Date.now();
           }
           deriveTaskRunStatus(current);
@@ -408,31 +420,45 @@ export class TaskedSubagentsController {
         });
         aggregate.launched += launch.assignments.length;
 
-        const status = finalWaitStatus(await this.runtime.waitForRunSignal(ref, {
+        const status = finalWaitStatus(await this.runtime.waitForRunSignal(launchedRef, {
           ctx: runtimeCtx,
-          onUpdate: (snapshot) => this.applyRunProgressUpdate(launch.taskRunId, snapshot, options.ctx ?? this.lastContext),
+          onUpdate: (snapshot) => this.applyRunProgressUpdate(launch.taskRunId, snapshot, dispatchEpoch, options.ctx ?? this.lastContext),
         }));
-        const raw = await this.runtime.getRunResult(ref);
-        await this.applyRunOutcome(launch.taskRunId, ref.runId, status, raw, options.ctx ?? this.lastContext);
+        if (this.stateEpoch !== dispatchEpoch) return aggregate;
+        const raw = await this.runtime.getRunResult(launchedRef);
+        if (this.stateEpoch !== dispatchEpoch) return aggregate;
+        await this.applyRunOutcome(launch.taskRunId, launchedRef.runId, status, raw, dispatchEpoch, options.ctx ?? this.lastContext);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         aggregate.errors.push(message);
         aggregate.hasBlockingIssue = true;
-        await this.lock.withLock(() => {
+        if (this.stateEpoch === dispatchEpoch) await this.lock.withLock(() => {
+          if (this.stateEpoch !== dispatchEpoch) return;
           const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
           if (!taskRun) return;
+          const timestamp = Date.now();
           for (const assignment of launch.assignments) {
             const stored = taskRun.assignments.find((candidate) => candidate.id === assignment.id);
             if (!stored) continue;
+            if (ref && stored.runId !== ref.runId) continue;
+            if (stored.status === "completed" && !stored.result) {
+              stored.status = "attention";
+              stored.updatedAt = timestamp;
+              continue;
+            }
+            if (stored.status !== "queued" && stored.status !== "running") continue;
             stored.status = "failed";
-            stored.updatedAt = Date.now();
+            stored.updatedAt = timestamp;
+            stored.completedAt = timestamp;
           }
           deriveTaskRunStatus(taskRun);
           this.persistState();
           this.updateUI(options.ctx ?? this.lastContext);
         });
+      } finally {
+        if (ref) this.liveRunIds.delete(ref.runId);
       }
-
+      if (this.stateEpoch !== dispatchEpoch) return aggregate;
       const shouldContinue = this.state.taskRuns
         .find((candidate) => candidate.id === launch.taskRunId)
         ?.tasks.some((task) => task.status === "ready");
@@ -459,20 +485,24 @@ export class TaskedSubagentsController {
   }
 
   async stopRun(assignmentId: string): Promise<boolean> {
-    const handle = this.resolveHandleForAssignment(assignmentId);
-    if (!handle) return false;
-    const ok = await this.runtime.stopRun(handle, this.runtimeContext(this.lastContext));
+    const target = this.resolveControllableHandleForAssignment(assignmentId, "stop");
+    if (!target) return false;
+    const ok = await this.runtime.stopRun(target.handle, this.runtimeContext(this.lastContext));
     if (!ok) return false;
-    await this.markRunStatus(handle.runId, "paused");
+    await this.markRunStatus(target.handle.runId, "paused");
     return true;
   }
 
   async cancelRun(assignmentId: string): Promise<boolean> {
-    const handle = this.resolveHandleForAssignment(assignmentId);
-    if (!handle) return false;
-    const ok = await this.runtime.cancelRun(handle, this.runtimeContext(this.lastContext));
+    const target = this.resolveControllableHandleForAssignment(assignmentId, "cancel");
+    if (!target) return false;
+    if (!target.live) {
+      await this.markRunStatus(target.handle.runId, "cancelled");
+      return true;
+    }
+    const ok = await this.runtime.cancelRun(target.handle, this.runtimeContext(this.lastContext));
     if (!ok) return false;
-    await this.markRunStatus(handle.runId, "cancelled");
+    await this.markRunStatus(target.handle.runId, "cancelled");
     return true;
   }
 
@@ -561,6 +591,7 @@ export class TaskedSubagentsController {
     const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
     if (!normalized.taskRun) return { edited: false, taskRunId: taskRun.id, taskId: targetId, errors: normalized.errors, dispatchScheduled: false };
 
+    this.stateEpoch += 1;
     const oldTask = taskRun.tasks[taskIndex];
     const nextTask = normalized.taskRun.tasks[taskIndex];
     nextTask.status = "ready";
@@ -605,6 +636,7 @@ export class TaskedSubagentsController {
     const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
     if (!normalized.taskRun) return { edited: false, taskRunId: taskRun.id, groupId: targetId, errors: normalized.errors, dispatchScheduled: false };
 
+    this.stateEpoch += 1;
     const oldGroup = taskRun.groups[groupIndex];
     const nextGroup = normalized.taskRun.groups[groupIndex];
     nextGroup.status = "ready";
@@ -682,11 +714,12 @@ export class TaskedSubagentsController {
       });
   }
 
-  private async applyRunProgressUpdate(taskRunId: string, snapshot: RunProgressSnapshot, ctx?: ExtensionContext): Promise<void> {
+  private async applyRunProgressUpdate(taskRunId: string, snapshot: RunProgressSnapshot, expectedEpoch: number | undefined, ctx?: ExtensionContext): Promise<void> {
     const signature = progressSignature(snapshot);
     const key = `${taskRunId}:${snapshot.runId}`;
     if (this.runProgressSignatures.get(key) === signature) return;
     await this.lock.withLock(() => {
+      if (expectedEpoch !== undefined && this.stateEpoch !== expectedEpoch) return;
       const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
       if (!taskRun) return;
       if (!applyAssignmentProgress(taskRun, snapshot)) return;
@@ -696,9 +729,10 @@ export class TaskedSubagentsController {
     });
   }
 
-  private async applyRunOutcome(taskRunId: string, runId: string, status: RunStatus, raw: string | undefined, ctx?: ExtensionContext): Promise<void> {
+  private async applyRunOutcome(taskRunId: string, runId: string, status: RunStatus, raw: string | undefined, expectedEpoch: number | undefined, ctx?: ExtensionContext): Promise<void> {
     let taskRunForSignal: TaskRunRecord | undefined;
     await this.lock.withLock(() => {
+      if (expectedEpoch !== undefined && this.stateEpoch !== expectedEpoch) return;
       const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
       if (!taskRun) return;
       const assignments = taskRun.assignments.filter((assignment) => assignment.runId === runId);
@@ -724,7 +758,8 @@ export class TaskedSubagentsController {
         if (!nextStatus) continue;
         assignment.status = nextStatus;
         assignment.updatedAt = timestamp;
-        if (terminalStatus(status)) assignment.completedAt = timestamp;
+        if (finalAssignmentStatus(nextStatus)) assignment.completedAt = timestamp;
+        else assignment.completedAt = undefined;
       }
       deriveTaskRunStatus(taskRun, timestamp);
 
@@ -732,7 +767,7 @@ export class TaskedSubagentsController {
       this.persistState();
       this.updateUI(ctx ?? this.lastContext);
     });
-    if (taskRunForSignal && terminalStatus(status)) this.emitRunSignal(taskRunForSignal, runId, status);
+    if (taskRunForSignal && terminalStatus(status) && (expectedEpoch === undefined || this.stateEpoch === expectedEpoch)) this.emitRunSignal(taskRunForSignal, runId, status);
   }
 
   private async markRunStatus(runId: string, status: RunStatus): Promise<void> {
@@ -817,6 +852,25 @@ export class TaskedSubagentsController {
       const ownsAssignment = launchRef.assignments.some((entry) => entry.assignmentId === assignment.id && entry.runId === launchRef.runId);
       if (!ownsAssignment) return undefined;
       return launchRef;
+    }
+    return undefined;
+  }
+
+  private resolveControllableHandleForAssignment(
+    assignmentId: string,
+    action: "stop" | "cancel",
+  ): { handle: SubagentRunHandle; live: boolean } | undefined {
+    const normalizedAssignmentId = normalizeTargetId(assignmentId);
+    if (!normalizedAssignmentId) return undefined;
+    for (const taskRun of this.state.taskRuns) {
+      const assignment = taskRun.assignments.find((candidate) => candidate.id === normalizedAssignmentId);
+      if (!assignment) continue;
+      const storedLiveStatus = assignment.status === "queued" || assignment.status === "running";
+      const live = storedLiveStatus && assignment.runId !== undefined && this.liveRunIds.has(assignment.runId);
+      const cancellable = storedLiveStatus || assignment.status === "attention" || assignment.status === "blocked";
+      if (action === "stop" ? !live : !cancellable) continue;
+      const handle = this.resolveHandleForAssignment(normalizedAssignmentId);
+      return handle ? { handle, live } : undefined;
     }
     return undefined;
   }

@@ -401,6 +401,7 @@ export function applyAssignmentProgress(taskRun: TaskRunRecord, snapshot: RunPro
     if (!step.id) continue;
     const assignment = taskRun.assignments.find((candidate) => candidate.id === step.id);
     if (!assignment) continue;
+    if (assignment.runId !== snapshot.runId) continue;
     if (isAssignmentStatus(step.status)) assignment.status = step.status;
     assignment.currentTool = step.currentTool;
     assignment.lastActionAt = step.lastActionAt ?? assignment.lastActionAt;

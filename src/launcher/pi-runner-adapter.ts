@@ -255,8 +255,6 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       const statusFile = await readJsonFile<RunnerStatusFile>(paths.statusPath);
       if (statusFile?.state) {
         await options?.onUpdate?.(buildProgressSnapshot(runId, statusFile));
-        const status = mapRunnerState(statusFile.state);
-        if (isTerminalStatus(status)) return status;
       }
       const result = await readJsonFile<RunnerResultFile>(launch.resultPath ?? paths.resultPath);
       if (result?.state) {

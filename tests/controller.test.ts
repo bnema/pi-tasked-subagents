@@ -100,6 +100,117 @@ class CompletingRuntime implements SubagentRuntime {
   }
 }
 
+class ControlledRuntime extends CompletingRuntime {
+  private waitStartedResolve!: () => void;
+  private waitResolve: ((status: RunStatus) => void) | undefined;
+  private waitReject: ((error: Error) => void) | undefined;
+  readonly waitStarted = new Promise<void>((resolve) => {
+    this.waitStartedResolve = resolve;
+  });
+
+  async waitForRunSignal(handle: SubagentRunHandle | undefined): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    this.waitStartedResolve();
+    return new Promise<RunStatus>((resolve, reject) => {
+      this.waitResolve = resolve;
+      this.waitReject = reject;
+    });
+  }
+
+  complete(status: RunStatus = "completed"): void {
+    this.waitResolve?.(status);
+  }
+
+  fail(error = new Error("wait failed")): void {
+    this.waitReject?.(error);
+  }
+}
+
+class ResultControlledRuntime extends CompletingRuntime {
+  private resultStartedResolve!: () => void;
+  private resultResolve: (() => void) | undefined;
+  readonly resultStarted = new Promise<void>((resolve) => {
+    this.resultStartedResolve = resolve;
+  });
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultStartedResolve();
+    await new Promise<void>((resolve) => {
+      this.resultResolve = resolve;
+    });
+    return super.getRunResult(handle);
+  }
+
+  releaseResult(): void {
+    this.resultResolve?.();
+  }
+}
+
+class ControlledSpyRuntime extends ControlledRuntime {
+  stopped: SubagentRunHandle[] = [];
+  cancelled: SubagentRunHandle[] = [];
+
+  async stopRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.stopped.push(handle);
+    return true;
+  }
+
+  async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.cancelled.push(handle);
+    return true;
+  }
+}
+
+class CompletedProgressFailRuntime extends CompletingRuntime {
+  private waitStartedResolve!: () => void;
+  private waitReject: ((error: Error) => void) | undefined;
+  readonly waitStarted = new Promise<void>((resolve) => {
+    this.waitStartedResolve = resolve;
+  });
+
+  async waitForRunSignal(
+    handle: SubagentRunHandle | undefined,
+    options?: { onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void> },
+  ): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    const request = this.requests.at(-1);
+    if (request) await options?.onUpdate?.({
+      runId: request.runId,
+      status: "running",
+      steps: request.tasks.map((task) => ({ id: task.assignmentId, status: "completed", agent: task.agent })),
+    });
+    this.waitStartedResolve();
+    return new Promise<RunStatus>((_resolve, reject) => {
+      this.waitReject = reject;
+    });
+  }
+
+  fail(error = new Error("wait failed")): void {
+    this.waitReject?.(error);
+  }
+}
+
+class CompletedProgressNoResultRuntime extends CompletingRuntime {
+  async waitForRunSignal(
+    handle: SubagentRunHandle | undefined,
+    options?: { onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void> },
+  ): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    const request = this.requests.at(-1);
+    if (request) await options?.onUpdate?.({
+      runId: request.runId,
+      status: "running",
+      steps: request.tasks.map((task) => ({ id: task.assignmentId, status: "completed", agent: task.agent })),
+    });
+    return "completed";
+  }
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    return undefined;
+  }
+}
+
 class AttentionThenCompletingRuntime extends CompletingRuntime {
   async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
     const request = this.requests.find((candidate) => candidate.runId === handle.runId) ?? this.requests.at(-1);
@@ -135,9 +246,27 @@ class CancelSpyRuntime extends CompletingRuntime {
   }
 }
 
+class SignalRuntime extends CompletingRuntime {
+  constructor(private readonly signalStatus: RunStatus) {
+    super();
+  }
+
+  async waitForRunSignal(): Promise<RunStatus> {
+    return this.signalStatus;
+  }
+
+  async getRunResult(_handle: SubagentRunHandle): Promise<string | undefined> {
+    return undefined;
+  }
+}
+
 function controllerWith(runtime: SubagentRuntime = new CompletingRuntime()): { controller: TaskRunControllerApi; runtime: SubagentRuntime } {
   const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
   return { controller: asTaskRunApi(controller), runtime };
+}
+
+function markRunLive(controller: TaskRunControllerApi, runId: string): void {
+  (controller as unknown as { liveRunIds: Set<string> }).liveRunIds.add(runId);
 }
 
 const baseSetTasks = {
@@ -205,12 +334,26 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(state.taskRuns[0].status).toBe("completed");
   });
 
-  test("setTasks replaces an existing task run instead of appending plan history", async () => {
+  test("setTasks appends a new task run when taskRunId is omitted", async () => {
     const { controller } = controllerWith(new CompletingRuntime());
 
     await controller.setTasks(baseSetTasks);
     await controller.awaitLastWork();
-    await expect(controller.setTasks({ ...baseSetTasks, title: "Replacement", tasks: [{ id: "replacement", group: "main", text: "Do replacement", criteria: ["Done"] }] })).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-1" });
+    const { taskRunId: _omittedTaskRunId, ...nextTasks } = baseSetTasks;
+    await expect(controller.setTasks({ ...nextTasks, title: "Next", tasks: [{ id: "next", group: "main", text: "Do next", criteria: ["Done"] }] })).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-2" });
+
+    const state = controller.getState();
+    expect(state.taskRuns.map((run) => run.id)).toEqual(["task-run-1", "task-run-2"]);
+    expect(state.taskRuns[1].title).toBe("Next");
+    expect(state.taskRuns[1].tasks.map((task) => task.id)).toEqual(["next"]);
+  });
+
+  test("setTasks replaces an existing task run when taskRunId is explicit", async () => {
+    const { controller } = controllerWith(new CompletingRuntime());
+
+    await controller.setTasks(baseSetTasks);
+    await controller.awaitLastWork();
+    await expect(controller.setTasks({ ...baseSetTasks, taskRunId: "task-run-1", title: "Replacement", tasks: [{ id: "replacement", group: "main", text: "Do replacement", criteria: ["Done"] }] })).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-1" });
 
     const state = controller.getState();
     expect(state.taskRuns.map((run) => run.id)).toEqual(["task-run-1"]);
@@ -352,6 +495,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     const runtime = new StopSpyRuntime();
     const { controller } = controllerWith(runtime);
     controller.restoreState(recoverableState("running"));
+    markRunLive(controller, "run-1");
 
     await expect(controller.stopRun("a1")).resolves.toBe(true);
 
@@ -364,6 +508,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     const runtime = new CancelSpyRuntime();
     const { controller } = controllerWith(runtime);
     controller.restoreState(recoverableState("running"));
+    markRunLive(controller, "run-1");
 
     await expect(controller.cancelRun("a1")).resolves.toBe(true);
 
@@ -372,6 +517,159 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     const assignments = controller.getState().taskRuns[0].assignments;
     expect(assignments.find((assignment) => assignment.id === "a1")?.status).toBe("cancelled");
     expect(assignments.find((assignment) => assignment.id === "a2")?.status).toBe("failed");
+  });
+
+  test("cancelRun marks an attention assignment without signalling stale pids", async () => {
+    const runtime = new CancelSpyRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("attention"));
+
+    await expect(controller.cancelRun("a1")).resolves.toBe(true);
+
+    expect(runtime.cancelled).toEqual([]);
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("cancelled");
+  });
+
+  test("cancelRun marks a stale running assignment without signalling stale pids", async () => {
+    const runtime = new CancelSpyRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("running"));
+
+    await expect(controller.cancelRun("a1")).resolves.toBe(true);
+
+    expect(runtime.cancelled).toEqual([]);
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("cancelled");
+  });
+
+  test("restoreState clears live run tracking before accepting restored handles", async () => {
+    const runtime = new StopSpyRuntime();
+    const { controller } = controllerWith(runtime);
+    markRunLive(controller, "run-1");
+    controller.restoreState(recoverableState("running"));
+
+    await expect(controller.stopRun("a1")).resolves.toBe(false);
+
+    expect(runtime.stopped).toEqual([]);
+  });
+
+  test("restoreState fences in-flight dispatch results from restored state", async () => {
+    const runtime = new ControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    await runtime.waitStarted;
+
+    const restored = recoverableState("running");
+    const restoredRunId = runtime.requests[0].runId;
+    const ref = { ...launchRef(), runId: restoredRunId, asyncId: `async-${restoredRunId}` };
+    for (const assignment of restored.taskRuns[0].assignments) {
+      assignment.runId = restoredRunId;
+      assignment.launchRef = ref;
+    }
+    controller.restoreState(restored);
+
+    runtime.complete("completed");
+    await controller.awaitLastWork();
+
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("running");
+  });
+
+  test("restoreState fences in-flight dispatch result reads from restored state", async () => {
+    const runtime = new ResultControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    await runtime.resultStarted;
+
+    const restored = recoverableState("running");
+    const restoredRunId = runtime.requests[0].runId;
+    const ref = { ...launchRef(), runId: restoredRunId, asyncId: `async-${restoredRunId}` };
+    for (const assignment of restored.taskRuns[0].assignments) {
+      assignment.runId = restoredRunId;
+      assignment.launchRef = ref;
+    }
+    controller.restoreState(restored);
+
+    runtime.releaseResult();
+    await controller.awaitLastWork();
+
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("running");
+  });
+
+  test.each([
+    ["stopRun", "completed"],
+    ["stopRun", "paused"],
+    ["stopRun", "running"],
+    ["cancelRun", "cancelled"],
+    ["cancelRun", "paused"],
+  ] as const)("%s refuses stale non-live assignment handles", async (method, status) => {
+    const runtime = method === "stopRun" ? new StopSpyRuntime() : new CancelSpyRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState(status));
+
+    await expect(controller[method]("a1")).resolves.toBe(false);
+
+    expect(runtime instanceof StopSpyRuntime ? runtime.stopped : runtime.cancelled).toEqual([]);
+  });
+
+  test.each([
+    ["stopRun", "paused"],
+    ["cancelRun", "cancelled"],
+  ] as const)("dispatch failures preserve %s terminal control status", async (method, expectedStatus) => {
+    const runtime = new ControlledSpyRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    await runtime.waitStarted;
+    const assignmentId = controller.getState().taskRuns[0].assignments[0].id;
+    await expect(controller[method](assignmentId)).resolves.toBe(true);
+
+    runtime.fail();
+    await controller.awaitLastWork();
+
+    expect(controller.getState().taskRuns[0].assignments[0].status).toBe(expectedStatus);
+  });
+
+  test("dispatch failures recover completed progress without result as attention", async () => {
+    const runtime = new CompletedProgressFailRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    await runtime.waitStarted;
+
+    runtime.fail();
+    await controller.awaitLastWork();
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.assignments[0].status).toBe("attention");
+    expect(taskRun.tasks[0].status).toBe("attention");
+  });
+
+  test("completed progress without result stays attention without completedAt", async () => {
+    const { controller } = controllerWith(new CompletedProgressNoResultRuntime());
+
+    await controller.setTasks(baseSetTasks);
+    await controller.awaitLastWork();
+
+    const assignment = controller.getState().taskRuns[0].assignments[0];
+    expect(assignment.status).toBe("attention");
+    expect(assignment.completedAt).toBeUndefined();
+  });
+
+  test.each([
+    ["paused", "paused"],
+    ["cancelled", "cancelled"],
+  ] as const)("dispatch outcome marks unreported assignments %s", async (signalStatus, expectedStatus) => {
+    const { controller } = controllerWith(new SignalRuntime(signalStatus));
+
+    await controller.setTasks(baseSetTasks);
+    await controller.awaitLastWork();
+
+    expect(controller.getState().taskRuns[0].assignments[0].status).toBe(expectedStatus);
   });
 
   test("freeform asks create a one-task TaskRun", async () => {

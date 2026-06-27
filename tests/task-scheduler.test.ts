@@ -348,6 +348,7 @@ describe("task scheduler", () => {
     const taskRun = makeTaskRun();
     const assignment = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 }).assignments[0];
     assignment.status = "queued";
+    assignment.runId = "run-1";
 
     const changed = applyAssignmentProgress(taskRun, {
       runId: "run-1",
@@ -360,9 +361,28 @@ describe("task scheduler", () => {
     expect(assignment.updatedAt).toBe(3);
   });
 
+  test("ignores progress snapshots from a different run with a reused assignment id", () => {
+    const taskRun = makeTaskRun();
+    const assignment = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 }).assignments[0];
+    assignment.runId = "new-run";
+    assignment.status = "running";
+
+    const changed = applyAssignmentProgress(taskRun, {
+      runId: "old-run",
+      status: "running",
+      steps: [{ id: assignment.id, status: "failed", currentTool: "bash" }],
+    }, 3);
+
+    expect(changed).toBe(false);
+    expect(assignment.status).toBe("running");
+    expect(assignment.currentTool).toBeUndefined();
+    expect(assignment.updatedAt).toBe(2);
+  });
+
   test("applies assignment progress activity fields", () => {
     const taskRun = makeTaskRun();
     const assignment = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 }).assignments[0];
+    assignment.runId = "run-1";
 
     applyAssignmentProgress(taskRun, {
       runId: "run-1",

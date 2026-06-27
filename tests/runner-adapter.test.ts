@@ -351,6 +351,38 @@ describe("PiRunnerAdapter task graph boundary", () => {
     }
   });
 
+  test("waits for result file after terminal status appears", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    try {
+      const asyncDir = path.join(root, "restored-async");
+      const resultPath = path.join(root, "restored-results", "run-restored.json");
+      await mkdir(asyncDir, { recursive: true });
+      await mkdir(path.dirname(resultPath), { recursive: true });
+      await writeFile(path.join(asyncDir, "status.json"), JSON.stringify({
+        runId: "run-restored",
+        state: "complete",
+        steps: [{ id: "a1", status: "completed", agent: "delegate" }],
+      }), "utf8");
+
+      const adapter = new PiRunnerAdapter({
+        piBin: "true",
+        asyncDirRootOverride: path.join(root, "unused-async-root"),
+        resultsDirOverride: path.join(root, "unused-results-root"),
+      });
+      const handle: SubagentRunHandle = {
+        runId: "run-restored",
+        asyncId: "run-restored",
+        asyncDir,
+        resultPath,
+        assignments: [{ assignmentId: "a1", runId: "run-restored", resultPath }],
+      };
+
+      await expect(adapter.waitForRunSignal(handle, { timeoutMs: 25 })).resolves.toBe("attention");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test.each([
     ["cancelRun", "cancelled", "Cancelled by user"],
     ["stopRun", "paused", "Stopped by user; continuation available"],
