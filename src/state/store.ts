@@ -1,19 +1,23 @@
 // ──────────────────────────────────────────────
-// Plan-first state store: create, normalize, serialize, and lock
+// Task-run state store: create, normalize, serialize, and lock
 // ──────────────────────────────────────────────
 
 import { STATE_VERSION } from "../defaults.js";
 import type {
   ArtifactRef,
   AssignmentStatus,
-  PhaseRecord,
-  PhaseStatus,
-  PlanRecord,
-  PlanStatus,
+  SubagentRunAssignmentHandle,
+  SubagentRunHandle,
   TaskAssignmentRecord,
   TaskCriterion,
   TaskEvidence,
+  TaskGroupRecord,
+  TaskGroupStatus,
   TaskRecord,
+  TaskReportStatus,
+  TaskResultRecord,
+  TaskRunRecord,
+  TaskRunStatus,
   TaskStatus,
   TaskedSubagentsState,
 } from "../types.js";
@@ -50,10 +54,15 @@ function optionalPositiveInteger(raw: unknown): number | undefined {
   return typeof raw === "number" && Number.isInteger(raw) && raw > 0 ? raw : undefined;
 }
 
-const PLAN_STATUS_SET = new Set<PlanStatus>(["pending", "running", "attention", "completed", "failed", "cancelled"]);
-const PHASE_STATUS_SET = new Set<PhaseStatus>(["pending", "ready", "running", "blocked", "attention", "completed", "failed", "cancelled"]);
-const TASK_STATUS_SET = new Set<TaskStatus>(["pending", "ready", "running", "blocked", "attention", "completed", "failed", "cancelled"]);
-const ASSIGNMENT_STATUS_SET = new Set<AssignmentStatus>(["queued", "running", "blocked", "attention", "completed", "failed", "cancelled", "paused", "skipped"]);
+function optionalTimestamp(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+}
+
+const TASK_RUN_STATUS: Record<TaskRunStatus, true> = { pending: true, running: true, attention: true, completed: true, failed: true, cancelled: true };
+const TASK_GROUP_STATUS: Record<TaskGroupStatus, true> = { pending: true, ready: true, running: true, blocked: true, attention: true, completed: true, failed: true, cancelled: true };
+const TASK_STATUS: Record<TaskStatus, true> = { pending: true, ready: true, running: true, blocked: true, attention: true, completed: true, failed: true, cancelled: true };
+const ASSIGNMENT_STATUS: Record<AssignmentStatus, true> = { queued: true, running: true, blocked: true, attention: true, completed: true, failed: true, cancelled: true, paused: true, skipped: true };
+const TASK_REPORT_STATUS: Record<TaskReportStatus, true> = { completed: true, attention: true, failed: true };
 
 function normalizeEvidence(raw: unknown): TaskEvidence | undefined {
   const input = objectRecord(raw);
@@ -81,137 +90,237 @@ function normalizeCriterion(raw: unknown, index: number): TaskCriterion {
   return { id, text, satisfied, evidence };
 }
 
-function normalizeTask(raw: unknown, index: number): TaskRecord {
+function normalizeTask(raw: unknown): TaskRecord | undefined {
   const input = objectRecord(raw);
-  const timestamp = now();
-  const rawStatus = stringValue(input.status, "pending") as TaskStatus;
-  const criteria = Array.isArray(input.criteria)
-    ? input.criteria.map((criterion, criterionIndex) => {
-      if (typeof criterion === "string") {
-        return normalizeCriterion({ id: `C${criterionIndex + 1}`, text: criterion }, criterionIndex);
-      }
-      return normalizeCriterion(criterion, criterionIndex);
-    }).filter((criterion) => criterion.text)
-    : [];
+  const id = optionalString(input.id);
+  const text = optionalString(input.text);
+  const rawStatus = optionalString(input.status) as TaskStatus | undefined;
+  const createdAt = optionalTimestamp(input.createdAt);
+  const updatedAt = optionalTimestamp(input.updatedAt);
+  if (!id || !text || !rawStatus || !Array.isArray(input.criteria) || createdAt === undefined || updatedAt === undefined) {
+    return undefined;
+  }
+  const filesHint = stringList(input.filesHint);
+  const criteria = input.criteria.map((criterion, criterionIndex) => {
+    if (typeof criterion === "string") {
+      return normalizeCriterion({ id: `C${criterionIndex + 1}`, text: criterion }, criterionIndex);
+    }
+    return normalizeCriterion(criterion, criterionIndex);
+  }).filter((criterion) => criterion.text);
 
   return {
-    id: optionalString(input.id) ?? `T${index + 1}`,
-    text: optionalString(input.text) ?? "",
-    status: TASK_STATUS_SET.has(rawStatus) ? rawStatus : "pending",
+    id,
+    groupId: optionalString(input.groupId),
+    text,
+    status: Object.prototype.hasOwnProperty.call(TASK_STATUS, rawStatus) ? rawStatus : "pending",
     criteria,
     dependsOn: stringList(input.dependsOn),
     assignmentIds: stringList(input.assignmentIds),
     agentHint: optionalString(input.agentHint),
-    filesHint: stringList(input.filesHint).length > 0 ? stringList(input.filesHint) : undefined,
+    filesHint: filesHint.length > 0 ? filesHint : undefined,
     cwd: optionalString(input.cwd),
     retries: typeof input.retries === "number" && Number.isInteger(input.retries) && input.retries >= 0 ? input.retries : undefined,
     outputMode: input.outputMode === "json" ? "json" : input.outputMode === "text" ? "text" : undefined,
     outputSchema: optionalString(input.outputSchema),
     when: optionalString(input.when),
     continuation: optionalString(input.continuation),
-    createdAt: numberValue(input.createdAt, timestamp),
-    updatedAt: numberValue(input.updatedAt, timestamp),
-    completedAt: typeof input.completedAt === "number" && Number.isFinite(input.completedAt) ? input.completedAt : undefined,
+    createdAt,
+    updatedAt,
+    completedAt: optionalTimestamp(input.completedAt),
   };
 }
 
-function normalizePhase(raw: unknown, index: number): PhaseRecord {
-  const input = objectRecord(raw);
-  const timestamp = now();
-  const rawStatus = stringValue(input.status, "pending") as PhaseStatus;
-  const filesHint = stringList(input.filesHint);
-  return {
-    id: optionalString(input.id) ?? `P${index + 1}`,
-    title: optionalString(input.title) ?? "",
-    status: PHASE_STATUS_SET.has(rawStatus) ? rawStatus : "pending",
-    tasks: Array.isArray(input.tasks) ? input.tasks.map(normalizeTask) : [],
-    dependsOn: stringList(input.dependsOn),
-    goal: optionalString(input.goal),
-    agentHint: optionalString(input.agentHint),
-    filesHint: filesHint.length > 0 ? filesHint : undefined,
-    brief: optionalString(input.brief),
-    maxConcurrency: optionalPositiveInteger(input.maxConcurrency),
-    createdAt: numberValue(input.createdAt, timestamp),
-    updatedAt: numberValue(input.updatedAt, timestamp),
-    completedAt: typeof input.completedAt === "number" && Number.isFinite(input.completedAt) ? input.completedAt : undefined,
-  };
-}
-
-function normalizeArtifact(raw: unknown): ArtifactRef | undefined {
-  const input = objectRecord(raw);
-  const label = optionalString(input.label);
-  const path = optionalString(input.path);
-  const assignmentId = optionalString(input.assignmentId);
-  const phaseId = optionalString(input.phaseId);
-  const taskId = optionalString(input.taskId);
-  if (!label || !path || !assignmentId || !phaseId || !taskId) return undefined;
-  return { label, path, assignmentId, phaseId, taskId };
-}
-
-function normalizeAssignment(raw: unknown): TaskAssignmentRecord | undefined {
+function normalizeGroup(raw: unknown): TaskGroupRecord | undefined {
   const input = objectRecord(raw);
   const id = optionalString(input.id);
-  const planId = optionalString(input.planId);
-  const phaseId = optionalString(input.phaseId);
-  const taskId = optionalString(input.taskId);
-  const agent = optionalString(input.agent);
-  const prompt = optionalString(input.prompt);
-  if (!id || !planId || !phaseId || !taskId || !agent || !prompt) return undefined;
-  const timestamp = now();
-  const rawStatus = stringValue(input.status, "queued") as AssignmentStatus;
-  return {
-    id,
-    planId,
-    phaseId,
-    taskId,
-    agent,
-    prompt,
-    status: ASSIGNMENT_STATUS_SET.has(rawStatus) ? rawStatus : "queued",
-    runId: optionalString(input.runId),
-    launchRef: typeof input.launchRef === "object" && input.launchRef !== null ? input.launchRef as TaskAssignmentRecord["launchRef"] : undefined,
-    result: typeof input.result === "object" && input.result !== null ? input.result as TaskAssignmentRecord["result"] : undefined,
-    currentTool: optionalString(input.currentTool),
-    lastActionAt: typeof input.lastActionAt === "number" && Number.isFinite(input.lastActionAt) ? input.lastActionAt : undefined,
-    lastActionSummary: optionalString(input.lastActionSummary),
-    recentActivity: stringList(input.recentActivity).slice(-3),
-    createdAt: numberValue(input.createdAt, timestamp),
-    updatedAt: numberValue(input.updatedAt, timestamp),
-    completedAt: typeof input.completedAt === "number" && Number.isFinite(input.completedAt) ? input.completedAt : undefined,
-  };
-}
-
-function normalizePlan(raw: unknown, index: number): PlanRecord | undefined {
-  const input = objectRecord(raw);
-  const timestamp = now();
-  const id = optionalString(input.id) ?? `plan-${index + 1}`;
   const title = optionalString(input.title);
-  const spec = optionalString(input.spec);
-  if (!title || !spec) return undefined;
-  const rawStatus = stringValue(input.status, "pending") as PlanStatus;
+  const rawStatus = optionalString(input.status) as TaskGroupStatus | undefined;
+  const maxConcurrency = optionalPositiveInteger(input.maxConcurrency);
+  const createdAt = optionalTimestamp(input.createdAt);
+  const updatedAt = optionalTimestamp(input.updatedAt);
+  if (!id || !title || !rawStatus || !Array.isArray(input.dependsOn) || maxConcurrency === undefined || createdAt === undefined || updatedAt === undefined) {
+    return undefined;
+  }
+  const filesHint = stringList(input.filesHint);
   return {
     id,
     title,
-    request: optionalString(input.request) ?? spec,
-    spec,
-    status: PLAN_STATUS_SET.has(rawStatus) ? rawStatus : "pending",
-    phases: Array.isArray(input.phases) ? input.phases.map(normalizePhase) : [],
-    assignments: Array.isArray(input.assignments)
-      ? input.assignments.map(normalizeAssignment).filter((entry): entry is TaskAssignmentRecord => Boolean(entry))
+    status: Object.prototype.hasOwnProperty.call(TASK_GROUP_STATUS, rawStatus) ? rawStatus : "pending",
+    dependsOn: stringList(input.dependsOn),
+    maxConcurrency,
+    agentHint: optionalString(input.agentHint),
+    filesHint: filesHint.length > 0 ? filesHint : undefined,
+    createdAt,
+    updatedAt,
+    completedAt: optionalTimestamp(input.completedAt),
+  };
+}
+
+interface TaskContextFallback {
+  taskRunId: string;
+  groupId?: string;
+  taskId?: string;
+  assignmentId?: string;
+}
+
+function normalizeArtifact(raw: unknown, fallback: TaskContextFallback): ArtifactRef | undefined {
+  const input = objectRecord(raw);
+  const label = optionalString(input.label);
+  const path = optionalString(input.path);
+  const assignmentId = optionalString(input.assignmentId) ?? fallback.assignmentId;
+  const taskRunId = fallback.taskRunId;
+  const taskId = optionalString(input.taskId) ?? fallback.taskId;
+  const groupId = optionalString(input.groupId) ?? fallback.groupId;
+  if (!label || !path || !assignmentId || !taskId) return undefined;
+  return { label, path, assignmentId, taskRunId, groupId, taskId };
+}
+
+function normalizeLaunchAssignmentHandle(raw: unknown, fallback: { assignmentId: string; runId: string; resultPath?: string }): SubagentRunAssignmentHandle | undefined {
+  const input = objectRecord(raw);
+  const assignmentId = optionalString(input.assignmentId) ?? fallback.assignmentId;
+  const runId = optionalString(input.runId) ?? fallback.runId;
+  if (!assignmentId || !runId) return undefined;
+  const resultPath = optionalString(input.resultPath) ?? fallback.resultPath;
+  return {
+    assignmentId,
+    runId,
+    ...(resultPath ? { resultPath } : {}),
+  };
+}
+
+function normalizeLaunchRef(raw: unknown, assignmentId: string, assignmentRunId?: string, assignmentResultPath?: string): SubagentRunHandle | undefined {
+  const input = objectRecord(raw);
+  const runId = optionalString(input.runId) ?? assignmentRunId ?? optionalString(input.asyncId);
+  if (!runId) return undefined;
+  const asyncId = optionalString(input.asyncId) ?? runId;
+  const resultPath = optionalString(input.resultPath) ?? assignmentResultPath;
+  const assignments = Array.isArray(input.assignments)
+    ? input.assignments
+      .map((entry) => normalizeLaunchAssignmentHandle(entry, { assignmentId, runId, resultPath }))
+      .filter((entry): entry is SubagentRunAssignmentHandle => Boolean(entry))
+    : [];
+  if (!assignments.some((entry) => entry.assignmentId === assignmentId)) {
+    assignments.push({ assignmentId, runId, ...(resultPath ? { resultPath } : {}) });
+  }
+  return {
+    runId,
+    asyncId,
+    ...(optionalString(input.asyncDir) ? { asyncDir: optionalString(input.asyncDir) } : {}),
+    ...(resultPath ? { resultPath } : {}),
+    ...(optionalString(input.sessionFile) ? { sessionFile: optionalString(input.sessionFile) } : {}),
+    ...(optionalString(input.artifactPath) ? { artifactPath: optionalString(input.artifactPath) } : {}),
+    assignments,
+  };
+}
+
+function normalizeCriteriaEvidence(raw: unknown): TaskResultRecord["criteriaEvidence"][number] | undefined {
+  const input = objectRecord(raw);
+  const criterionId = optionalString(input.criterionId);
+  const evidence = optionalString(input.evidence);
+  if (typeof input.criteriaIndex !== "number" || !Number.isInteger(input.criteriaIndex) || !criterionId || !evidence) return undefined;
+  return { criteriaIndex: input.criteriaIndex, criterionId, evidence };
+}
+
+function normalizeResult(raw: unknown, fallback: Required<Pick<TaskContextFallback, "assignmentId" | "taskRunId" | "taskId">> & Pick<TaskContextFallback, "groupId">): TaskResultRecord | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const input = raw as Record<string, unknown>;
+  const assignmentId = optionalString(input.assignmentId) ?? fallback.assignmentId;
+  const rawStatus = stringValue(input.status) as TaskReportStatus;
+  const summary = optionalString(input.summary);
+  if (!assignmentId || !Object.prototype.hasOwnProperty.call(TASK_REPORT_STATUS, rawStatus) || !summary) return undefined;
+  return {
+    assignmentId,
+    status: rawStatus,
+    summary,
+    criteriaEvidence: Array.isArray(input.criteriaEvidence)
+      ? input.criteriaEvidence.map(normalizeCriteriaEvidence).filter((entry): entry is TaskResultRecord["criteriaEvidence"][number] => Boolean(entry))
       : [],
     artifacts: Array.isArray(input.artifacts)
-      ? input.artifacts.map(normalizeArtifact).filter((entry): entry is ArtifactRef => Boolean(entry))
+      ? input.artifacts.map((artifact) => normalizeArtifact(artifact, fallback)).filter((entry): entry is ArtifactRef => Boolean(entry))
+      : [],
+    followUps: stringList(input.followUps),
+    rawResultPath: optionalString(input.rawResultPath),
+    createdAt: numberValue(input.createdAt, now()),
+  };
+}
+
+function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: ReadonlyMap<string, string | undefined>): TaskAssignmentRecord | undefined {
+  const input = objectRecord(raw);
+  const id = optionalString(input.id);
+  const taskId = optionalString(input.taskId);
+  const agent = optionalString(input.agent);
+  const prompt = optionalString(input.prompt);
+  if (!id || !taskId || !agent || !prompt) return undefined;
+  const groupId = optionalString(input.groupId) ?? groupIdByTaskId.get(taskId);
+  const launchInput = objectRecord(input.launchRef);
+  const runId = optionalString(input.runId) ?? optionalString(launchInput.runId) ?? optionalString(launchInput.asyncId);
+  const assignmentResultPath = optionalString(input.resultPath);
+  const launchRef = normalizeLaunchRef(input.launchRef, id, runId, assignmentResultPath);
+  const timestamp = now();
+  const rawStatus = stringValue(input.status, "queued") as AssignmentStatus;
+  const recentActivity = stringList(input.recentActivity).slice(-3);
+  return {
+    id,
+    taskRunId,
+    groupId,
+    taskId,
+    agent,
+    prompt,
+    status: Object.prototype.hasOwnProperty.call(ASSIGNMENT_STATUS, rawStatus) ? rawStatus : "queued",
+    runId: runId ?? launchRef?.runId,
+    launchRef,
+    result: normalizeResult(input.result, { assignmentId: id, taskRunId, groupId, taskId }),
+    currentTool: optionalString(input.currentTool),
+    lastActionAt: optionalTimestamp(input.lastActionAt),
+    lastActionSummary: optionalString(input.lastActionSummary),
+    ...(recentActivity.length > 0 ? { recentActivity } : {}),
+    createdAt: numberValue(input.createdAt, timestamp),
+    updatedAt: numberValue(input.updatedAt, timestamp),
+    completedAt: optionalTimestamp(input.completedAt),
+  };
+}
+
+function normalizeTaskRun(raw: unknown, index: number): TaskRunRecord | undefined {
+  const input = objectRecord(raw);
+  const timestamp = now();
+  const id = optionalString(input.id);
+  const title = optionalString(input.title);
+  const request = optionalString(input.request);
+  const context = optionalString(input.context);
+  if (!id || !title || !request || !context) return undefined;
+  const rawStatus = stringValue(input.status, "pending") as TaskRunStatus;
+  const groups = Array.isArray(input.groups)
+    ? input.groups.map(normalizeGroup).filter((entry): entry is TaskGroupRecord => Boolean(entry))
+    : [];
+  const tasks = Array.isArray(input.tasks)
+    ? input.tasks.map(normalizeTask).filter((entry): entry is TaskRecord => Boolean(entry))
+    : [];
+  const groupIdByTaskId = new Map(tasks.map((task) => [task.id, task.groupId]));
+  return {
+    id,
+    title,
+    request,
+    context,
+    status: Object.prototype.hasOwnProperty.call(TASK_RUN_STATUS, rawStatus) ? rawStatus : "pending",
+    groups,
+    tasks,
+    assignments: Array.isArray(input.assignments)
+      ? input.assignments.map((assignment) => normalizeAssignment(assignment, id, groupIdByTaskId)).filter((entry): entry is TaskAssignmentRecord => Boolean(entry))
+      : [],
+    artifacts: Array.isArray(input.artifacts)
+      ? input.artifacts.map((artifact) => normalizeArtifact(artifact, { taskRunId: id })).filter((entry): entry is ArtifactRef => Boolean(entry))
       : [],
     maxConcurrency: optionalPositiveInteger(input.maxConcurrency),
     createdAt: numberValue(input.createdAt, timestamp),
     updatedAt: numberValue(input.updatedAt, timestamp),
-    completedAt: typeof input.completedAt === "number" && Number.isFinite(input.completedAt) ? input.completedAt : undefined,
+    completedAt: optionalTimestamp(input.completedAt),
   };
 }
 
 export function createEmptyState(): TaskedSubagentsState {
   return {
-    version: STATE_VERSION as 3,
-    plans: [],
+    version: STATE_VERSION as 4,
+    taskRuns: [],
     updatedAt: now(),
   };
 }
@@ -221,22 +330,24 @@ export function cloneState(state: TaskedSubagentsState): TaskedSubagentsState {
 }
 
 /**
- * Normalize only valid current-version state. Older ask/run/workflow snapshots
- * and incompatible pre-run-handle snapshots are intentionally reset because the
- * plugin is still unreleased and the current model is a clean break.
+ * Normalize only valid v4 task-run state. Older plan/phase snapshots are a
+ * clean break and intentionally reset without migration.
  */
 export function ensureState(raw: unknown): TaskedSubagentsState {
   const input = objectRecord(raw);
-  if (input.version !== STATE_VERSION) return createEmptyState();
+  if (input.version !== STATE_VERSION || !Array.isArray(input.taskRuns)) return createEmptyState();
 
-  const plans = Array.isArray(input.plans)
-    ? input.plans.map(normalizePlan).filter((entry): entry is PlanRecord => Boolean(entry))
-    : [];
-  const currentPlanId = optionalString(input.currentPlanId);
+  const taskRuns = input.taskRuns
+    .map(normalizeTaskRun)
+    .filter((entry): entry is TaskRunRecord => Boolean(entry));
+  const currentTaskRunId = optionalString(input.currentTaskRunId);
+  const validCurrentTaskRunId = currentTaskRunId && taskRuns.some((taskRun) => taskRun.id === currentTaskRunId)
+    ? currentTaskRunId
+    : taskRuns.at(-1)?.id;
   return {
-    version: STATE_VERSION as 3,
-    plans,
-    currentPlanId: currentPlanId && plans.some((plan) => plan.id === currentPlanId) ? currentPlanId : plans.at(-1)?.id,
+    version: STATE_VERSION as 4,
+    taskRuns,
+    ...(validCurrentTaskRunId ? { currentTaskRunId: validCurrentTaskRunId } : {}),
     updatedAt: numberValue(input.updatedAt, now()),
   };
 }
