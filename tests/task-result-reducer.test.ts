@@ -2,70 +2,105 @@ import { describe, expect, test } from "vitest";
 
 import { applySubagentTaskReport, parseTaskReport } from "../src/orchestration/task-result-reducer.js";
 import { createReadyAssignments } from "../src/orchestration/task-scheduler.js";
-import { normalizePlanInput } from "../src/state/plan-validation.js";
+import { normalizeTaskRunInput } from "../src/state/task-run-validation.js";
 
 function setup() {
-  const normalized = normalizePlanInput({
-    title: "Plan",
-    spec: "Spec",
-    phases: [{ id: "main", title: "Main", tasks: [{ id: "task", text: "Do task", criteria: ["Criterion one", "Criterion two"] }] }],
-  }, { planId: "plan-1", now: 1 });
-  if (!normalized.plan) throw new Error(normalized.errors.join("\n"));
-  const plan = normalized.plan;
-  const scheduled = createReadyAssignments(plan, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 });
+  const normalized = normalizeTaskRunInput({
+    title: "Task run",
+    request: "Complete the requested work",
+    groups: [{ id: "main", title: "Main" }],
+    tasks: [{ id: "task", group: "main", text: "Do task", criteria: ["Criterion one", "Criterion two"] }],
+  }, { taskRunId: "task-run-1", now: 1 });
+  if (!normalized.taskRun) throw new Error(normalized.errors.join("\n"));
+  const taskRun = normalized.taskRun;
+  const scheduled = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 });
   const assignment = scheduled.assignments[0];
-  return { plan, assignment };
+  return { taskRun, assignment, task: taskRun.tasks[0] };
+}
+
+function completeReport({ taskRun, assignment }: ReturnType<typeof setup>) {
+  return {
+    taskRunId: taskRun.id,
+    groupId: assignment.groupId,
+    taskId: assignment.taskId,
+    assignmentId: assignment.id,
+    status: "completed",
+    summary: "Done",
+    criteriaEvidence: [{ criteriaIndex: 0, evidence: "Evidence one" }, { criteriaIndex: 1, evidence: "Evidence two" }],
+  } as const;
 }
 
 describe("task result reducer", () => {
   test("applies evidence and completes task when all criteria are covered", () => {
-    const { plan, assignment } = setup();
+    const fixture = setup();
+    const { taskRun, assignment } = fixture;
 
-    const result = applySubagentTaskReport(plan, {
-      planId: plan.id,
-      phaseId: assignment.phaseId,
-      taskId: assignment.taskId,
-      assignmentId: assignment.id,
-      status: "completed",
-      summary: "Done",
-      criteriaEvidence: [{ criteriaIndex: 0, evidence: "Evidence one" }, { criteriaIndex: 1, evidence: "Evidence two" }],
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
       artifacts: [{ label: "notes", path: "notes.md" }],
     }, { now: 3 });
 
     expect(result.applied).toBe(true);
-    expect(plan.phases[0].tasks[0].status).toBe("completed");
-    expect(plan.phases[0].status).toBe("completed");
-    expect(plan.status).toBe("completed");
-    expect(plan.artifacts[0]).toMatchObject({ label: "notes", assignmentId: assignment.id });
+    expect(taskRun.tasks[0].status).toBe("completed");
+    expect(taskRun.groups[0].status).toBe("completed");
+    expect(taskRun.status).toBe("completed");
+    expect(taskRun.artifacts[0]).toMatchObject({
+      label: "notes",
+      assignmentId: assignment.id,
+      taskRunId: taskRun.id,
+      groupId: "main",
+      taskId: "task",
+    });
   });
 
-  test("puts task into attention when completed report lacks criterion evidence", () => {
-    const { plan, assignment } = setup();
+  test("reapplying an assignment report replaces prior evidence and artifacts", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
 
-    const result = applySubagentTaskReport(plan, {
-      planId: plan.id,
-      phaseId: assignment.phaseId,
-      taskId: assignment.taskId,
+    applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      criteriaEvidence: [{ criteriaIndex: 0, evidence: "Old one" }, { criteriaIndex: 1, evidence: "Old two" }],
+      artifacts: [{ label: "old", path: "old.md" }],
+    }, { now: 3 });
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      criteriaEvidence: [{ criteriaIndex: 0, evidence: "New one" }, { criteriaIndex: 1, evidence: "New two" }],
+      artifacts: [{ label: "new", path: "new.md" }],
+    }, { now: 4 });
+
+    expect(result.applied).toBe(true);
+    expect(task.criteria[0].evidence).toHaveLength(1);
+    expect(task.criteria[0].evidence[0]).toMatchObject({
       assignmentId: assignment.id,
-      status: "completed",
-      summary: "Done-ish",
+      summary: "New one",
+      artifactPath: "new.md",
+    });
+    expect(taskRun.artifacts).toHaveLength(1);
+    expect(taskRun.artifacts[0]).toMatchObject({ label: "new", path: "new.md" });
+  });
+
+  test("puts assignment and task into attention when completed report lacks criterion evidence", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
       criteriaEvidence: [{ criteriaIndex: 0, evidence: "Evidence one" }],
     }, { now: 3 });
 
     expect(result.applied).toBe(false);
     expect(result.errors).toContain("Report does not provide evidence for every criterion");
-    expect(plan.phases[0].tasks[0].status).toBe("attention");
-    expect(plan.status).toBe("attention");
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+    expect(taskRun.status).toBe("attention");
   });
 
   test("keeps failed reports failed even when all criteria include evidence", () => {
-    const { plan, assignment } = setup();
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
 
-    const result = applySubagentTaskReport(plan, {
-      planId: plan.id,
-      phaseId: assignment.phaseId,
-      taskId: assignment.taskId,
-      assignmentId: assignment.id,
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
       status: "failed",
       summary: "Could not complete safely",
       criteriaEvidence: [
@@ -75,44 +110,80 @@ describe("task result reducer", () => {
     }, { now: 3 });
 
     expect(result.applied).toBe(true);
-    expect(plan.phases[0].tasks[0].status).toBe("failed");
-    expect(plan.status).toBe("failed");
+    expect(assignment.status).toBe("failed");
+    expect(task.status).toBe("failed");
+    expect(task.criteria[0].evidence[0]?.summary).toBe("Tried criterion one");
+    expect(task.criteria.every((criterion) => criterion.satisfied)).toBe(false);
+    expect(taskRun.status).toBe("failed");
   });
 
-  test("rejects reports for the wrong assignment", () => {
-    const { plan, assignment } = setup();
+  test("keeps attention reports in attention and records evidence without satisfying criteria", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
 
-    const result = applySubagentTaskReport(plan, {
-      planId: plan.id,
-      phaseId: assignment.phaseId,
-      taskId: assignment.taskId,
-      assignmentId: "wrong",
-      status: "completed",
-      summary: "Done",
-      criteriaEvidence: [{ criteriaIndex: 0, evidence: "Evidence" }],
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      status: "attention",
+      summary: "Needs follow-up",
+      criteriaEvidence: [
+        { criteriaIndex: 0, evidence: "Partial criterion one" },
+        { criteriaIndex: 1, evidence: "Partial criterion two" },
+      ],
+    }, { now: 3 });
+
+    expect(result.applied).toBe(true);
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+    expect(task.criteria[0].evidence[0]?.summary).toBe("Partial criterion one");
+    expect(task.criteria.every((criterion) => criterion.satisfied)).toBe(false);
+    expect(taskRun.status).toBe("attention");
+  });
+
+  test.each([
+    ["mismatched task run id", { taskRunId: "wrong" }, "Report taskRunId wrong does not match task-run-1"],
+    ["mismatched group id", { groupId: "wrong" }, "Report groupId wrong does not match main"],
+    ["mismatched task id", { taskId: "wrong" }, "Report taskId wrong does not match task"],
+  ] as const)("puts assignment and task into attention for %s", (_name, override, expectedError) => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      ...override,
     }, { now: 3 });
 
     expect(result.applied).toBe(false);
-    expect(result.errors).toContain("Assignment wrong not found");
+    expect(result.errors).toContain(expectedError);
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+    expect(taskRun.status).toBe("attention");
+  });
+
+  test("puts launched assignment and task into attention for mismatched assignment id", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      assignmentId: "wrong",
+    }, { now: 3, expectedAssignmentId: assignment.id });
+
+    expect(result.applied).toBe(false);
+    expect(result.errors).toContain(`Report assignmentId wrong does not match launched assignment ${assignment.id}`);
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+    expect(taskRun.status).toBe("attention");
   });
 
   test("rejects stale reports for non-latest assignments without completing the task", () => {
-    const { plan, assignment } = setup();
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
     assignment.status = "paused";
-    const task = plan.phases[0].tasks[0];
     task.status = "ready";
     task.continuation = "Retry";
-    const retry = createReadyAssignments(plan, { defaultAgent: "delegate", defaultCwd: "/repo", now: 4 }).assignments[0];
+    const retry = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 4 }).assignments[0];
 
-    const result = applySubagentTaskReport(plan, {
-      planId: plan.id,
-      phaseId: assignment.phaseId,
-      taskId: assignment.taskId,
-      assignmentId: assignment.id,
-      status: "completed",
-      summary: "Old assignment finally finished",
-      criteriaEvidence: [{ criteriaIndex: 0, evidence: "Old one" }, { criteriaIndex: 1, evidence: "Old two" }],
-    }, { now: 5, expectedAssignmentId: assignment.id });
+    const result = applySubagentTaskReport(taskRun, completeReport(fixture), { now: 5, expectedAssignmentId: assignment.id });
 
     expect(result.applied).toBe(false);
     expect(result.errors).toContain(`Report assignmentId ${assignment.id} is stale; latest assignment is ${retry.id}`);
@@ -122,15 +193,26 @@ describe("task result reducer", () => {
   });
 
   test("parses a balanced task report JSON object embedded in prose", () => {
-    const parsed = parseTaskReport('Final report: {"planId":"plan-1","phaseId":"main","taskId":"task","assignmentId":"a1","status":"completed","summary":"Done","criteriaEvidence":[]}');
+    const parsed = parseTaskReport('Final report: {"taskRunId":"task-run-1","groupId":"main","taskId":"task","assignmentId":"a1","status":"completed","summary":"Done","criteriaEvidence":[]}');
 
+    expect(parsed?.taskRunId).toBe("task-run-1");
+    expect(parsed?.groupId).toBe("main");
     expect(parsed?.assignmentId).toBe("a1");
   });
 
+  test("parses a later balanced task report JSON object after an earlier non-report object", () => {
+    const parsed = parseTaskReport('Ignore {"not":"a report"} then {"taskRunId":"task-run-1","groupId":"main","taskId":"task","assignmentId":"a2","status":"completed","summary":"Done","criteriaEvidence":[]}');
+
+    expect(parsed?.assignmentId).toBe("a2");
+  });
+
+  test("parses a later fenced task report after an earlier non-report fence", () => {
+    const parsed = parseTaskReport('```json\n{"not":"a report"}\n```\n```json\n{"taskRunId":"task-run-1","groupId":"main","taskId":"task","assignmentId":"a3","status":"completed","summary":"Done","criteriaEvidence":[]}\n```');
+
+    expect(parsed?.assignmentId).toBe("a3");
+  });
+
   test.each([
-    ["mismatched plan id", { planId: "wrong" }, "Report planId wrong does not match plan-1"],
-    ["mismatched phase id", { phaseId: "wrong" }, "Report phaseId wrong does not match main"],
-    ["mismatched task id", { taskId: "wrong" }, "Report taskId wrong does not match task"],
     ["invalid status", { status: "cancelled" }, "Report status must be completed, attention, or failed"],
     ["empty summary", { summary: " " }, "Report summary is required"],
     ["missing criteria evidence", { criteriaEvidence: undefined }, "Report criteriaEvidence is required"],
@@ -139,24 +221,27 @@ describe("task result reducer", () => {
     ["non-integer criteria index", { criteriaEvidence: [{ criteriaIndex: 0.5, evidence: "one" }] }, "Criterion index must be an integer"],
     ["out-of-bounds criteria index", { criteriaEvidence: [{ criteriaIndex: 2, evidence: "one" }] }, "Criteria index 2 is out of bounds"],
     ["empty evidence", { criteriaEvidence: [{ criteriaIndex: 0, evidence: " " }] }, "Evidence for criteria index 0 is required"],
+    ["malformed criteria evidence entry", { criteriaEvidence: [null] }, "Criteria evidence entry 0 must be an object"],
+    ["non-string evidence", { criteriaEvidence: [{ criteriaIndex: 0, evidence: 42 }] }, "Evidence for criteria index 0 is required"],
+    ["non-array artifacts", { artifacts: "notes.md" }, "Report artifacts must be an array"],
+    ["malformed artifact entry", { artifacts: [null] }, "Artifact entry 0 must be an object"],
+    ["non-string artifact label", { artifacts: [{ label: 42, path: "notes.md" }] }, "Artifact label for entry 0 is required"],
+    ["non-string artifact path", { artifacts: [{ label: "notes", path: 42 }] }, "Artifact path for entry 0 is required"],
+    ["non-array follow-ups", { followUps: "todo" }, "Report followUps must be an array"],
+    ["malformed follow-up entry", { followUps: [42] }, "Follow-up entry 0 must be a string"],
   ] as const)("rejects invalid report: %s", (_name, override, expectedError) => {
-    const { plan, assignment } = setup();
-    const report = {
-      planId: plan.id,
-      phaseId: assignment.phaseId,
-      taskId: assignment.taskId,
-      assignmentId: assignment.id,
-      status: "completed",
-      summary: "Done",
-      criteriaEvidence: [{ criteriaIndex: 0, evidence: "Evidence one" }, { criteriaIndex: 1, evidence: "Evidence two" }],
-      ...override,
-    };
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
 
-    const result = applySubagentTaskReport(plan, report as Parameters<typeof applySubagentTaskReport>[1], { now: 3 });
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      ...override,
+    } as Parameters<typeof applySubagentTaskReport>[1], { now: 3 });
 
     expect(result.applied).toBe(false);
     expect(result.errors).toContain(expectedError);
-    expect(plan.phases[0].tasks[0].status).toBe("attention");
-    expect(plan.status).toBe("attention");
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+    expect(taskRun.status).toBe("attention");
   });
 });

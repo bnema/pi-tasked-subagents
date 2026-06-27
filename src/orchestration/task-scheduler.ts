@@ -1,15 +1,16 @@
 // ──────────────────────────────────────────────
-// Task scheduler: derive ready task assignments from plan state
+// Task scheduler: derive ready task assignments from task-run state
 // ──────────────────────────────────────────────
 
-import type {
-  AssignmentStatus,
-  LaunchTaskEntry,
-  PhaseRecord,
-  PlanRecord,
-  RunProgressSnapshot,
-  TaskAssignmentRecord,
-  TaskRecord,
+import {
+  ASSIGNMENT_STATUSES,
+  type AssignmentStatus,
+  type LaunchTaskEntry,
+  type RunProgressSnapshot,
+  type TaskAssignmentRecord,
+  type TaskGroupRecord,
+  type TaskRecord,
+  type TaskRunRecord,
 } from "../types.js";
 
 export interface SchedulerOptions {
@@ -17,6 +18,10 @@ export interface SchedulerOptions {
   defaultCwd: string;
   now?: number;
 }
+
+type TaskAssignmentWithLaunchDefaults = TaskAssignmentRecord & {
+  cwd?: string;
+};
 
 export interface SchedulerResult {
   assignments: TaskAssignmentRecord[];
@@ -27,12 +32,16 @@ function now(options?: { now?: number }): number {
   return options?.now ?? Date.now();
 }
 
-function taskById(plan: PlanRecord): Map<string, { phase: PhaseRecord; task: TaskRecord }> {
-  const map = new Map<string, { phase: PhaseRecord; task: TaskRecord }>();
-  for (const phase of plan.phases) {
-    for (const task of phase.tasks) map.set(task.id, { phase, task });
-  }
-  return map;
+function taskById(taskRun: TaskRunRecord): Map<string, TaskRecord> {
+  return new Map(taskRun.tasks.map((task) => [task.id, task]));
+}
+
+function groupById(taskRun: TaskRunRecord): Map<string, TaskGroupRecord> {
+  return new Map(taskRun.groups.map((group) => [group.id, group]));
+}
+
+function tasksForGroup(taskRun: TaskRunRecord, groupId: string | undefined): TaskRecord[] {
+  return taskRun.tasks.filter((task) => task.groupId === groupId);
 }
 
 function taskCriteriaSatisfied(task: TaskRecord): boolean {
@@ -47,73 +56,113 @@ function isBlockingStatus(status: string): boolean {
   return status === "failed" || status === "attention" || status === "cancelled" || status === "blocked";
 }
 
+function isAssignmentStatus(status: string | undefined): status is AssignmentStatus {
+  return typeof status === "string" && (ASSIGNMENT_STATUSES as readonly string[]).includes(status);
+}
+
 function isActiveAssignmentStatus(status: AssignmentStatus): boolean {
   return status === "queued" || status === "running";
 }
 
-function latestAssignment(plan: PlanRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
+function latestAssignment(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
   for (let index = task.assignmentIds.length - 1; index >= 0; index -= 1) {
-    const assignment = plan.assignments.find((candidate) => candidate.id === task.assignmentIds[index]);
+    const assignment = taskRun.assignments.find((candidate) => candidate.id === task.assignmentIds[index]);
     if (assignment) return assignment;
   }
   return undefined;
 }
 
-function dependencyIdsForTask(phase: PhaseRecord, task: TaskRecord): string[] {
-  if (task.dependsOn.length > 0) return task.dependsOn;
-  const index = phase.tasks.findIndex((candidate) => candidate.id === task.id);
-  const maxConcurrency = phase.maxConcurrency ?? 1;
-  if (maxConcurrency > 1 || index <= 0) return [];
-  return [phase.tasks[index - 1].id];
+function dependencyIdsForTask(taskRun: TaskRunRecord, task: TaskRecord): string[] {
+  const dependencyIds = [...task.dependsOn];
+  const addImplicitDependency = (taskId: string): void => {
+    if (!dependencyIds.includes(taskId)) dependencyIds.push(taskId);
+  };
+
+  if (!task.groupId) {
+    if (taskRun.maxConcurrency === undefined) {
+      const ungroupedTasks = tasksForGroup(taskRun, undefined);
+      const index = ungroupedTasks.findIndex((candidate) => candidate.id === task.id);
+      if (index > 0) addImplicitDependency(ungroupedTasks[index - 1].id);
+    }
+    return dependencyIds;
+  }
+
+  const group = groupById(taskRun).get(task.groupId);
+  const groupMaxConcurrency = group?.maxConcurrency ?? 1;
+  if (groupMaxConcurrency > 1) return dependencyIds;
+
+  const groupTasks = tasksForGroup(taskRun, task.groupId);
+  const index = groupTasks.findIndex((candidate) => candidate.id === task.id);
+  if (index > 0) addImplicitDependency(groupTasks[index - 1].id);
+  return dependencyIds;
 }
 
-function phaseDependenciesComplete(plan: PlanRecord, phase: PhaseRecord): boolean {
-  return phase.dependsOn.every((depId) => plan.phases.find((candidate) => candidate.id === depId)?.status === "completed");
+function groupDependenciesComplete(taskRun: TaskRunRecord, group: TaskGroupRecord): boolean {
+  const groups = groupById(taskRun);
+  return group.dependsOn.every((depId) => groups.get(depId)?.status === "completed");
 }
 
-function phaseDependenciesBlocked(plan: PlanRecord, phase: PhaseRecord): boolean {
-  return phase.dependsOn.some((depId) => {
-    const dependency = plan.phases.find((candidate) => candidate.id === depId);
+function groupDependenciesBlocked(taskRun: TaskRunRecord, group: TaskGroupRecord): boolean {
+  const groups = groupById(taskRun);
+  return group.dependsOn.some((depId) => {
+    const dependency = groups.get(depId);
     return dependency ? isBlockingStatus(dependency.status) : true;
   });
 }
 
-function taskDependenciesComplete(plan: PlanRecord, phase: PhaseRecord, task: TaskRecord): boolean {
-  const tasks = taskById(plan);
-  return dependencyIdsForTask(phase, task).every((depId) => {
-    const dependency = tasks.get(depId)?.task;
+function taskDependenciesComplete(taskRun: TaskRunRecord, task: TaskRecord): boolean {
+  const tasks = taskById(taskRun);
+  return dependencyIdsForTask(taskRun, task).every((depId) => {
+    const dependency = tasks.get(depId);
     return dependency ? dependency.status === "completed" : false;
   });
 }
 
-function taskDependenciesBlocked(plan: PlanRecord, phase: PhaseRecord, task: TaskRecord): boolean {
-  const tasks = taskById(plan);
-  return dependencyIdsForTask(phase, task).some((depId) => {
-    const dependency = tasks.get(depId)?.task;
+function taskDependenciesBlocked(taskRun: TaskRunRecord, task: TaskRecord): boolean {
+  const tasks = taskById(taskRun);
+  return dependencyIdsForTask(taskRun, task).some((depId) => {
+    const dependency = tasks.get(depId);
     return dependency ? isBlockingStatus(dependency.status) : true;
   });
 }
 
-function activeCountForPhase(plan: PlanRecord, phase: PhaseRecord): number {
-  const ids = new Set(phase.tasks.flatMap((task) => task.assignmentIds));
-  return plan.assignments.filter((assignment) => ids.has(assignment.id) && isActiveAssignmentStatus(assignment.status)).length;
+function activeCountForTaskRun(taskRun: TaskRunRecord): number {
+  return taskRun.assignments.filter((assignment) => isActiveAssignmentStatus(assignment.status)).length;
 }
 
-function phaseCanDispatchReadyTasks(phase: PhaseRecord): boolean {
-  return phase.status === "ready"
-    || phase.status === "running"
-    || (phase.status === "attention" && phase.tasks.some((task) => task.status === "ready"));
+function activeCountForGroup(taskRun: TaskRunRecord, group: TaskGroupRecord): number {
+  const ids = new Set(tasksForGroup(taskRun, group.id).flatMap((task) => task.assignmentIds));
+  return taskRun.assignments.filter((assignment) => ids.has(assignment.id) && isActiveAssignmentStatus(assignment.status)).length;
 }
 
-function buildAssignmentId(plan: PlanRecord, phase: PhaseRecord, task: TaskRecord): string {
-  return `${plan.id}-${phase.id}-${task.id}-a${task.assignmentIds.length + 1}`;
+function taskHasActiveAssignment(taskRun: TaskRunRecord, task: TaskRecord): boolean {
+  return task.assignmentIds
+    .map((assignmentId) => taskRun.assignments.find((assignment) => assignment.id === assignmentId))
+    .some((assignment) => assignment && isActiveAssignmentStatus(assignment.status));
 }
 
-export function buildTaskAssignmentPrompt(plan: PlanRecord, phase: PhaseRecord, task: TaskRecord): string {
-  const upstreamOutputs = dependencyIdsForTask(phase, task)
+function groupCanDispatchReadyTasks(taskRun: TaskRunRecord, group: TaskGroupRecord): boolean {
+  if (groupDependenciesBlocked(taskRun, group) || !groupDependenciesComplete(taskRun, group)) return false;
+  return group.status === "ready"
+    || group.status === "running"
+    || (group.status === "attention" && tasksForGroup(taskRun, group.id).some((task) => task.status === "ready"));
+}
+
+function taskRunAvailableSlots(taskRun: TaskRunRecord): number {
+  if (!taskRun.maxConcurrency) return Number.POSITIVE_INFINITY;
+  return Math.max(0, taskRun.maxConcurrency - activeCountForTaskRun(taskRun));
+}
+
+function buildAssignmentId(taskRun: TaskRunRecord, group: TaskGroupRecord | undefined, task: TaskRecord): string {
+  const groupPart = group ? `group-${group.id}` : "ungrouped";
+  return `${taskRun.id}-${groupPart}-task-${task.id}-assignment-${task.assignmentIds.length + 1}`;
+}
+
+export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGroupRecord | undefined, task: TaskRecord): string {
+  const upstreamOutputs = dependencyIdsForTask(taskRun, task)
     .map((taskId) => {
-      const dependency = taskById(plan).get(taskId)?.task;
-      const assignment = dependency ? latestAssignment(plan, dependency) : undefined;
+      const dependency = taskById(taskRun).get(taskId);
+      const assignment = dependency ? latestAssignment(taskRun, dependency) : undefined;
       const summary = assignment?.result?.summary;
       return summary ? `Task ${taskId}: ${summary}` : undefined;
     })
@@ -124,15 +173,13 @@ export function buildTaskAssignmentPrompt(plan: PlanRecord, phase: PhaseRecord, 
     "Complete only this task. Report evidence for each criterion.",
     "Output ONLY valid JSON matching the SubagentTaskReport shape described below.",
     "",
-    `Plan id: ${plan.id}`,
-    `Plan title: ${plan.title}`,
-    `Plan request: ${plan.request}`,
-    `Plan spec: ${plan.spec}`,
-    `Phase id: ${phase.id}`,
-    `Phase title: ${phase.title}`,
-    phase.goal ? `Phase goal: ${phase.goal}` : undefined,
-    phase.brief ? `Phase brief: ${phase.brief}` : undefined,
-    phase.filesHint?.length ? `Phase files: ${phase.filesHint.join(", ")}` : undefined,
+    `TaskRun id: ${taskRun.id}`,
+    `TaskRun title: ${taskRun.title}`,
+    `TaskRun request: ${taskRun.request}`,
+    `TaskRun context: ${taskRun.context}`,
+    group ? `Group id: ${group.id}` : undefined,
+    group ? `Group title: ${group.title}` : undefined,
+    group?.filesHint?.length ? `Group files: ${group.filesHint.join(", ")}` : undefined,
     task.filesHint?.length ? `Task files: ${task.filesHint.join(", ")}` : undefined,
     "",
     `Task id: ${task.id}`,
@@ -146,8 +193,8 @@ export function buildTaskAssignmentPrompt(plan: PlanRecord, phase: PhaseRecord, 
     "",
     "Required JSON:",
     JSON.stringify({
-      planId: plan.id,
-      phaseId: phase.id,
+      taskRunId: taskRun.id,
+      groupId: group?.id ?? "OMIT_FOR_UNGROUPED_TASK",
       taskId: task.id,
       assignmentId: "ASSIGNMENT_ID",
       status: "completed | attention | failed",
@@ -158,7 +205,8 @@ export function buildTaskAssignmentPrompt(plan: PlanRecord, phase: PhaseRecord, 
     }, null, 2),
     "",
     "Rules:",
-    "- Use the exact planId, phaseId, taskId, and assignmentId provided by the launcher prompt.",
+    "- Use the exact taskRunId, groupId, taskId, and assignmentId provided by the launcher prompt.",
+    "- Omit groupId only when this prompt has no Group id line.",
     "- criteriaEvidence must use zero-based criteriaIndex values from this task only.",
     "- Evidence must be concrete and non-empty.",
     "- Use status=attention when blocked or evidence is insufficient.",
@@ -166,150 +214,192 @@ export function buildTaskAssignmentPrompt(plan: PlanRecord, phase: PhaseRecord, 
   ].filter((line): line is string => typeof line === "string").join("\n");
 }
 
-export function derivePlanStatus(plan: PlanRecord, timestamp = Date.now()): void {
-  for (const phase of plan.phases) {
-    if (phaseDependenciesBlocked(plan, phase)) phase.status = "blocked";
-    else if ((phase.status === "pending" || phase.status === "blocked" || phase.status === "attention") && phaseDependenciesComplete(plan, phase)) phase.status = "ready";
-
-    for (const task of phase.tasks) {
-      const assignment = latestAssignment(plan, task);
-      const hasContinuation = Boolean(task.continuation?.trim());
-      if (!hasContinuation && taskComplete(task, assignment)) {
-        task.status = "completed";
-        task.completedAt ??= timestamp;
-        continue;
-      }
-      if (!hasContinuation && assignment) {
-        if (assignment.status === "completed" && !assignment.result && !taskCriteriaSatisfied(task)) {
-          task.status = "running";
-          continue;
-        }
-        if (assignment.status !== "completed") {
-          if (assignment.status === "paused") task.status = "attention";
-          else if (assignment.status === "skipped") task.status = "blocked";
-          else task.status = assignment.status === "queued" ? "running" : assignment.status;
-          continue;
-        }
-      }
-      if (!hasContinuation && (task.status === "failed" || task.status === "attention" || task.status === "cancelled")) continue;
-      if (taskDependenciesBlocked(plan, phase, task)) task.status = "blocked";
-      else if (phase.status === "ready" || phase.status === "running") {
-        task.status = taskDependenciesComplete(plan, phase, task) ? "ready" : "pending";
-      }
-    }
-
-    const taskStatuses = phase.tasks.map((task) => task.status);
-    if (taskStatuses.length > 0 && taskStatuses.every((status) => status === "completed")) {
-      phase.status = "completed";
-      phase.completedAt ??= timestamp;
-    } else if (taskStatuses.some((status) => status === "failed")) phase.status = "failed";
-    else if (taskStatuses.some((status) => status === "attention")) phase.status = "attention";
-    else if (taskStatuses.some((status) => status === "cancelled")) phase.status = "cancelled";
-    else if (taskStatuses.some((status) => status === "blocked")) phase.status = "blocked";
-    else if (phase.status !== "blocked" && taskStatuses.some((status) => status === "running")) phase.status = "running";
-    phase.updatedAt = timestamp;
+function deriveTaskStatus(taskRun: TaskRunRecord, task: TaskRecord, group: TaskGroupRecord | undefined, timestamp: number): void {
+  const assignment = latestAssignment(taskRun, task);
+  const hasContinuation = Boolean(task.continuation?.trim());
+  if (!hasContinuation && taskComplete(task, assignment)) {
+    task.status = "completed";
+    task.completedAt ??= timestamp;
+    return;
   }
-
-  const phaseStatuses = plan.phases.map((phase) => phase.status);
-  if (phaseStatuses.length > 0 && phaseStatuses.every((status) => status === "completed")) {
-    plan.status = "completed";
-    plan.completedAt ??= timestamp;
-  } else if (phaseStatuses.some((status) => status === "failed")) plan.status = "failed";
-  else if (phaseStatuses.some((status) => status === "attention" || status === "blocked")) plan.status = "attention";
-  else if (phaseStatuses.some((status) => status === "cancelled")) plan.status = "cancelled";
-  else plan.status = "running";
-  plan.updatedAt = timestamp;
+  if (!hasContinuation && assignment) {
+    if (assignment.status === "completed" && !assignment.result && !taskCriteriaSatisfied(task)) {
+      task.status = "running";
+      return;
+    }
+    if (assignment.status !== "completed") {
+      if (assignment.status === "paused") task.status = "attention";
+      else if (assignment.status === "skipped") task.status = "blocked";
+      else task.status = assignment.status === "queued" ? "running" : assignment.status;
+      return;
+    }
+  }
+  if (!hasContinuation && (task.status === "failed" || task.status === "attention" || task.status === "cancelled")) return;
+  if (taskDependenciesBlocked(taskRun, task)) task.status = "blocked";
+  else if (group) {
+    if (groupDependenciesBlocked(taskRun, group)) task.status = task.status === "blocked" ? "blocked" : "pending";
+    else if (groupDependenciesComplete(taskRun, group) && (group.status === "ready" || group.status === "running" || group.status === "attention")) {
+      task.status = taskDependenciesComplete(taskRun, task) ? "ready" : "pending";
+    }
+  } else {
+    task.status = taskDependenciesComplete(taskRun, task) ? "ready" : "pending";
+  }
 }
 
-export function createReadyAssignments(plan: PlanRecord, options: SchedulerOptions): SchedulerResult {
+function deriveGroupStatus(taskRun: TaskRunRecord, group: TaskGroupRecord, timestamp: number): void {
+  const depsBlocked = groupDependenciesBlocked(taskRun, group);
+  const depsComplete = groupDependenciesComplete(taskRun, group);
+  const groupTasks = tasksForGroup(taskRun, group.id);
+
+  if (depsBlocked) group.status = "blocked";
+  else if ((group.status === "pending" || group.status === "blocked" || group.status === "attention") && depsComplete) group.status = "ready";
+
+  for (const task of groupTasks) deriveTaskStatus(taskRun, task, group, timestamp);
+
+  const taskStatuses = groupTasks.map((task) => task.status);
+  if (taskStatuses.length > 0 && taskStatuses.every((status) => status === "completed")) {
+    group.status = "completed";
+    group.completedAt ??= timestamp;
+  } else if (taskStatuses.some((status) => status === "failed")) group.status = "failed";
+  else if (taskStatuses.some((status) => status === "attention")) group.status = "attention";
+  else if (taskStatuses.some((status) => status === "cancelled")) group.status = "cancelled";
+  else if (taskStatuses.some((status) => status === "blocked") || depsBlocked) group.status = "blocked";
+  else if (!depsComplete) group.status = "pending";
+  else if (taskStatuses.some((status) => status === "running")) group.status = "running";
+  else group.status = "ready";
+
+  group.updatedAt = timestamp;
+}
+
+export function deriveTaskRunStatus(taskRun: TaskRunRecord, timestamp = Date.now()): void {
+  const groups = groupById(taskRun);
+  const maxPasses = Math.max(1, taskRun.groups.length + 1);
+  for (let pass = 0; pass < maxPasses; pass += 1) {
+    const before = [
+      ...taskRun.groups.map((group) => `${group.id}:${group.status}`),
+      ...taskRun.tasks.map((task) => `${task.id}:${task.status}`),
+    ].join("|");
+    for (const group of taskRun.groups) deriveGroupStatus(taskRun, group, timestamp);
+    for (const task of taskRun.tasks) {
+      if (!task.groupId || !groups.has(task.groupId)) deriveTaskStatus(taskRun, task, undefined, timestamp);
+    }
+    const after = [
+      ...taskRun.groups.map((group) => `${group.id}:${group.status}`),
+      ...taskRun.tasks.map((task) => `${task.id}:${task.status}`),
+    ].join("|");
+    if (after === before) break;
+  }
+
+  const groupStatuses = taskRun.groups.map((group) => group.status);
+  const ungroupedStatuses = taskRun.tasks.filter((task) => !task.groupId || !groups.has(task.groupId)).map((task) => task.status);
+  const statuses = [...groupStatuses, ...ungroupedStatuses];
+  if (statuses.length > 0 && statuses.every((status) => status === "completed")) {
+    taskRun.status = "completed";
+    taskRun.completedAt ??= timestamp;
+  } else if (statuses.some((status) => status === "failed")) taskRun.status = "failed";
+  else if (statuses.some((status) => status === "attention" || status === "blocked")) taskRun.status = "attention";
+  else if (statuses.some((status) => status === "cancelled")) taskRun.status = "cancelled";
+  else taskRun.status = "running";
+  taskRun.updatedAt = timestamp;
+}
+
+
+function createAssignment(taskRun: TaskRunRecord, group: TaskGroupRecord | undefined, task: TaskRecord, options: SchedulerOptions, timestamp: number): TaskAssignmentRecord {
+  const assignmentId = buildAssignmentId(taskRun, group, task);
+  const prompt = buildTaskAssignmentPrompt(taskRun, group, task).replace("ASSIGNMENT_ID", assignmentId);
+  const assignment: TaskAssignmentWithLaunchDefaults = {
+    id: assignmentId,
+    taskRunId: taskRun.id,
+    groupId: group?.id,
+    taskId: task.id,
+    agent: task.agentHint ?? group?.agentHint ?? options.defaultAgent,
+    prompt,
+    status: "queued",
+    cwd: task.cwd ?? options.defaultCwd,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  task.assignmentIds.push(assignment.id);
+  task.continuation = undefined;
+  task.status = "running";
+  task.updatedAt = timestamp;
+  if (group) {
+    group.status = "running";
+    group.updatedAt = timestamp;
+  }
+  taskRun.assignments.push(assignment);
+  return assignment;
+}
+
+export function createReadyAssignments(taskRun: TaskRunRecord, options: SchedulerOptions): SchedulerResult {
   const timestamp = now(options);
-  derivePlanStatus(plan, timestamp);
+  deriveTaskRunStatus(taskRun, timestamp);
 
   const created: TaskAssignmentRecord[] = [];
-  for (const phase of plan.phases) {
-    if (!phaseCanDispatchReadyTasks(phase)) continue;
-    const maxConcurrency = phase.maxConcurrency ?? 1;
-    let availableSlots = Math.max(0, maxConcurrency - activeCountForPhase(plan, phase));
+  for (const group of taskRun.groups) {
+    if (taskRunAvailableSlots(taskRun) <= 0) break;
+    if (!groupCanDispatchReadyTasks(taskRun, group)) continue;
+    const groupAvailableSlots = Math.max(0, (group.maxConcurrency ?? 1) - activeCountForGroup(taskRun, group));
+    let availableSlots = Math.min(groupAvailableSlots, taskRunAvailableSlots(taskRun));
     if (availableSlots <= 0) continue;
 
-    for (const task of phase.tasks) {
-      if (availableSlots <= 0) break;
-      if (task.status !== "ready") continue;
-      const activeAssignment = task.assignmentIds
-        .map((assignmentId) => plan.assignments.find((assignment) => assignment.id === assignmentId))
-        .some((assignment) => assignment && isActiveAssignmentStatus(assignment.status));
-      if (activeAssignment) continue;
-
-      const assignmentId = buildAssignmentId(plan, phase, task);
-      const prompt = buildTaskAssignmentPrompt(plan, phase, task).replace("ASSIGNMENT_ID", assignmentId);
-      const assignment: TaskAssignmentRecord = {
-        id: assignmentId,
-        planId: plan.id,
-        phaseId: phase.id,
-        taskId: task.id,
-        agent: task.agentHint ?? phase.agentHint ?? options.defaultAgent,
-        prompt,
-        status: "queued",
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      };
-      task.assignmentIds.push(assignment.id);
-      task.continuation = undefined;
-      task.status = "running";
-      task.updatedAt = timestamp;
-      phase.status = "running";
-      plan.assignments.push(assignment);
-      created.push(assignment);
+    for (const task of tasksForGroup(taskRun, group.id)) {
+      if (availableSlots <= 0 || taskRunAvailableSlots(taskRun) <= 0) break;
+      if (task.status !== "ready" || taskHasActiveAssignment(taskRun, task)) continue;
+      created.push(createAssignment(taskRun, group, task, options, timestamp));
       availableSlots -= 1;
     }
   }
 
-  plan.updatedAt = timestamp;
+  for (const task of taskRun.tasks) {
+    if (taskRunAvailableSlots(taskRun) <= 0) break;
+    if (task.groupId) continue;
+    if (task.status !== "ready" || taskHasActiveAssignment(taskRun, task)) continue;
+    created.push(createAssignment(taskRun, undefined, task, options, timestamp));
+  }
+
+  taskRun.updatedAt = timestamp;
   return {
     assignments: created,
-    hasBlockingIssue: plan.status === "attention" || plan.status === "failed" || plan.status === "cancelled",
+    hasBlockingIssue: taskRun.status === "attention" || taskRun.status === "failed" || taskRun.status === "cancelled",
   };
 }
 
-export function toLaunchTaskEntries(assignments: TaskAssignmentRecord[], plan: PlanRecord): LaunchTaskEntry[] {
+export function toLaunchTaskEntries(assignments: TaskAssignmentRecord[], taskRun: TaskRunRecord, options: { defaultCwd?: string } = {}): LaunchTaskEntry[] {
   const assignmentIdsInLaunch = new Set(assignments.map((assignment) => assignment.id));
   const latestAssignmentIdByTaskId = new Map<string, string>();
-  for (const assignment of plan.assignments) latestAssignmentIdByTaskId.set(assignment.taskId, assignment.id);
+  for (const assignment of taskRun.assignments) latestAssignmentIdByTaskId.set(assignment.taskId, assignment.id);
 
   return assignments.map((assignment) => {
-    const phase = plan.phases.find((candidate) => candidate.id === assignment.phaseId);
-    const task = phase?.tasks.find((candidate) => candidate.id === assignment.taskId);
-    const dependsOn = task?.dependsOn
+    const task = taskRun.tasks.find((candidate) => candidate.id === assignment.taskId);
+    const dependsOn = task ? dependencyIdsForTask(taskRun, task)
       .map((taskId) => latestAssignmentIdByTaskId.get(taskId))
-      .filter((assignmentId): assignmentId is string => typeof assignmentId === "string" && assignmentIdsInLaunch.has(assignmentId));
+      .filter((assignmentId): assignmentId is string => typeof assignmentId === "string" && assignmentIdsInLaunch.has(assignmentId)) : [];
     return {
       assignmentId: assignment.id,
-      phaseId: assignment.phaseId,
+      taskRunId: assignment.taskRunId,
+      groupId: assignment.groupId,
       taskId: assignment.taskId,
       agent: assignment.agent,
       prompt: assignment.prompt,
       taskSummary: task?.text ?? assignment.taskId,
-      dependsOn: dependsOn && dependsOn.length > 0 ? dependsOn : undefined,
+      dependsOn: dependsOn.length > 0 ? dependsOn : undefined,
       retries: task?.retries,
       outputMode: "json",
       outputSchema: "SubagentTaskReport JSON object",
       when: task?.when,
-      cwd: task?.cwd,
-    };
+      cwd: task?.cwd ?? (assignment as TaskAssignmentWithLaunchDefaults).cwd ?? options.defaultCwd,
+    } satisfies LaunchTaskEntry;
   });
 }
 
-export function applyAssignmentProgress(plan: PlanRecord, snapshot: RunProgressSnapshot, timestamp = Date.now()): boolean {
+export function applyAssignmentProgress(taskRun: TaskRunRecord, snapshot: RunProgressSnapshot, timestamp = Date.now()): boolean {
   let changed = false;
   for (const step of snapshot.steps) {
     if (!step.id) continue;
-    const assignment = plan.assignments.find((candidate) => candidate.id === step.id);
+    const assignment = taskRun.assignments.find((candidate) => candidate.id === step.id);
     if (!assignment) continue;
-    if (step.status === "running") assignment.status = "running";
-    else if (step.status === "completed") assignment.status = "completed";
-    else if (step.status === "failed") assignment.status = "failed";
-    else if (step.status === "skipped") assignment.status = "skipped";
-    else if (step.status === "cancelled") assignment.status = "cancelled";
+    if (isAssignmentStatus(step.status)) assignment.status = step.status;
     assignment.currentTool = step.currentTool;
     assignment.lastActionAt = step.lastActionAt ?? assignment.lastActionAt;
     assignment.lastActionSummary = step.lastActionSummary ?? assignment.lastActionSummary;
@@ -317,6 +407,6 @@ export function applyAssignmentProgress(plan: PlanRecord, snapshot: RunProgressS
     assignment.updatedAt = timestamp;
     changed = true;
   }
-  if (changed) derivePlanStatus(plan, timestamp);
+  if (changed) deriveTaskRunStatus(taskRun, timestamp);
   return changed;
 }

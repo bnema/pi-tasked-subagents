@@ -2,8 +2,8 @@
 // Task result reducer: validate and apply subagent task reports
 // ──────────────────────────────────────────────
 
-import type { ArtifactRef, PlanRecord, SubagentTaskReport, TaskAssignmentRecord, TaskRecord } from "../types.js";
-import { derivePlanStatus } from "./task-scheduler.js";
+import type { ArtifactRef, SubagentTaskReport, TaskAssignmentRecord, TaskRecord, TaskRunRecord } from "../types.js";
+import { deriveTaskRunStatus } from "./task-scheduler.js";
 
 export interface ApplyTaskReportResult {
   applied: boolean;
@@ -11,12 +11,10 @@ export interface ApplyTaskReportResult {
   warnings: string[];
 }
 
-function findTask(plan: PlanRecord, phaseId: string, taskId: string): { task: TaskRecord; phaseIndex: number; taskIndex: number } | undefined {
-  const phaseIndex = plan.phases.findIndex((phase) => phase.id === phaseId);
-  if (phaseIndex < 0) return undefined;
-  const taskIndex = plan.phases[phaseIndex].tasks.findIndex((task) => task.id === taskId);
+function findTask(taskRun: TaskRunRecord, taskId: string): { task: TaskRecord; taskIndex: number } | undefined {
+  const taskIndex = taskRun.tasks.findIndex((task) => task.id === taskId);
   if (taskIndex < 0) return undefined;
-  return { task: plan.phases[phaseIndex].tasks[taskIndex], phaseIndex, taskIndex };
+  return { task: taskRun.tasks[taskIndex], taskIndex };
 }
 
 function putAssignmentAttention(assignment: TaskAssignmentRecord | undefined, timestamp: number): void {
@@ -25,30 +23,31 @@ function putAssignmentAttention(assignment: TaskAssignmentRecord | undefined, ti
   assignment.updatedAt = timestamp;
 }
 
-function putTaskAttention(plan: PlanRecord, assignment: TaskAssignmentRecord | undefined, timestamp: number): void {
+function putTaskAttention(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord | undefined, timestamp: number): void {
   putAssignmentAttention(assignment, timestamp);
   if (assignment) {
-    const found = findTask(plan, assignment.phaseId, assignment.taskId);
+    const found = findTask(taskRun, assignment.taskId);
     if (found) {
       found.task.status = "attention";
       found.task.updatedAt = timestamp;
-      plan.phases[found.phaseIndex].status = "attention";
-      plan.phases[found.phaseIndex].updatedAt = timestamp;
     }
   }
-  plan.status = "attention";
-  plan.updatedAt = timestamp;
+  deriveTaskRunStatus(taskRun, timestamp);
+  taskRun.status = "attention";
+  taskRun.updatedAt = timestamp;
 }
 
-function validateReport(plan: PlanRecord, assignment: TaskAssignmentRecord | undefined, report: SubagentTaskReport): string[] {
+function validateReport(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord | undefined, report: SubagentTaskReport): string[] {
   const errors: string[] = [];
   if (!assignment) return [`Assignment ${report.assignmentId} not found`];
-  if (report.planId !== plan.id) errors.push(`Report planId ${report.planId} does not match ${plan.id}`);
-  if (report.phaseId !== assignment.phaseId) errors.push(`Report phaseId ${report.phaseId} does not match ${assignment.phaseId}`);
+  if (report.taskRunId !== taskRun.id) errors.push(`Report taskRunId ${report.taskRunId} does not match ${taskRun.id}`);
+  if (report.groupId !== assignment.groupId) errors.push(`Report groupId ${report.groupId} does not match ${assignment.groupId}`);
   if (report.taskId !== assignment.taskId) errors.push(`Report taskId ${report.taskId} does not match ${assignment.taskId}`);
-  const found = findTask(plan, assignment.phaseId, assignment.taskId);
-  if (!found) {
-    errors.push(`Task ${assignment.taskId} not found in phase ${assignment.phaseId}`);
+
+  const found = findTask(taskRun, assignment.taskId);
+  if (!found || found.task.groupId !== assignment.groupId) {
+    const groupText = assignment.groupId ? ` in group ${assignment.groupId}` : "";
+    errors.push(`Task ${assignment.taskId} not found${groupText}`);
     return errors;
   }
 
@@ -62,36 +61,75 @@ function validateReport(plan: PlanRecord, assignment: TaskAssignmentRecord | und
   }
 
   const seen = new Set<number>();
-  for (const entry of report.criteriaEvidence) {
-    if (!Number.isInteger(entry.criteriaIndex)) errors.push("Criterion index must be an integer");
-    if (seen.has(entry.criteriaIndex)) errors.push(`Duplicate criteria index ${entry.criteriaIndex}`);
-    seen.add(entry.criteriaIndex);
-    if (entry.criteriaIndex < 0 || entry.criteriaIndex >= found.task.criteria.length) {
-      errors.push(`Criteria index ${entry.criteriaIndex} is out of bounds`);
+  for (const [entryIndex, rawEntry] of (report.criteriaEvidence as unknown[]).entries()) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      errors.push(`Criteria evidence entry ${entryIndex} must be an object`);
+      continue;
     }
-    if (!entry.evidence?.trim()) errors.push(`Evidence for criteria index ${entry.criteriaIndex} is required`);
+
+    const entry = rawEntry as Partial<SubagentTaskReport["criteriaEvidence"][number]>;
+    const criteriaIndex = entry.criteriaIndex;
+    if (!Number.isInteger(criteriaIndex)) {
+      errors.push("Criterion index must be an integer");
+      continue;
+    }
+    const validatedCriteriaIndex = criteriaIndex as number;
+
+    if (seen.has(validatedCriteriaIndex)) errors.push(`Duplicate criteria index ${validatedCriteriaIndex}`);
+    seen.add(validatedCriteriaIndex);
+    if (validatedCriteriaIndex < 0 || validatedCriteriaIndex >= found.task.criteria.length) {
+      errors.push(`Criteria index ${validatedCriteriaIndex} is out of bounds`);
+    }
+    if (typeof entry.evidence !== "string" || !entry.evidence.trim()) errors.push(`Evidence for criteria index ${validatedCriteriaIndex} is required`);
   }
 
   if (report.status === "completed" && seen.size !== found.task.criteria.length) {
     errors.push("Report does not provide evidence for every criterion");
   }
 
+  if (report.artifacts !== undefined) {
+    if (!Array.isArray(report.artifacts)) {
+      errors.push("Report artifacts must be an array");
+    } else {
+      for (const [artifactIndex, rawArtifact] of (report.artifacts as unknown[]).entries()) {
+        if (!rawArtifact || typeof rawArtifact !== "object" || Array.isArray(rawArtifact)) {
+          errors.push(`Artifact entry ${artifactIndex} must be an object`);
+          continue;
+        }
+
+        const artifact = rawArtifact as Record<string, unknown>;
+        if (typeof artifact.label !== "string" || !artifact.label.trim()) errors.push(`Artifact label for entry ${artifactIndex} is required`);
+        if (typeof artifact.path !== "string" || !artifact.path.trim()) errors.push(`Artifact path for entry ${artifactIndex} is required`);
+      }
+    }
+  }
+
+  if (report.followUps !== undefined) {
+    if (!Array.isArray(report.followUps)) {
+      errors.push("Report followUps must be an array");
+    } else {
+      for (const [followUpIndex, followUp] of (report.followUps as unknown[]).entries()) {
+        if (typeof followUp !== "string") errors.push(`Follow-up entry ${followUpIndex} must be a string`);
+      }
+    }
+  }
+
   return errors;
 }
 
 export function applySubagentTaskReport(
-  plan: PlanRecord,
+  taskRun: TaskRunRecord,
   report: SubagentTaskReport,
   options: { now?: number; rawResultPath?: string; expectedAssignmentId?: string } = {},
 ): ApplyTaskReportResult {
   const timestamp = options.now ?? Date.now();
-  const assignment = plan.assignments.find((candidate) => candidate.id === (options.expectedAssignmentId ?? report.assignmentId));
+  const assignment = taskRun.assignments.find((candidate) => candidate.id === (options.expectedAssignmentId ?? report.assignmentId));
   if (options.expectedAssignmentId && report.assignmentId !== options.expectedAssignmentId) {
-    putTaskAttention(plan, assignment, timestamp);
+    putTaskAttention(taskRun, assignment, timestamp);
     return { applied: false, errors: [`Report assignmentId ${report.assignmentId} does not match launched assignment ${options.expectedAssignmentId}`], warnings: [] };
   }
   if (assignment) {
-    const found = findTask(plan, assignment.phaseId, assignment.taskId);
+    const found = findTask(taskRun, assignment.taskId);
     const latestAssignmentId = found?.task.assignmentIds.at(-1);
     if (latestAssignmentId && latestAssignmentId !== assignment.id) {
       putAssignmentAttention(assignment, timestamp);
@@ -102,26 +140,36 @@ export function applySubagentTaskReport(
       };
     }
   }
-  const errors = validateReport(plan, assignment, report);
+
+  const errors = validateReport(taskRun, assignment, report);
   if (errors.length > 0) {
-    putTaskAttention(plan, assignment, timestamp);
+    putTaskAttention(taskRun, assignment, timestamp);
     return { applied: false, errors, warnings: [] };
   }
 
-  const found = findTask(plan, report.phaseId, report.taskId)!;
+  const found = findTask(taskRun, assignment!.taskId)!;
   const artifacts: ArtifactRef[] = (report.artifacts ?? [])
     .filter((artifact) => artifact.label?.trim() && artifact.path?.trim())
     .map((artifact) => ({
       label: artifact.label.trim(),
       path: artifact.path.trim(),
       assignmentId: report.assignmentId,
-      phaseId: report.phaseId,
+      taskRunId: report.taskRunId,
+      groupId: report.groupId,
       taskId: report.taskId,
     }));
 
+  taskRun.artifacts = taskRun.artifacts.filter((artifact) => artifact.assignmentId !== report.assignmentId);
+  for (const criterion of found.task.criteria) {
+    const hadAssignmentEvidence = criterion.evidence.some((evidence) => evidence.assignmentId === report.assignmentId);
+    if (!hadAssignmentEvidence) continue;
+    criterion.evidence = criterion.evidence.filter((evidence) => evidence.assignmentId !== report.assignmentId);
+    if (criterion.evidence.length === 0) criterion.satisfied = false;
+  }
+
   for (const entry of report.criteriaEvidence) {
     const criterion = found.task.criteria[entry.criteriaIndex];
-    criterion.satisfied = true;
+    if (report.status === "completed") criterion.satisfied = true;
     criterion.evidence.push({
       criterionId: criterion.id,
       assignmentId: report.assignmentId,
@@ -131,7 +179,7 @@ export function applySubagentTaskReport(
     });
   }
 
-  assignment!.status = report.status === "completed" ? "completed" : report.status;
+  assignment!.status = report.status;
   assignment!.result = {
     assignmentId: report.assignmentId,
     status: report.status,
@@ -154,16 +202,16 @@ export function applySubagentTaskReport(
   else found.task.status = found.task.criteria.every((criterion) => criterion.satisfied) ? "completed" : "attention";
   found.task.completedAt = found.task.status === "completed" ? timestamp : undefined;
   found.task.updatedAt = timestamp;
-  plan.artifacts.push(...artifacts);
-  derivePlanStatus(plan, timestamp);
+  taskRun.artifacts.push(...artifacts);
+  deriveTaskRunStatus(taskRun, timestamp);
   return { applied: true, errors: [], warnings: [] };
 }
 
 function isTaskReport(value: unknown): value is SubagentTaskReport {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Partial<SubagentTaskReport>;
-  return typeof input.planId === "string"
-    && typeof input.phaseId === "string"
+  return typeof input.taskRunId === "string"
+    && (input.groupId === undefined || typeof input.groupId === "string")
     && typeof input.taskId === "string"
     && typeof input.assignmentId === "string"
     && (input.status === "completed" || input.status === "attention" || input.status === "failed")
@@ -171,35 +219,40 @@ function isTaskReport(value: unknown): value is SubagentTaskReport {
     && Array.isArray(input.criteriaEvidence);
 }
 
-function extractBalancedJsonObjectCandidate(text: string): string | undefined {
-  const start = text.indexOf("{");
-  if (start < 0) return undefined;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
-    const char = text[index];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === '"') inString = false;
-      continue;
+function extractBalancedJsonObjectCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  for (let start = text.indexOf("{"); start >= 0; start = text.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === "{") depth += 1;
+      if (char === "}") depth -= 1;
+      if (depth === 0) {
+        candidates.push(text.slice(start, index + 1).trim());
+        break;
+      }
     }
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === "{") depth += 1;
-    if (char === "}") depth -= 1;
-    if (depth === 0) return text.slice(start, index + 1).trim();
   }
-  return undefined;
+  return candidates;
 }
 
 export function parseTaskReport(raw: string): SubagentTaskReport | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
-  const candidates = [trimmed, /```(?:json)?\s*\n([\s\S]*?)\n```/u.exec(trimmed)?.[1], extractBalancedJsonObjectCandidate(trimmed)];
+  const fencedCandidates = [...trimmed.matchAll(/```(?:json)?\s*\n([\s\S]*?)\n```/gu)].map((match) => match[1]);
+  const candidates = [trimmed, ...fencedCandidates, ...extractBalancedJsonObjectCandidates(trimmed)];
   for (const candidate of candidates) {
     if (!candidate) continue;
     try {
