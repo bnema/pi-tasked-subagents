@@ -314,12 +314,12 @@ describe("task scheduler", () => {
     expect(second.assignments).toEqual([]);
   });
 
-  test("creates launch entries with task-run and group identifiers", () => {
+  test("creates launch entries with task-run identifiers and task output settings", () => {
     const taskRun = makeTaskRun({
       groups: [{ id: "main", title: "Main", maxConcurrency: 2 }],
       tasks: [
-        { id: "one", group: "main", text: "Do one", criteria: ["One done"] },
-        { id: "two", group: "main", text: "Do two", dependsOn: ["one"], criteria: ["Two done"] },
+        { id: "one", group: "main", text: "Do one", criteria: ["One done"], outputMode: "text", outputSchema: "Plain completion notes" },
+        { id: "two", group: "main", text: "Do two", criteria: ["Two done"] },
       ],
     });
     const ready = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 });
@@ -331,9 +331,16 @@ describe("task scheduler", () => {
       taskRunId: "task-run-1",
       groupId: "main",
       taskId: "one",
+      outputMode: "text",
+      outputSchema: "Plain completion notes",
+      cwd: "/repo",
+    });
+    expect(entries[1]).toMatchObject({
+      taskRunId: "task-run-1",
+      groupId: "main",
+      taskId: "two",
       outputMode: "json",
       outputSchema: "SubagentTaskReport JSON object",
-      cwd: "/repo",
     });
   });
 

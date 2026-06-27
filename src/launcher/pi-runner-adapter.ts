@@ -217,7 +217,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     return {
       ...toRunHandleBase(launch),
       assignments: request.tasks.map((task) => ({
-        assignmentId: task.assignmentId,
+        assignmentId: task.assignmentId.trim(),
         runId: launch.runId,
         resultPath: launch.resultPath,
       })),
@@ -322,13 +322,14 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     const delegateProfile = profilesByName.get("delegate") ?? getAgentProfile("delegate");
     return entries.map((entry, index) => {
       const profile = profilesByName.get(entry.agent) ?? { ...delegateProfile, name: entry.agent };
+      const cwd = typeof entry.cwd === "string" && entry.cwd.trim().length > 0 ? entry.cwd.trim() : baseCwd;
       return {
-        id: entry.assignmentId,
-        dependsOn: entry.dependsOn,
+        id: entry.assignmentId.trim(),
+        dependsOn: entry.dependsOn?.map((dependencyId) => dependencyId.trim()),
         agent: entry.agent,
         taskSummary: entry.taskSummary,
         prompt: entry.prompt,
-        cwd: entry.cwd ?? baseCwd,
+        cwd,
         sessionDir: childSessionDir(asyncDir, index),
         outputFile: childOutputFile(index),
         retries: entry.retries,

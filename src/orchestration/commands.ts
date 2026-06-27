@@ -1,9 +1,9 @@
 // ──────────────────────────────────────────────
-// Command parsing and formatting for plan-first tasked subagents
+// Command parsing and formatting for tasked subagent task runs
 // ──────────────────────────────────────────────
 
 import type { AgentProfile } from "../launcher/agent-profiles.js";
-import type { PlanRecord, TaskAssignmentRecord, TaskedSubagentsState } from "../types.js";
+import type { TaskAssignmentRecord, TaskGroupRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
 import { statusLabel } from "../ui/messages.js";
 import { shortTitle } from "../utils/text.js";
 
@@ -28,6 +28,40 @@ export interface ParsedCommand {
   details?: boolean;
   scope?: "completed" | "all";
   args?: Record<string, unknown>;
+}
+
+export interface ParsedDispatchArgs {
+  taskRunId?: string;
+  maxConcurrency?: number;
+  errors: string[];
+}
+
+const DISPATCH_ARG_KEYS = new Set(["taskRunId", "maxConcurrency"]);
+
+export function parseDispatchArgs(args?: Record<string, unknown>): ParsedDispatchArgs {
+  const result: ParsedDispatchArgs = { errors: [] };
+  if (!args) return result;
+
+  for (const [key, value] of Object.entries(args)) {
+    if (!DISPATCH_ARG_KEYS.has(key)) {
+      result.errors.push(`Unsupported dispatch argument: ${key}`);
+      continue;
+    }
+
+    if (key === "taskRunId") {
+      if (typeof value === "string" && value.trim()) result.taskRunId = value.trim();
+      else result.errors.push("dispatch taskRunId must be a non-empty string");
+      continue;
+    }
+
+    if (typeof value !== "string" || !/^[1-9]\d*$/u.test(value.trim())) {
+      result.errors.push("dispatch maxConcurrency must be a positive integer");
+      continue;
+    }
+    result.maxConcurrency = Number(value.trim());
+  }
+
+  return result;
 }
 
 function splitArgs(input: string): string[] {
@@ -77,6 +111,7 @@ export function parseCommand(input: string, internal = false): ParsedCommand {
     for (const token of argsTokens) {
       const index = token.indexOf("=");
       if (index > 0) args[token.slice(0, index)] = token.slice(index + 1);
+      else if (token) args[token] = true;
     }
     return { action: "dispatch", args: Object.keys(args).length > 0 ? args : undefined };
   }
@@ -115,50 +150,55 @@ export function parseCommand(input: string, internal = false): ParsedCommand {
   }
 }
 
-function findPlan(state: TaskedSubagentsState, id: string): PlanRecord | undefined {
-  return state.plans.find((plan) => plan.id === id);
+function orderedTaskRuns(state: TaskedSubagentsState): TaskRunRecord[] {
+  const current = state.currentTaskRunId ? state.taskRuns.find((taskRun) => taskRun.id === state.currentTaskRunId) : undefined;
+  return current ? [current, ...state.taskRuns.filter((taskRun) => taskRun.id !== current.id)] : state.taskRuns;
 }
 
-function findPhase(state: TaskedSubagentsState, id: string) {
-  for (const plan of state.plans) {
-    const phase = plan.phases.find((candidate) => candidate.id === id);
-    if (phase) return { plan, phase };
+function findTaskRun(state: TaskedSubagentsState, id: string): TaskRunRecord | undefined {
+  return state.taskRuns.find((taskRun) => taskRun.id === id);
+}
+
+function findGroup(state: TaskedSubagentsState, id: string): { taskRun: TaskRunRecord; group: TaskGroupRecord } | undefined {
+  for (const taskRun of orderedTaskRuns(state)) {
+    const group = taskRun.groups.find((candidate) => candidate.id === id);
+    if (group) return { taskRun, group };
   }
   return undefined;
 }
 
-function findTask(state: TaskedSubagentsState, id: string) {
-  for (const plan of state.plans) {
-    for (const phase of plan.phases) {
-      const task = phase.tasks.find((candidate) => candidate.id === id);
-      if (task) return { plan, phase, task };
-    }
+function findTask(state: TaskedSubagentsState, id: string): { taskRun: TaskRunRecord; group?: TaskGroupRecord; task: TaskRecord } | undefined {
+  for (const taskRun of orderedTaskRuns(state)) {
+    const task = taskRun.tasks.find((candidate) => candidate.id === id);
+    if (!task) continue;
+    const group = task.groupId ? taskRun.groups.find((candidate) => candidate.id === task.groupId) : undefined;
+    return { taskRun, group, task };
   }
   return undefined;
 }
 
-function findAssignment(state: TaskedSubagentsState, id: string): { plan: PlanRecord; assignment: TaskAssignmentRecord } | undefined {
-  for (const plan of state.plans) {
-    const assignment = plan.assignments.find((candidate) => candidate.id === id);
-    if (assignment) return { plan, assignment };
+function findAssignment(state: TaskedSubagentsState, id: string): { taskRun: TaskRunRecord; assignment: TaskAssignmentRecord } | undefined {
+  for (const taskRun of orderedTaskRuns(state)) {
+    const assignment = taskRun.assignments.find((candidate) => candidate.id === id);
+    if (assignment) return { taskRun, assignment };
   }
   return undefined;
 }
 
-function assignmentsForTask(plan: PlanRecord, task: PlanRecord["phases"][number]["tasks"][number]): TaskAssignmentRecord[] {
+function assignmentsForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord[] {
   return task.assignmentIds
-    .map((assignmentId) => plan.assignments.find((assignment) => assignment.id === assignmentId))
+    .map((assignmentId) => taskRun.assignments.find((assignment) => assignment.id === assignmentId))
     .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
 }
 
-function assignmentSummaryLine(plan: PlanRecord, assignment: TaskAssignmentRecord): string {
-  const task = plan.phases.flatMap((phase) => phase.tasks).find((candidate) => candidate.id === assignment.taskId);
+function assignmentSummaryLine(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): string {
+  const task = taskRun.tasks.find((candidate) => candidate.id === assignment.taskId);
   const summary = assignment.result?.summary ? ` · ${shortTitle(assignment.result.summary, 80)}` : "";
   return `${assignment.id} · ${statusLabel(assignment.status)} · ${assignment.taskId}${task?.text ? ` · ${shortTitle(task.text, 80)}` : ""}${summary}`;
 }
 
-function taskAssignmentSummary(plan: PlanRecord, task: PlanRecord["phases"][number]["tasks"][number]): string {
-  const assignmentIds = assignmentsForTask(plan, task).map((assignment) => assignment.id);
+function taskAssignmentSummary(taskRun: TaskRunRecord, task: TaskRecord): string {
+  const assignmentIds = assignmentsForTask(taskRun, task).map((assignment) => assignment.id);
   return assignmentIds.length > 0 ? assignmentIds.join(", ") : "no assignment";
 }
 
@@ -166,14 +206,14 @@ function assignmentsForTarget(state: TaskedSubagentsState, targetId: string): Ta
   const assignment = findAssignment(state, targetId);
   if (assignment) return [assignment.assignment];
   const task = findTask(state, targetId);
-  if (task) return assignmentsForTask(task.plan, task.task);
-  const phase = findPhase(state, targetId);
-  if (phase) {
-    const ids = new Set(phase.phase.tasks.flatMap((taskRecord) => taskRecord.assignmentIds));
-    return phase.plan.assignments.filter((candidate) => ids.has(candidate.id));
+  if (task) return assignmentsForTask(task.taskRun, task.task);
+  const group = findGroup(state, targetId);
+  if (group) {
+    const ids = new Set(group.taskRun.tasks.filter((taskRecord) => taskRecord.groupId === group.group.id).flatMap((taskRecord) => taskRecord.assignmentIds));
+    return group.taskRun.assignments.filter((candidate) => ids.has(candidate.id));
   }
-  const plan = findPlan(state, targetId);
-  if (plan) return plan.assignments;
+  const taskRun = findTaskRun(state, targetId);
+  if (taskRun) return taskRun.assignments;
   return undefined;
 }
 
@@ -182,105 +222,107 @@ export function resolveResultAssignmentId(state: TaskedSubagentsState, targetId:
   return assignments?.length === 1 ? assignments[0].id : undefined;
 }
 
-
 export function formatStatusReport(state: TaskedSubagentsState, targetId?: string): string {
-  if (state.plans.length === 0) return "No tracked plans.";
+  if (state.taskRuns.length === 0) return "No tracked task runs.";
   if (targetId) {
-    const plan = findPlan(state, targetId);
-    if (plan) return formatPlanStatus(plan);
-    const phase = findPhase(state, targetId);
-    if (phase) return formatPhaseStatus(phase.plan, phase.phase);
+    const taskRun = findTaskRun(state, targetId);
+    if (taskRun) return formatTaskRunStatus(taskRun);
+    const group = findGroup(state, targetId);
+    if (group) return formatGroupStatus(group.taskRun, group.group);
     const task = findTask(state, targetId);
-    if (task) return formatTaskStatus(task.plan, task.phase, task.task);
+    if (task) return formatTaskStatus(task.taskRun, task.group, task.task);
     const assignment = findAssignment(state, targetId);
-    if (assignment) return formatAssignmentDetail(assignment.plan, assignment.assignment);
-    return `Not found: ${targetId}. Use a valid plan, phase, task, or assignment id.`;
+    if (assignment) return formatAssignmentDetail(assignment.taskRun, assignment.assignment);
+    return `Not found: ${targetId}. Use a valid taskRun, group, task, or assignment id.`;
   }
 
-  const active = state.plans.filter((plan) => plan.status === "pending" || plan.status === "running").length;
-  const attention = state.plans.filter((plan) => plan.status === "attention" || plan.status === "failed").length;
-  const completed = state.plans.filter((plan) => plan.status === "completed").length;
-  const lines = [`Plans: ${state.plans.length} total`];
+  const active = state.taskRuns.filter((taskRun) => taskRun.status === "pending" || taskRun.status === "running").length;
+  const attention = state.taskRuns.filter((taskRun) => taskRun.status === "attention" || taskRun.status === "failed").length;
+  const completed = state.taskRuns.filter((taskRun) => taskRun.status === "completed").length;
+  const lines = [`Task runs: ${state.taskRuns.length} total`];
   if (active) lines.push(`  Active: ${active}`);
   if (attention) lines.push(`  Attention: ${attention}`);
   if (completed) lines.push(`  Completed: ${completed}`);
   lines.push("");
-  for (const plan of state.plans) lines.push(...formatPlanStatusLines(plan), "");
+  for (const taskRun of state.taskRuns) lines.push(...formatTaskRunStatusLines(taskRun), "");
   return lines.join("\n").trimEnd();
 }
 
-function formatPlanStatusLines(plan: PlanRecord): string[] {
-  const tasks = plan.phases.flatMap((phase) => phase.tasks);
-  const completedTasks = tasks.filter((task) => task.status === "completed").length;
-  const runningAssignments = plan.assignments.filter((assignment) => assignment.status === "running" || assignment.status === "queued").length;
-  const attentionTasks = tasks.filter((task) => task.status === "attention" || task.status === "failed" || task.status === "blocked").length;
+function formatTaskRunStatusLines(taskRun: TaskRunRecord): string[] {
+  const completedTasks = taskRun.tasks.filter((task) => task.status === "completed").length;
+  const runningAssignments = taskRun.assignments.filter((assignment) => assignment.status === "running" || assignment.status === "queued").length;
+  const attentionTasks = taskRun.tasks.filter((task) => task.status === "attention" || task.status === "failed" || task.status === "blocked").length;
   return [
-    `${plan.id} · ${statusLabel(plan.status)} · ${plan.title}`,
-    `  request: ${shortTitle(plan.request, 80)}`,
-    `  phases: ${plan.phases.length}`,
-    `  tasks: ${completedTasks}/${tasks.length} completed`,
+    `${taskRun.id} · ${statusLabel(taskRun.status)} · ${taskRun.title}`,
+    `  request: ${shortTitle(taskRun.request, 80)}`,
+    `  groups: ${taskRun.groups.length}`,
+    `  tasks: ${completedTasks}/${taskRun.tasks.length} completed`,
     runningAssignments ? `  assignments: ${runningAssignments} active` : undefined,
     attentionTasks ? `  attention tasks: ${attentionTasks}` : undefined,
   ].filter((line): line is string => Boolean(line));
 }
 
-function formatPlanStatus(plan: PlanRecord): string {
-  return formatPlanStatusLines(plan).join("\n");
+function formatTaskRunStatus(taskRun: TaskRunRecord): string {
+  return formatTaskRunStatusLines(taskRun).join("\n");
 }
 
-function formatPhaseStatus(plan: PlanRecord, phase: PlanRecord["phases"][number]): string {
-  const done = phase.tasks.filter((task) => task.status === "completed").length;
-  return [`${phase.id} · ${statusLabel(phase.status)} · ${phase.title}`, `  plan: ${plan.id} · ${plan.title}`, `  tasks: ${done}/${phase.tasks.length} completed`].join("\n");
+function formatGroupStatus(taskRun: TaskRunRecord, group: TaskGroupRecord): string {
+  const groupTasks = taskRun.tasks.filter((task) => task.groupId === group.id);
+  const done = groupTasks.filter((task) => task.status === "completed").length;
+  return [`Group: ${group.id} · ${statusLabel(group.status)} · ${group.title}`, `  taskRun: ${taskRun.id} · ${taskRun.title}`, `  tasks: ${done}/${groupTasks.length} completed`].join("\n");
 }
 
-function formatTaskStatus(plan: PlanRecord, phase: PlanRecord["phases"][number], task: PlanRecord["phases"][number]["tasks"][number]): string {
+function formatTaskStatus(taskRun: TaskRunRecord, group: TaskGroupRecord | undefined, task: TaskRecord): string {
   const evidence = task.criteria.filter((criterion) => criterion.satisfied).length;
-  return [`${task.id} · ${statusLabel(task.status)} · ${task.text}`, `  plan: ${plan.id}`, `  phase: ${phase.id} · ${phase.title}`, `  criteria: ${evidence}/${task.criteria.length} satisfied`].join("\n");
+  return [`${task.id} · ${statusLabel(task.status)} · ${task.text}`, `  taskRun: ${taskRun.id}`, group ? `  group: ${group.id} · ${group.title}` : undefined, `  criteria: ${evidence}/${task.criteria.length} satisfied`]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 export function formatInspectReport(state: TaskedSubagentsState, targetId: string): string {
-  const plan = findPlan(state, targetId);
-  if (plan) return formatPlanDetail(plan);
-  const phase = findPhase(state, targetId);
-  if (phase) return formatPhaseDetail(phase.plan, phase.phase);
+  const taskRun = findTaskRun(state, targetId);
+  if (taskRun) return formatTaskRunDetail(taskRun);
+  const group = findGroup(state, targetId);
+  if (group) return formatGroupDetail(group.taskRun, group.group);
   const task = findTask(state, targetId);
-  if (task) return formatTaskDetail(task.plan, task.phase, task.task);
+  if (task) return formatTaskDetail(task.taskRun, task.group, task.task);
   const assignment = findAssignment(state, targetId);
-  if (assignment) return formatAssignmentDetail(assignment.plan, assignment.assignment);
-  return `Not found: ${targetId}. Use a valid plan, phase, task, or assignment id.`;
+  if (assignment) return formatAssignmentDetail(assignment.taskRun, assignment.assignment);
+  return `Not found: ${targetId}. Use a valid taskRun, group, task, or assignment id.`;
 }
 
-function formatPlanDetail(plan: PlanRecord): string {
-  const lines = [`Plan: ${plan.id}`, `  title: ${plan.title}`, `  status: ${statusLabel(plan.status)}`, `  request: ${plan.request}`, `  spec: ${plan.spec}`, "", `Phases (${plan.phases.length}):`];
-  for (const phase of plan.phases) {
-    lines.push(`  ${phase.id} · ${statusLabel(phase.status)} · ${phase.title}`);
-    for (const task of phase.tasks) lines.push(`    ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(plan, task)} · ${task.text}`);
+function formatTaskRunDetail(taskRun: TaskRunRecord): string {
+  const lines = [`TaskRun: ${taskRun.id}`, `  title: ${taskRun.title}`, `  status: ${statusLabel(taskRun.status)}`, `  request: ${taskRun.request}`, `  context: ${taskRun.context}`, "", `Groups (${taskRun.groups.length}):`];
+  for (const group of taskRun.groups) lines.push(`  ${group.id} · ${statusLabel(group.status)} · ${group.title}`);
+  lines.push("", `Tasks (${taskRun.tasks.length}):`);
+  for (const task of taskRun.tasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(taskRun, task)} · ${task.text}`);
+  if (taskRun.assignments.length > 0) {
+    lines.push("", `Assignments (${taskRun.assignments.length}):`);
+    for (const assignment of taskRun.assignments) lines.push(`  ${assignmentSummaryLine(taskRun, assignment)}`);
   }
-  if (plan.assignments.length > 0) {
-    lines.push("", `Assignments (${plan.assignments.length}):`);
-    for (const assignment of plan.assignments) lines.push(`  ${assignmentSummaryLine(plan, assignment)}`);
-  }
-  if (plan.artifacts.length > 0) lines.push(`Artifacts: ${plan.artifacts.length}`);
+  if (taskRun.artifacts.length > 0) lines.push(`Artifacts: ${taskRun.artifacts.length}`);
   return lines.join("\n");
 }
 
-function formatPhaseDetail(plan: PlanRecord, phase: PlanRecord["phases"][number]): string {
-  const lines = [`Phase: ${phase.id}`, `  title: ${phase.title}`, `  status: ${statusLabel(phase.status)}`, `  plan: ${plan.id} · ${plan.title}`];
-  if (phase.goal) lines.push(`  goal: ${phase.goal}`);
-  if (phase.dependsOn.length) lines.push(`  depends on: ${phase.dependsOn.join(", ")}`);
-  lines.push("", `Tasks (${phase.tasks.length}):`);
-  for (const task of phase.tasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(plan, task)} · ${task.text}`);
-  const ids = new Set(phase.tasks.flatMap((task) => task.assignmentIds));
-  const assignments = plan.assignments.filter((assignment) => ids.has(assignment.id));
+function formatGroupDetail(taskRun: TaskRunRecord, group: TaskGroupRecord): string {
+  const groupTasks = taskRun.tasks.filter((task) => task.groupId === group.id);
+  const lines = [`Group: ${group.id}`, `  title: ${group.title}`, `  status: ${statusLabel(group.status)}`, `  taskRun: ${taskRun.id} · ${taskRun.title}`];
+  if (group.dependsOn.length) lines.push(`  depends on: ${group.dependsOn.join(", ")}`);
+  lines.push("", `Tasks (${groupTasks.length}):`);
+  for (const task of groupTasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(taskRun, task)} · ${task.text}`);
+  const ids = new Set(groupTasks.flatMap((task) => task.assignmentIds));
+  const assignments = taskRun.assignments.filter((assignment) => ids.has(assignment.id));
   if (assignments.length > 0) {
     lines.push("", `Assignments (${assignments.length}):`);
-    for (const assignment of assignments) lines.push(`  ${assignmentSummaryLine(plan, assignment)}`);
+    for (const assignment of assignments) lines.push(`  ${assignmentSummaryLine(taskRun, assignment)}`);
   }
   return lines.join("\n");
 }
 
-function formatTaskDetail(plan: PlanRecord, phase: PlanRecord["phases"][number], task: PlanRecord["phases"][number]["tasks"][number]): string {
-  const lines = [`Task: ${task.id}`, `  text: ${task.text}`, `  status: ${statusLabel(task.status)}`, `  plan: ${plan.id}`, `  phase: ${phase.id} · ${phase.title}`, "", "Criteria:"];
+function formatTaskDetail(taskRun: TaskRunRecord, group: TaskGroupRecord | undefined, task: TaskRecord): string {
+  const lines = [`Task: ${task.id}`, `  text: ${task.text}`, `  status: ${statusLabel(task.status)}`, `  taskRun: ${taskRun.id}`];
+  if (group) lines.push(`  group: ${group.id} · ${group.title}`);
+  lines.push("", "Criteria:");
   for (const criterion of task.criteria) {
     lines.push(`  ${criterion.satisfied ? "✓" : "·"} ${criterion.text}`);
     for (const evidence of criterion.evidence) lines.push(`    evidence: ${shortTitle(evidence.summary, 120)} (${evidence.assignmentId})`);
@@ -289,8 +331,9 @@ function formatTaskDetail(plan: PlanRecord, phase: PlanRecord["phases"][number],
   return lines.join("\n");
 }
 
-function formatAssignmentDetail(plan: PlanRecord, assignment: TaskAssignmentRecord): string {
-  const lines = [`Assignment: ${assignment.id}`, `  status: ${statusLabel(assignment.status)}`, `  plan: ${plan.id} · ${plan.title}`, `  phase: ${assignment.phaseId}`, `  task: ${assignment.taskId}`, `  agent: ${assignment.agent}`];
+function formatAssignmentDetail(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): string {
+  const lines = [`Assignment: ${assignment.id}`, `  status: ${statusLabel(assignment.status)}`, `  taskRun: ${taskRun.id} · ${taskRun.title}`, assignment.groupId ? `  group: ${assignment.groupId}` : undefined, `  task: ${assignment.taskId}`, `  agent: ${assignment.agent}`]
+    .filter((line): line is string => Boolean(line));
   if (assignment.result?.summary) lines.push(`  result: ${assignment.result.summary}`);
   if (assignment.launchRef?.resultPath) lines.push(`  result path: ${assignment.launchRef.resultPath}`);
   return lines.join("\n");
@@ -298,16 +341,19 @@ function formatAssignmentDetail(plan: PlanRecord, assignment: TaskAssignmentReco
 
 export function formatResultReport(state: TaskedSubagentsState, targetId: string): string {
   const assignments = assignmentsForTarget(state, targetId);
-  if (!assignments) return `Assignment not found: ${targetId}. Use /tasked-subagents status to list active assignments.`;
+  if (!assignments) return `Result target not found: ${targetId}. Use /tasked-subagents status to list active assignments.`;
   if (assignments.length === 0) return `No assignments for result target: ${targetId}. Use /tasked-subagents inspect ${targetId} for details.`;
   if (assignments.length === 1) {
     const assignment = findAssignment(state, assignments[0].id);
-    return assignment ? formatAssignmentDetail(assignment.plan, assignment.assignment) : `Assignment not found: ${targetId}.`;
+    return assignment ? formatAssignmentDetail(assignment.taskRun, assignment.assignment) : `Assignment not found: ${targetId}.`;
   }
   return [
     `Ambiguous result target: ${targetId}. Use /tasked-subagents result <assignmentId>.`,
     "Assignments:",
-    ...assignments.map((assignment) => `  ${assignmentSummaryLine(state.plans.find((plan) => plan.id === assignment.planId)!, assignment)}`),
+    ...assignments.map((assignment) => {
+      const taskRun = state.taskRuns.find((candidate) => candidate.id === assignment.taskRunId);
+      return `  ${taskRun ? assignmentSummaryLine(taskRun, assignment) : assignment.id}`;
+    }),
   ].join("\n");
 }
 
@@ -328,7 +374,7 @@ export function formatCancelAcknowledgement(assignmentId: string): string {
 }
 
 export function formatClearAcknowledgement(count: number): string {
-  return count > 0 ? `Cleared ${count} plan(s).` : "Nothing to clear.";
+  return count > 0 ? `Cleared ${count} task run(s).` : "Nothing to clear.";
 }
 
 export function formatAgentsReport(profiles: AgentProfile[], options: { details?: boolean } = {}): string {
@@ -347,13 +393,13 @@ export function formatAgentsReport(profiles: AgentProfile[], options: { details?
     "",
     options.details ? "Details omit system prompts." : "Names only by default. Use details=true or --details for non-sensitive metadata.",
     "",
-    "Use with replace_plan: assign an agentHint to a concrete task inside a phase.",
+    "Use with set_tasks or edit_task: assign an agentHint to a concrete task.",
   ];
   return lines.join("\n");
 }
 
 export function formatDispatchReport(args?: Record<string, unknown>, result?: string): string {
-  const lines = ["[INTERNAL DISPATCH]", "Schedules ready task assignments for the current plan."];
+  const lines = ["[INTERNAL DISPATCH]", "Schedules ready task assignments for the current task run."];
   if (args && Object.keys(args).length > 0) {
     lines.push("Dispatch arguments:");
     for (const [key, value] of Object.entries(args)) lines.push(`  ${key}: ${String(value)}`);
@@ -366,32 +412,33 @@ export function buildHelpText(): string {
   return [
     "Slash command usage:",
     "  /tasked-subagents help",
-    "  /tasked-subagents status [planId|phaseId|taskId|assignmentId]",
-    "  /tasked-subagents inspect <planId|phaseId|taskId|assignmentId>",
-    "  /tasked-subagents result <planId|phaseId|taskId|assignmentId>  (plan/phase/task must resolve to one assignment)",
-    "  /tasked-subagents dispatch",
+    "  /tasked-subagents status [taskRunId|groupId|taskId|assignmentId]",
+    "  /tasked-subagents inspect <taskRunId|groupId|taskId|assignmentId>",
+    "  /tasked-subagents result <taskRunId|groupId|taskId|assignmentId>  (taskRun/group/task must resolve to one assignment)",
+    "  /tasked-subagents dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>]",
     "  /tasked-subagents stop <assignmentId>",
-    "  /tasked-subagents continue <taskId|assignmentId|phaseId> <prompt>",
-    "  /tasked-subagents resolve <taskId|assignmentId|phaseId|planId> <fix-summary>",
+    "  /tasked-subagents continue <taskId|assignmentId|groupId> <prompt>",
+    "  /tasked-subagents resolve <taskId|assignmentId|groupId|taskRunId> <fix-summary>",
     "  /tasked-subagents cancel <assignmentId>",
     "  /tasked-subagents clear [completed|all]",
     "  /tasked-subagents agents [--details]",
     "",
     "Tool usage:",
-    "  tasked_subagents action=replace_plan spec=<spec> phases=<phases>",
-    "  tasked_subagents action=edit_plan targetId=<phaseId|taskId> phase=<patch> task=<patch>",
-    "  tasked_subagents action=dispatch [planId=<planId>]",
+    "  tasked_subagents action=set_tasks context=<context> tasks=<tasks> [groups=<groups>]",
+    "  tasked_subagents action=edit_task taskRunId=<taskRunId> targetId=<taskId> task=<patch>",
+    "  tasked_subagents action=edit_group taskRunId=<taskRunId> targetId=<groupId> group=<patch>",
+    "  tasked_subagents action=dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>]",
     "  tasked_subagents action=status [targetId=<id>]",
     "  tasked_subagents action=inspect targetId=<id>",
     "  tasked_subagents action=result assignmentId=<assignmentId>",
-    "  tasked_subagents action=continue targetId=<taskId|assignmentId|phaseId> prompt=<prompt>",
-    "  tasked_subagents action=resolve targetId=<taskId|assignmentId|phaseId|planId> prompt=<fix-summary>",
+    "  tasked_subagents action=continue targetId=<taskId|assignmentId|groupId> prompt=<prompt>",
+    "  tasked_subagents action=resolve targetId=<taskId|assignmentId|groupId|taskRunId> prompt=<fix-summary>",
     "  tasked_subagents action=stop assignmentId=<assignmentId>",
     "  tasked_subagents action=cancel assignmentId=<assignmentId>",
     "  tasked_subagents action=list_agents [details=true]",
     "",
     "Model:",
-    "  Plans contain phases; phases contain tasks; every subagent assignment executes exactly one task.",
-    "  One-off work is a one-phase, one-task plan.",
+    "  Task runs contain groups and tasks; every subagent assignment executes exactly one task.",
+    "  One-off work is a one-task task run.",
   ].join("\n");
 }

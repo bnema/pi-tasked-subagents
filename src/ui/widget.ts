@@ -1,11 +1,11 @@
 // ──────────────────────────────────────────────
-// Plan/phase/task/assignment widget rendering
+// Task-run/group/task/assignment widget rendering
 // ──────────────────────────────────────────────
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
 import { DEFAULT_WIDGET_LINES } from "../defaults.js";
-import type { PhaseRecord, PlanRecord, TaskAssignmentRecord, TaskRecord, TaskedSubagentsState } from "../types.js";
+import type { TaskAssignmentRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
 import { shortTitle } from "../utils/text.js";
 import {
   GLYPH_ATTENTION,
@@ -44,6 +44,13 @@ const ASSIGNMENT_ID_WIDTH = 24;
 const MAX_ACTIVITY_LINES = 3;
 const RUNNING_DOT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const RUNNING_DOT_INTERVAL_MS = 120;
+
+interface WidgetGroupView {
+  id?: string;
+  title: string;
+  status: string;
+  agentHint?: string;
+}
 
 function muted(text: string, theme?: WidgetThemeLike): string {
   return theme?.muted ? theme.muted(text) : text;
@@ -111,34 +118,34 @@ function linePrefix(isLast: boolean, theme?: WidgetThemeLike): string {
   return `${treeGlyph(isLast, theme)} `;
 }
 
-function planVisibleInWidget(plan: PlanRecord): boolean {
-  return plan.status !== "completed" && plan.status !== "cancelled";
+function taskRunVisibleInWidget(taskRun: TaskRunRecord): boolean {
+  return taskRun.status !== "completed" && taskRun.status !== "cancelled";
 }
 
-function currentPlan(state: TaskedSubagentsState): PlanRecord | undefined {
-  if (state.currentPlanId) {
-    const current = state.plans.find((plan) => plan.id === state.currentPlanId);
-    if (current && planVisibleInWidget(current)) return current;
+function currentTaskRun(state: TaskedSubagentsState): TaskRunRecord | undefined {
+  if (state.currentTaskRunId) {
+    const current = state.taskRuns.find((taskRun) => taskRun.id === state.currentTaskRunId);
+    if (current && taskRunVisibleInWidget(current)) return current;
   }
-  return state.plans.find((plan) => (plan.status === "attention" || plan.status === "failed") && planVisibleInWidget(plan))
-    ?? state.plans.find((plan) => (plan.status === "running" || plan.status === "pending") && planVisibleInWidget(plan));
+  return state.taskRuns.find((taskRun) => (taskRun.status === "attention" || taskRun.status === "failed") && taskRunVisibleInWidget(taskRun))
+    ?? state.taskRuns.find((taskRun) => (taskRun.status === "running" || taskRun.status === "pending") && taskRunVisibleInWidget(taskRun));
 }
 
-function taskDisplaysDone(plan: PlanRecord, task: TaskRecord): boolean {
-  return task.status === "completed" || assignmentForTask(plan, task)?.status === "completed";
+function taskDisplaysDone(taskRun: TaskRunRecord, task: TaskRecord): boolean {
+  return task.status === "completed" || assignmentForTask(taskRun, task)?.status === "completed";
 }
 
-function planTaskProgress(plan: PlanRecord): { done: number; total: number } {
-  const tasks = plan.phases.flatMap((phase) => phase.tasks);
-  return { done: tasks.filter((task) => taskDisplaysDone(plan, task)).length, total: tasks.length };
+function taskRunTaskProgress(taskRun: TaskRunRecord): { done: number; total: number } {
+  return { done: taskRun.tasks.filter((task) => taskDisplaysDone(taskRun, task)).length, total: taskRun.tasks.length };
 }
 
 function taskCriteriaProgress(task: TaskRecord): { done: number; total: number } {
   return { done: task.criteria.filter((criterion) => criterion.satisfied).length, total: task.criteria.length };
 }
 
-function phaseProgress(plan: PlanRecord, phase: PhaseRecord): { done: number; total: number } {
-  return { done: phase.tasks.filter((task) => taskDisplaysDone(plan, task)).length, total: phase.tasks.length };
+function groupProgress(taskRun: TaskRunRecord, group: WidgetGroupView): { done: number; total: number } {
+  const tasks = tasksForGroup(taskRun, group.id);
+  return { done: tasks.filter((task) => taskDisplaysDone(taskRun, task)).length, total: tasks.length };
 }
 
 function statusProgressLabel(
@@ -153,53 +160,76 @@ function statusProgressLabel(
   return `${statusGlyphValue} ${muted(`${progress.done}/${progress.total}`, theme)}`;
 }
 
-function assignmentForTask(plan: PlanRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
+function assignmentForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
   for (let index = task.assignmentIds.length - 1; index >= 0; index -= 1) {
-    const assignment = plan.assignments.find((candidate) => candidate.id === task.assignmentIds[index]);
+    const assignment = taskRun.assignments.find((candidate) => candidate.id === task.assignmentIds[index]);
     if (assignment) return assignment;
   }
   return undefined;
 }
 
-function phaseHasUnfinishedWork(plan: PlanRecord, phase: PhaseRecord): boolean {
-  return phase.tasks.some((task) => !taskDisplaysDone(plan, task));
+function tasksForGroup(taskRun: TaskRunRecord, groupId: string | undefined): TaskRecord[] {
+  return taskRun.tasks.filter((task) => task.groupId === groupId);
 }
 
-function phaseIsInteresting(phase: PhaseRecord): boolean {
-  return phase.status !== "pending" || phase.tasks.some((task) => task.status !== "pending");
+function taskStatusForWidgetGroup(tasks: TaskRecord[]): string {
+  if (tasks.some((task) => task.status === "attention")) return "attention";
+  if (tasks.some((task) => task.status === "failed")) return "failed";
+  if (tasks.some((task) => task.status === "running")) return "running";
+  if (tasks.some((task) => task.status === "ready")) return "ready";
+  if (tasks.some((task) => task.status === "blocked")) return "blocked";
+  if (tasks.every((task) => task.status === "completed")) return "completed";
+  if (tasks.every((task) => task.status === "cancelled")) return "cancelled";
+  return "pending";
 }
 
-function visiblePhases(plan: PlanRecord): PhaseRecord[] {
-  const unfinished = plan.phases.filter((phase) => phaseHasUnfinishedWork(plan, phase));
-  const interestingUnfinished = unfinished.filter(phaseIsInteresting);
+function widgetGroups(taskRun: TaskRunRecord): WidgetGroupView[] {
+  const ungroupedTasks = tasksForGroup(taskRun, undefined);
+  return ungroupedTasks.length > 0
+    ? [...taskRun.groups, { title: "Ungrouped", status: taskStatusForWidgetGroup(ungroupedTasks) }]
+    : taskRun.groups;
+}
+
+function groupHasUnfinishedWork(taskRun: TaskRunRecord, group: WidgetGroupView): boolean {
+  return tasksForGroup(taskRun, group.id).some((task) => !taskDisplaysDone(taskRun, task));
+}
+
+function groupIsInteresting(taskRun: TaskRunRecord, group: WidgetGroupView): boolean {
+  return group.status !== "pending" || tasksForGroup(taskRun, group.id).some((task) => task.status !== "pending");
+}
+
+function visibleGroups(taskRun: TaskRunRecord): WidgetGroupView[] {
+  const groups = widgetGroups(taskRun);
+  const unfinished = groups.filter((group) => groupHasUnfinishedWork(taskRun, group));
+  const interestingUnfinished = unfinished.filter((group) => groupIsInteresting(taskRun, group));
   if (interestingUnfinished.length > 0) return interestingUnfinished;
-  const interesting = plan.phases.filter(phaseIsInteresting);
-  return interesting.length > 0 ? interesting : plan.phases;
+  const interesting = groups.filter((group) => groupIsInteresting(taskRun, group));
+  return interesting.length > 0 ? interesting : groups;
 }
 
-function visibleTasks(plan: PlanRecord, phase: PhaseRecord): TaskRecord[] {
-  const unfinished = phase.tasks.filter((task) => !taskDisplaysDone(plan, task));
+function visibleTasks(taskRun: TaskRunRecord, group: WidgetGroupView): TaskRecord[] {
+  const unfinished = tasksForGroup(taskRun, group.id).filter((task) => !taskDisplaysDone(taskRun, task));
   const activeOrNeedsAttention = unfinished.filter((task) => task.status !== "pending");
   if (activeOrNeedsAttention.length > 0) return activeOrNeedsAttention;
   return unfinished;
 }
 
-function completedTaskCount(plan: PlanRecord, phase: PhaseRecord): number {
-  return phase.tasks.filter((task) => taskDisplaysDone(plan, task)).length;
+function completedTaskCount(taskRun: TaskRunRecord, group: WidgetGroupView): number {
+  return tasksForGroup(taskRun, group.id).filter((task) => taskDisplaysDone(taskRun, task)).length;
 }
 
-function buildSummaryLine(plan: PlanRecord, theme?: WidgetThemeLike, options: WidgetBuildOptions = {}): string {
-  const progress = planTaskProgress(plan);
+function buildSummaryLine(taskRun: TaskRunRecord, theme?: WidgetThemeLike, options: WidgetBuildOptions = {}): string {
+  const progress = taskRunTaskProgress(taskRun);
   return joinParts([
     `${color(GLYPH_TASKED_SUBAGENTS, "accent", theme)} ${bold("Tasked", theme)}`,
-    statusProgressLabel(plan.status, progress, theme),
-    plan.status === "running" && options.runningDots ? color(options.runningDots, "accent", theme) : undefined,
-    bold(shortTitle(plan.title || plan.request, SUMMARY_TITLE_WIDTH), theme),
+    statusProgressLabel(taskRun.status, progress, theme),
+    taskRun.status === "running" && options.runningDots ? color(options.runningDots, "accent", theme) : undefined,
+    bold(shortTitle(taskRun.title || taskRun.request, SUMMARY_TITLE_WIDTH), theme),
   ]);
 }
 
-function buildPhaseLine(plan: PlanRecord, phase: PhaseRecord, isLast: boolean, theme?: WidgetThemeLike): string {
-  return `${linePrefix(isLast, theme)}${color(GLYPH_PHASE, "accent", theme)} ${bold(shortTitle(phase.title, PHASE_TITLE_WIDTH), theme)} ${statusProgressLabel(phase.status, phaseProgress(plan, phase), theme)}`;
+function buildGroupLine(taskRun: TaskRunRecord, group: WidgetGroupView, isLast: boolean, theme?: WidgetThemeLike): string {
+  return `${linePrefix(isLast, theme)}${color(GLYPH_PHASE, "accent", theme)} ${bold(shortTitle(group.title, PHASE_TITLE_WIDTH), theme)} ${statusProgressLabel(group.status, groupProgress(taskRun, group), theme)}`;
 }
 
 function formatElapsed(startedAt: number | undefined, currentTime: number): string | undefined {
@@ -282,10 +312,10 @@ function taskActivityLines(
   ];
 }
 
-function buildTaskLine(plan: PlanRecord, phase: PhaseRecord, task: TaskRecord, parentLast: boolean, isLast: boolean, theme?: WidgetThemeLike): string {
-  const assignment = assignmentForTask(plan, task);
+function buildTaskLine(taskRun: TaskRunRecord, group: WidgetGroupView, task: TaskRecord, parentLast: boolean, isLast: boolean, theme?: WidgetThemeLike): string {
+  const assignment = assignmentForTask(taskRun, task);
   const criteria = taskCriteriaProgress(task);
-  const agent = assignment?.agent ?? task.agentHint ?? phase.agentHint;
+  const agent = assignment?.agent ?? task.agentHint ?? group.agentHint;
   const hasActivityDetails = assignment?.status === "queued" || assignment?.status === "running";
   return `${childPrefix(parentLast, theme)}${linePrefix(isLast, theme)}${shortTitle(task.text, TASK_TITLE_WIDTH)} ${joinParts([
     statusProgressLabel(task.status, criteria, theme, { hideZeroProgress: true }),
@@ -298,16 +328,16 @@ function buildCompletedTasksLine(count: number, parentLast: boolean, isLast: boo
   return `${childPrefix(parentLast, theme)}${linePrefix(isLast, theme)}${color(GLYPH_DONE, "success", theme)} ${muted(`${count} completed`, theme)}`;
 }
 
-function hiddenPhaseCounts(plan: PlanRecord, phases: PhaseRecord[]): { completed: number; completedTasks: number; other: number } {
-  const visibleIds = new Set(phases.map((phase) => phase.id));
+function hiddenGroupCounts(taskRun: TaskRunRecord, groups: WidgetGroupView[]): { completed: number; completedTasks: number; other: number } {
+  const visibleIds = new Set(groups.map((group) => group.id).filter((id): id is string => typeof id === "string"));
   let completed = 0;
   let completedTasks = 0;
   let other = 0;
-  for (const phase of plan.phases) {
-    if (visibleIds.has(phase.id)) continue;
-    if (phase.status === "completed") {
+  for (const group of taskRun.groups) {
+    if (visibleIds.has(group.id)) continue;
+    if (group.status === "completed") {
       completed += 1;
-      completedTasks += completedTaskCount(plan, phase);
+      completedTasks += completedTaskCount(taskRun, group);
     } else other += 1;
   }
   return { completed, completedTasks, other };
@@ -315,7 +345,7 @@ function hiddenPhaseCounts(plan: PlanRecord, phases: PhaseRecord[]): { completed
 
 function buildHiddenLine(hidden: { completed: number; completedTasks: number; other: number }, theme?: WidgetThemeLike): string | undefined {
   const parts = [
-    hidden.completed > 0 ? `${hidden.completed} ${hidden.completed === 1 ? "phase" : "phases"} completed` : undefined,
+    hidden.completed > 0 ? `${hidden.completed} ${hidden.completed === 1 ? "group" : "groups"} completed` : undefined,
     hidden.completedTasks > 0 ? `${hidden.completedTasks} completed` : undefined,
     hidden.other > 0 ? `+${hidden.other}` : undefined,
   ].filter(Boolean);
@@ -329,20 +359,20 @@ export function buildWidgetLines(
   options: WidgetBuildOptions = {},
 ): string[] {
   if (limit <= 0) return [];
-  const plan = currentPlan(state);
-  if (!plan) return [];
+  const taskRun = currentTaskRun(state);
+  if (!taskRun) return [];
 
-  const lines = [buildSummaryLine(plan, theme, options)];
-  const phases = visiblePhases(plan);
-  const hidden = hiddenPhaseCounts(plan, phases);
-  const hasHiddenPhases = hidden.completed > 0 || hidden.other > 0;
+  const lines = [buildSummaryLine(taskRun, theme, options)];
+  const groups = visibleGroups(taskRun);
+  const hidden = hiddenGroupCounts(taskRun, groups);
+  const hasHiddenGroups = hidden.completed > 0 || hidden.other > 0;
 
-  for (let phaseIndex = 0; phaseIndex < phases.length && lines.length < limit; phaseIndex += 1) {
-    const phase = phases[phaseIndex];
-    const phaseIsLast = phaseIndex === phases.length - 1 && !hasHiddenPhases;
-    lines.push(buildPhaseLine(plan, phase, phaseIsLast, theme));
-    const tasks = visibleTasks(plan, phase);
-    const completedCount = completedTaskCount(plan, phase);
+  for (let groupIndex = 0; groupIndex < groups.length && lines.length < limit; groupIndex += 1) {
+    const group = groups[groupIndex];
+    const groupIsLast = groupIndex === groups.length - 1 && !hasHiddenGroups;
+    lines.push(buildGroupLine(taskRun, group, groupIsLast, theme));
+    const tasks = visibleTasks(taskRun, group);
+    const completedCount = completedTaskCount(taskRun, group);
     const hasCompletedSummary = completedCount > 0;
     for (let taskIndex = 0; taskIndex < tasks.length && lines.length < limit; taskIndex += 1) {
       const task = tasks[taskIndex];
@@ -350,14 +380,14 @@ export function buildWidgetLines(
       const reserveCompletedSummary = hasCompletedSummary && isLastVisibleTask && lines.length + 1 < limit;
       const taskIsLast = isLastVisibleTask && !reserveCompletedSummary;
       const activityLimit = reserveCompletedSummary ? limit - 1 : limit;
-      lines.push(buildTaskLine(plan, phase, task, phaseIsLast, taskIsLast, theme));
-      for (const activityLine of taskActivityLines(assignmentForTask(plan, task), phaseIsLast, taskIsLast, theme, options)) {
+      lines.push(buildTaskLine(taskRun, group, task, groupIsLast, taskIsLast, theme));
+      for (const activityLine of taskActivityLines(assignmentForTask(taskRun, task), groupIsLast, taskIsLast, theme, options)) {
         if (lines.length >= activityLimit) break;
         lines.push(activityLine);
       }
     }
     if (lines.length < limit) {
-      const completedLine = buildCompletedTasksLine(completedCount, phaseIsLast, true, theme);
+      const completedLine = buildCompletedTasksLine(completedCount, groupIsLast, true, theme);
       if (completedLine) lines.push(completedLine);
     }
   }
@@ -371,7 +401,7 @@ export function buildWidgetLines(
 }
 
 function hasActiveAssignment(state: TaskedSubagentsState): boolean {
-  return state.plans.some((plan) => plan.assignments.some((assignment) => assignment.status === "queued" || assignment.status === "running"));
+  return state.taskRuns.some((taskRun) => taskRun.assignments.some((assignment) => assignment.status === "queued" || assignment.status === "running"));
 }
 
 export function createWidgetContent(

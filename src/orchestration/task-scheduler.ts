@@ -143,9 +143,11 @@ function taskHasActiveAssignment(taskRun: TaskRunRecord, task: TaskRecord): bool
 
 function groupCanDispatchReadyTasks(taskRun: TaskRunRecord, group: TaskGroupRecord): boolean {
   if (groupDependenciesBlocked(taskRun, group) || !groupDependenciesComplete(taskRun, group)) return false;
-  return group.status === "ready"
-    || group.status === "running"
-    || (group.status === "attention" && tasksForGroup(taskRun, group.id).some((task) => task.status === "ready"));
+  if (group.status === "ready" || group.status === "running") return true;
+  const readyTasks = tasksForGroup(taskRun, group.id).filter((task) => task.status === "ready");
+  if (group.status === "attention") return readyTasks.length > 0;
+  return (group.status === "failed" || group.status === "cancelled" || group.status === "blocked")
+    && readyTasks.some((task) => task.continuation?.trim());
 }
 
 function taskRunAvailableSlots(taskRun: TaskRunRecord): number {
@@ -385,8 +387,8 @@ export function toLaunchTaskEntries(assignments: TaskAssignmentRecord[], taskRun
       taskSummary: task?.text ?? assignment.taskId,
       dependsOn: dependsOn.length > 0 ? dependsOn : undefined,
       retries: task?.retries,
-      outputMode: "json",
-      outputSchema: "SubagentTaskReport JSON object",
+      outputMode: task?.outputMode ?? "json",
+      outputSchema: task?.outputSchema ?? "SubagentTaskReport JSON object",
       when: task?.when,
       cwd: task?.cwd ?? (assignment as TaskAssignmentWithLaunchDefaults).cwd ?? options.defaultCwd,
     } satisfies LaunchTaskEntry;

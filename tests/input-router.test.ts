@@ -16,7 +16,7 @@ describe("input router", () => {
     expect(controller.handleUserAsk).not.toHaveBeenCalled();
   });
 
-  test("handles explicit requests by creating a plan", () => {
+  test("handles explicit requests by creating a one-task TaskRun", () => {
     const controller = { handleUserAsk: vi.fn() };
     expect(routeInput("@tasked-subagents inspect repo", "interactive", controller as never).action).toBe("handled");
     expect(controller.handleUserAsk).toHaveBeenCalledWith("inspect repo");

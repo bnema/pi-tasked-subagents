@@ -1,5 +1,5 @@
 // ──────────────────────────────────────────────
-// Plan-first controller for pi-tasked-subagents
+// Task-run controller for pi-tasked-subagents
 // ──────────────────────────────────────────────
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -14,24 +14,28 @@ import {
   PACKAGE_NAME,
 } from "../defaults.js";
 import type {
-  AcceptedPlanResult,
-  EditPlanInput,
-  EditPlanResult,
-  PlanRecord,
+  EditGroupInput,
+  EditGroupResult,
+  EditTaskInput,
+  EditTaskResult,
   RunProgressSnapshot,
   RunStatus,
+  SetTasksInput,
+  SetTasksResult,
   SubagentRunHandle,
   SubagentRuntime,
   SubagentTaskReport,
   TaskAssignmentRecord,
+  TaskGroupRecord,
+  TaskInput,
   TaskRecord,
+  TaskRunRecord,
   TaskedSubagentsState,
-  ValidatedPlanInput,
 } from "../types.js";
 import { PiRunnerAdapter } from "../launcher/pi-runner-adapter.js";
 import type { RunnerRuntimeContext } from "../launcher/interface.js";
 import { cloneState, createEmptyState, createStateLock, ensureState } from "../state/store.js";
-import { normalizePlanInput, validatePlanInput } from "../state/plan-validation.js";
+import { normalizeTaskRunInput, validateTaskRunInput } from "../state/task-run-validation.js";
 import { statusLabel } from "../ui/messages.js";
 import { buildFooterStatus } from "../ui/status.js";
 import { buildWidgetLines, createWidgetContent } from "../ui/widget.js";
@@ -39,19 +43,19 @@ import { shortTitle } from "../utils/text.js";
 import {
   applyAssignmentProgress,
   createReadyAssignments,
-  derivePlanStatus,
+  deriveTaskRunStatus,
   toLaunchTaskEntries,
 } from "./task-scheduler.js";
 import { applySubagentTaskReport, parseTaskReport } from "./task-result-reducer.js";
 
-export type { ValidatedPlanInput, EditPlanInput, AcceptedPlanResult, EditPlanResult } from "../types.js";
+export type { EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, SetTasksInput, SetTasksResult } from "../types.js";
 
 export interface DispatchOptions {
   maxConcurrency?: number;
   defaultAgent?: string;
   defaultCwd?: string;
   ctx?: ExtensionContext;
-  planId?: string;
+  taskRunId?: string;
 }
 
 export interface DispatchResult {
@@ -103,13 +107,8 @@ function controlStatusForAssignment(
   currentStatus: TaskAssignmentRecord["status"],
   targetStatus: RunStatus,
 ): TaskAssignmentRecord["status"] | undefined {
-  if (targetStatus === "paused") {
-    return currentStatus === "queued" || currentStatus === "running" ? "paused" : undefined;
-  }
-  if (targetStatus === "cancelled") {
-    if (finalAssignmentStatus(currentStatus)) return undefined;
-    return "cancelled";
-  }
+  if (targetStatus === "paused") return currentStatus === "queued" || currentStatus === "running" ? "paused" : undefined;
+  if (targetStatus === "cancelled") return finalAssignmentStatus(currentStatus) ? undefined : "cancelled";
   return undefined;
 }
 
@@ -118,52 +117,11 @@ function normalizeTargetId(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function maxPlanCounter(plans: PlanRecord[]): number {
-  return plans.reduce((max, plan) => {
-    const match = /^plan-(\d+)$/u.exec(plan.id);
+function maxTaskRunCounter(taskRuns: TaskRunRecord[]): number {
+  return taskRuns.reduce((max, taskRun) => {
+    const match = /^task-run-(\d+)$/u.exec(taskRun.id);
     return match ? Math.max(max, Number(match[1])) : max;
   }, 0);
-}
-
-function taskRecordToValidationInput(task: PlanRecord["phases"][number]["tasks"][number]): ValidatedPlanInput["phases"][number]["tasks"][number] {
-  return {
-    id: task.id,
-    text: task.text,
-    criteria: task.criteria.map((criterion) => criterion.text),
-    dependsOn: task.dependsOn,
-    agentHint: task.agentHint,
-    filesHint: task.filesHint,
-    cwd: task.cwd,
-    retries: task.retries,
-    outputMode: task.outputMode,
-    outputSchema: task.outputSchema,
-    when: task.when,
-  };
-}
-
-function phaseRecordToValidationInput(phase: PlanRecord["phases"][number]): ValidatedPlanInput["phases"][number] {
-  return {
-    id: phase.id,
-    title: phase.title,
-    goal: phase.goal,
-    dependsOn: phase.dependsOn,
-    agentHint: phase.agentHint,
-    filesHint: phase.filesHint,
-    brief: phase.brief,
-    maxConcurrency: phase.maxConcurrency,
-    tasks: phase.tasks.map(taskRecordToValidationInput),
-  };
-}
-
-function planRecordToValidationInput(plan: PlanRecord): ValidatedPlanInput {
-  return {
-    id: plan.id,
-    title: plan.title,
-    request: plan.request,
-    spec: plan.spec,
-    maxConcurrency: plan.maxConcurrency,
-    phases: plan.phases.map(phaseRecordToValidationInput),
-  };
 }
 
 function progressSignature(snapshot: RunProgressSnapshot): string {
@@ -227,18 +185,58 @@ function resultForAssignment(raw: string | undefined, assignmentId: string): str
 }
 
 type MutableTarget =
-  | { kind: "plan"; plan: PlanRecord }
-  | { kind: "phase"; plan: PlanRecord; phase: PlanRecord["phases"][number] }
-  | { kind: "task"; plan: PlanRecord; phase: PlanRecord["phases"][number]; task: PlanRecord["phases"][number]["tasks"][number] }
-  | { kind: "assignment"; plan: PlanRecord; assignment: TaskAssignmentRecord; phase: PlanRecord["phases"][number]; task: PlanRecord["phases"][number]["tasks"][number] };
+  | { kind: "taskRun"; taskRun: TaskRunRecord }
+  | { kind: "group"; taskRun: TaskRunRecord; group: TaskGroupRecord }
+  | { kind: "task"; taskRun: TaskRunRecord; group?: TaskGroupRecord; task: TaskRecord }
+  | { kind: "assignment"; taskRun: TaskRunRecord; assignment: TaskAssignmentRecord; group?: TaskGroupRecord; task: TaskRecord };
 
 function recoverableTaskStatus(status: string): boolean {
   return status === "attention" || status === "failed" || status === "blocked" || status === "cancelled";
 }
 
-function assignmentResolutionLines(plan: PlanRecord, task: TaskRecord): string[] {
+function taskToInput(task: TaskRecord): TaskInput {
+  return {
+    id: task.id,
+    group: task.groupId,
+    text: task.text,
+    criteria: task.criteria.map((criterion) => criterion.text),
+    dependsOn: task.dependsOn,
+    agentHint: task.agentHint,
+    filesHint: task.filesHint,
+    cwd: task.cwd,
+    retries: task.retries,
+    outputMode: task.outputMode,
+    outputSchema: task.outputSchema,
+    when: task.when,
+  };
+}
+
+function groupToInput(group: TaskGroupRecord): NonNullable<SetTasksInput["groups"]>[number] {
+  return {
+    id: group.id,
+    title: group.title,
+    dependsOn: group.dependsOn,
+    maxConcurrency: group.maxConcurrency,
+    agentHint: group.agentHint,
+    filesHint: group.filesHint,
+  };
+}
+
+function taskRunToInput(taskRun: TaskRunRecord): SetTasksInput {
+  return {
+    taskRunId: taskRun.id,
+    title: taskRun.title,
+    request: taskRun.request,
+    context: taskRun.context,
+    groups: taskRun.groups.map(groupToInput),
+    tasks: taskRun.tasks.map(taskToInput),
+    maxConcurrency: taskRun.maxConcurrency,
+  };
+}
+
+function assignmentResolutionLines(taskRun: TaskRunRecord, task: TaskRecord): string[] {
   return task.assignmentIds
-    .map((assignmentId) => plan.assignments.find((assignment) => assignment.id === assignmentId))
+    .map((assignmentId) => taskRun.assignments.find((assignment) => assignment.id === assignmentId))
     .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment))
     .map((assignment) => {
       const details = [
@@ -249,8 +247,8 @@ function assignmentResolutionLines(plan: PlanRecord, task: TaskRecord): string[]
     });
 }
 
-function buildResolutionPrompt(plan: PlanRecord, task: TaskRecord, prompt: string): string {
-  const priorAssignments = assignmentResolutionLines(plan, task);
+function buildResolutionPrompt(taskRun: TaskRunRecord, task: TaskRecord, prompt: string): string {
+  const priorAssignments = assignmentResolutionLines(taskRun, task);
   return [
     "The main agent reports that previous findings or blockers for this task were fixed.",
     "Verification only: inspect the fix context, run focused checks when useful, and do not perform broad unrelated work.",
@@ -264,13 +262,21 @@ function buildResolutionPrompt(plan: PlanRecord, task: TaskRecord, prompt: strin
   ].filter((line): line is string => typeof line === "string").join("\n");
 }
 
+function launchRefForAssignments(ref: SubagentRunHandle, assignments: TaskAssignmentRecord[]): SubagentRunHandle {
+  const entries = assignments.map((assignment) => {
+    const existing = ref.assignments.find((entry) => entry.assignmentId === assignment.id && entry.runId === ref.runId);
+    return existing ?? { assignmentId: assignment.id, runId: ref.runId, ...(ref.resultPath ? { resultPath: ref.resultPath } : {}) };
+  });
+  return { ...ref, assignments: entries };
+}
+
 export class TaskedSubagentsController {
   private state: TaskedSubagentsState = createEmptyState();
   private readonly lock = createStateLock();
   private readonly runtime: SubagentRuntime<RunnerRuntimeContext>;
   private readonly defaultAgent: string;
   private readonly pi: ExtensionAPI;
-  private planCounter = 0;
+  private taskRunCounter = 0;
   private lastContext: ExtensionContext | undefined;
   private lastDispatchWork: Promise<void> = Promise.resolve();
   private readonly runProgressSignatures = new Map<string, string>();
@@ -287,7 +293,7 @@ export class TaskedSubagentsController {
 
   restoreState(state: TaskedSubagentsState): void {
     this.state = ensureState(state);
-    this.planCounter = Math.max(this.planCounter, maxPlanCounter(this.state.plans));
+    this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
     this.runProgressSignatures.clear();
   }
 
@@ -295,51 +301,55 @@ export class TaskedSubagentsController {
     await this.lastDispatchWork;
   }
 
-  /** Explicit freeform routing creates a real one-phase/one-task plan. */
+  /** Explicit freeform routing creates a real one-group/one-task TaskRun. */
   async handleUserAsk(text: string, ctx?: ExtensionContext): Promise<void> {
     const request = text.trim();
     if (!request) return;
-    await this.acceptValidatedPlan({
+    await this.setTasks({
       title: shortTitle(request, 80),
       request,
-      spec: request,
-      phases: [
-        {
-          id: "main",
-          title: "Main",
-          tasks: [{ id: "task", text: request, criteria: ["The requested task is completed with concrete evidence."] }],
-        },
-      ],
+      context: request,
+      groups: [{ id: "main", title: "Main" }],
+      tasks: [{ id: "task", group: "main", text: request, criteria: ["The requested task is completed with concrete evidence."] }],
     }, ctx);
   }
 
-  async acceptValidatedPlan(input: ValidatedPlanInput, ctx?: ExtensionContext): Promise<AcceptedPlanResult> {
+  async setTasks(input: SetTasksInput, ctx?: ExtensionContext): Promise<SetTasksResult> {
     if (ctx) this.lastContext = ctx;
     const result = await this.lock.withLock(() => {
-      const errors = validatePlanInput(input);
-      if (errors.length > 0) return { accepted: false, errors, dispatchScheduled: false } satisfies AcceptedPlanResult;
+      const errors = validateTaskRunInput(input);
+      if (errors.length > 0) return { accepted: false, errors, dispatchScheduled: false } satisfies SetTasksResult;
 
-      const planId = input.id ?? `plan-${this.planCounter + 1}`;
-      const normalized = normalizePlanInput(input, { planId });
-      if (!normalized.plan) return { accepted: false, errors: normalized.errors, dispatchScheduled: false } satisfies AcceptedPlanResult;
+      const taskRunId = normalizeTargetId(input.taskRunId) ?? this.state.currentTaskRunId ?? this.nextTaskRunId();
+      const normalized = normalizeTaskRunInput(input, { taskRunId });
+      if (!normalized.taskRun) return { accepted: false, errors: normalized.errors, dispatchScheduled: false } satisfies SetTasksResult;
 
-      this.planCounter += 1;
-      this.state.plans.push(normalized.plan);
-      this.state.currentPlanId = normalized.plan.id;
-      this.state.updatedAt = normalized.plan.updatedAt;
+      const existingIndex = this.state.taskRuns.findIndex((candidate) => candidate.id === normalized.taskRun!.id);
+      if (existingIndex >= 0) this.state.taskRuns[existingIndex] = normalized.taskRun;
+      else this.state.taskRuns.push(normalized.taskRun);
+      this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
+      this.state.currentTaskRunId = normalized.taskRun.id;
+      this.state.updatedAt = normalized.taskRun.updatedAt;
       this.persistState();
       this.updateUI(ctx ?? this.lastContext);
-      return { accepted: true, planId: normalized.plan.id, errors: [], dispatchScheduled: true } satisfies AcceptedPlanResult;
+      return { accepted: true, taskRunId: normalized.taskRun.id, errors: [], dispatchScheduled: true } satisfies SetTasksResult;
     });
 
-    if (result.accepted && result.planId) this.scheduleDispatch(result.planId, ctx);
+    if (result.accepted && result.taskRunId) this.scheduleDispatch(result.taskRunId, ctx);
     return result;
   }
 
-  async editPlan(input: EditPlanInput, ctx?: ExtensionContext): Promise<EditPlanResult> {
+  async editTask(input: EditTaskInput, ctx?: ExtensionContext): Promise<EditTaskResult> {
     if (ctx) this.lastContext = ctx;
-    const result = await this.lock.withLock(() => this.editPlanMutable(input, ctx));
-    if (result.edited && result.dispatchScheduled && result.planId) this.scheduleDispatch(result.planId, ctx);
+    const result = await this.lock.withLock(() => this.editTaskMutable(input, ctx));
+    if (result.edited && result.dispatchScheduled && result.taskRunId) this.scheduleDispatch(result.taskRunId, ctx);
+    return result;
+  }
+
+  async editGroup(input: EditGroupInput, ctx?: ExtensionContext): Promise<EditGroupResult> {
+    if (ctx) this.lastContext = ctx;
+    const result = await this.lock.withLock(() => this.editGroupMutable(input, ctx));
+    if (result.edited && result.dispatchScheduled && result.taskRunId) this.scheduleDispatch(result.taskRunId, ctx);
     return result;
   }
 
@@ -350,39 +360,39 @@ export class TaskedSubagentsController {
 
     while (true) {
       const launch = await this.lock.withLock(() => {
-        const plan = this.resolvePlanMutable(options.planId);
-        if (!plan) return undefined;
-        const scheduled = createReadyAssignments(plan, {
+        const taskRun = this.resolveTaskRunMutable(options.taskRunId);
+        if (!taskRun) return undefined;
+        const scheduled = createReadyAssignments(taskRun, {
           defaultAgent: options.defaultAgent ?? this.defaultAgent,
           defaultCwd: options.defaultCwd ?? runtimeCtx.cwd,
         });
         aggregate.hasBlockingIssue ||= scheduled.hasBlockingIssue;
         if (scheduled.assignments.length === 0) {
-          derivePlanStatus(plan);
+          deriveTaskRunStatus(taskRun);
           this.persistState();
           this.updateUI(options.ctx ?? this.lastContext);
           return undefined;
         }
-        const runId = `plan-${plan.id}-${Date.now()}`;
-        return { planId: plan.id, runId, title: plan.title, assignments: scheduled.assignments };
+        const runId = `${taskRun.id}-${Date.now()}`;
+        return { taskRunId: taskRun.id, runId, title: taskRun.title, maxConcurrency: taskRun.maxConcurrency, assignments: scheduled.assignments };
       });
 
       if (!launch) return aggregate;
 
       try {
-        const plan = this.state.plans.find((candidate) => candidate.id === launch.planId);
-        if (!plan) return aggregate;
-        const ref = await this.runtime.launchTaskGraph({
+        const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
+        if (!taskRun) return aggregate;
+        const ref = launchRefForAssignments(await this.runtime.launchTaskGraph({
           runId: launch.runId,
-          title: `Plan ${plan.id}: ${plan.title}`,
-          taskSummary: plan.title,
-          tasks: toLaunchTaskEntries(launch.assignments, plan),
-          maxConcurrency: options.maxConcurrency ?? plan.maxConcurrency,
+          title: `TaskRun ${taskRun.id}: ${taskRun.title}`,
+          taskSummary: taskRun.title,
+          tasks: toLaunchTaskEntries(launch.assignments, taskRun),
+          maxConcurrency: options.maxConcurrency ?? launch.maxConcurrency,
           cwd: options.defaultCwd ?? runtimeCtx.cwd,
-        }, runtimeCtx);
+        }, runtimeCtx), launch.assignments);
 
         await this.lock.withLock(() => {
-          const current = this.state.plans.find((candidate) => candidate.id === launch.planId);
+          const current = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
           if (!current) return;
           for (const assignment of launch.assignments) {
             const stored = current.assignments.find((candidate) => candidate.id === assignment.id);
@@ -392,7 +402,7 @@ export class TaskedSubagentsController {
             stored.launchRef = ref;
             stored.updatedAt = Date.now();
           }
-          derivePlanStatus(current);
+          deriveTaskRunStatus(current);
           this.persistState();
           this.updateUI(options.ctx ?? this.lastContext);
         });
@@ -400,42 +410,38 @@ export class TaskedSubagentsController {
 
         const status = finalWaitStatus(await this.runtime.waitForRunSignal(ref, {
           ctx: runtimeCtx,
-          onUpdate: (snapshot) => this.applyRunProgressUpdate(launch.planId, snapshot, options.ctx ?? this.lastContext),
+          onUpdate: (snapshot) => this.applyRunProgressUpdate(launch.taskRunId, snapshot, options.ctx ?? this.lastContext),
         }));
         const raw = await this.runtime.getRunResult(ref);
-        await this.applyRunOutcome(launch.planId, ref.runId, status, raw, options.ctx ?? this.lastContext);
+        await this.applyRunOutcome(launch.taskRunId, ref.runId, status, raw, options.ctx ?? this.lastContext);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         aggregate.errors.push(message);
         aggregate.hasBlockingIssue = true;
         await this.lock.withLock(() => {
-          const plan = this.state.plans.find((candidate) => candidate.id === launch.planId);
-          if (!plan) return;
+          const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
+          if (!taskRun) return;
           for (const assignment of launch.assignments) {
-            const stored = plan.assignments.find((candidate) => candidate.id === assignment.id);
+            const stored = taskRun.assignments.find((candidate) => candidate.id === assignment.id);
             if (!stored) continue;
             stored.status = "failed";
             stored.updatedAt = Date.now();
           }
-          derivePlanStatus(plan);
+          deriveTaskRunStatus(taskRun);
           this.persistState();
           this.updateUI(options.ctx ?? this.lastContext);
         });
       }
 
-      const shouldContinue = this.state.plans
-        .find((candidate) => candidate.id === launch.planId)
-        ?.phases.some((phase) => phase.status === "ready" || phase.tasks.some((task) => task.status === "ready"));
+      const shouldContinue = this.state.taskRuns
+        .find((candidate) => candidate.id === launch.taskRunId)
+        ?.tasks.some((task) => task.status === "ready");
       if (!shouldContinue) return aggregate;
     }
   }
 
-  async continuePhase(targetId: string, prompt: string, ctx?: ExtensionContext): Promise<boolean> {
-    return this.continueTarget(targetId, prompt, ctx);
-  }
-
   async continueTarget(targetId: string, prompt: string, ctx?: ExtensionContext): Promise<boolean> {
-    const result = await this.readyTargetForDispatch(targetId, () => prompt.trim(), { ctx, directTargetsMustBeRecoverable: false });
+    const result = await this.readyTargetForDispatch(targetId, (_taskRun, _task) => prompt.trim(), { ctx, directTargetsMustBeRecoverable: false });
     if (!result) return false;
     this.scheduleDispatch(result, ctx);
     return true;
@@ -444,7 +450,7 @@ export class TaskedSubagentsController {
   async resolveTarget(targetId: string, prompt: string, ctx?: ExtensionContext): Promise<boolean> {
     const result = await this.readyTargetForDispatch(
       targetId,
-      (plan, task) => buildResolutionPrompt(plan, task, prompt),
+      (taskRun, task) => buildResolutionPrompt(taskRun, task, prompt),
       { ctx, directTargetsMustBeRecoverable: true },
     );
     if (!result) return false;
@@ -479,18 +485,18 @@ export class TaskedSubagentsController {
 
   clear(scope: "completed" | "all" = "completed"): Promise<number> {
     return this.lock.withLock(() => {
-      const before = this.state.plans.length;
+      const before = this.state.taskRuns.length;
       if (scope === "all") this.state = createEmptyState();
       else {
-        this.state.plans = this.state.plans.filter((plan) => plan.status !== "completed" && plan.status !== "cancelled");
-        if (this.state.currentPlanId && !this.state.plans.some((plan) => plan.id === this.state.currentPlanId)) {
-          this.state.currentPlanId = this.state.plans.at(-1)?.id;
+        this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.status !== "completed" && taskRun.status !== "cancelled");
+        if (this.state.currentTaskRunId && !this.state.taskRuns.some((taskRun) => taskRun.id === this.state.currentTaskRunId)) {
+          this.state.currentTaskRunId = this.state.taskRuns.at(-1)?.id;
         }
         this.state.updatedAt = Date.now();
       }
       this.persistState();
       this.updateUI(this.lastContext);
-      return before - this.state.plans.length;
+      return before - this.state.taskRuns.length;
     });
   }
 
@@ -525,12 +531,102 @@ export class TaskedSubagentsController {
     }
   }
 
+  private nextTaskRunId(): string {
+    let counter = this.taskRunCounter;
+    let candidate: string;
+    do {
+      counter += 1;
+      candidate = `task-run-${counter}`;
+    } while (this.state.taskRuns.some((taskRun) => taskRun.id === candidate));
+    this.taskRunCounter = counter;
+    return candidate;
+  }
+
+  private editTaskMutable(input: EditTaskInput, ctx?: ExtensionContext): EditTaskResult {
+    const taskRun = this.resolveTaskRunMutable(input.taskRunId);
+    if (!taskRun) return { edited: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
+    const requestedTargetId = normalizeTargetId(input.targetId) ?? normalizeTargetId(input.task?.id);
+    if (!requestedTargetId) return { edited: false, taskRunId: taskRun.id, errors: ["Task targetId is required"], dispatchScheduled: false };
+    const assignmentTarget = taskRun.assignments.find((assignment) => assignment.id === requestedTargetId);
+    const targetId = assignmentTarget?.taskId ?? requestedTargetId;
+    const taskIndex = taskRun.tasks.findIndex((candidate) => candidate.id === targetId);
+    if (taskIndex < 0) return { edited: false, taskRunId: taskRun.id, errors: [`Task ${requestedTargetId} not found`], dispatchScheduled: false };
+
+    const candidate = taskRunToInput(taskRun);
+    candidate.tasks[taskIndex] = { ...candidate.tasks[taskIndex], ...input.task, id: input.task?.id ?? candidate.tasks[taskIndex].id };
+    const validationErrors = validateTaskRunInput(candidate);
+    if (validationErrors.length > 0) return { edited: false, taskRunId: taskRun.id, taskId: targetId, errors: validationErrors, dispatchScheduled: false };
+
+    const timestamp = Date.now();
+    const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
+    if (!normalized.taskRun) return { edited: false, taskRunId: taskRun.id, taskId: targetId, errors: normalized.errors, dispatchScheduled: false };
+
+    const oldTask = taskRun.tasks[taskIndex];
+    const nextTask = normalized.taskRun.tasks[taskIndex];
+    nextTask.status = "ready";
+    nextTask.assignmentIds = [];
+    nextTask.completedAt = undefined;
+    nextTask.createdAt = oldTask.createdAt;
+    nextTask.updatedAt = timestamp;
+    taskRun.tasks[taskIndex] = nextTask;
+    const assignmentIds = new Set(oldTask.assignmentIds);
+    taskRun.assignments = taskRun.assignments.filter((assignment) => assignment.taskId !== oldTask.id && !assignmentIds.has(assignment.id));
+    taskRun.artifacts = taskRun.artifacts.filter((artifact) => artifact.taskId !== oldTask.id && !assignmentIds.has(artifact.assignmentId));
+    const group = nextTask.groupId ? taskRun.groups.find((candidateGroup) => candidateGroup.id === nextTask.groupId) : undefined;
+    if (group) {
+      group.status = "ready";
+      group.completedAt = undefined;
+      group.updatedAt = timestamp;
+    }
+    taskRun.status = "running";
+    taskRun.completedAt = undefined;
+    taskRun.updatedAt = timestamp;
+    deriveTaskRunStatus(taskRun, timestamp);
+    this.persistState();
+    this.updateUI(ctx ?? this.lastContext);
+    return { edited: true, taskRunId: taskRun.id, taskId: nextTask.id, errors: [], dispatchScheduled: true };
+  }
+
+  private editGroupMutable(input: EditGroupInput, ctx?: ExtensionContext): EditGroupResult {
+    const taskRun = this.resolveTaskRunMutable(input.taskRunId);
+    if (!taskRun) return { edited: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
+    const targetId = normalizeTargetId(input.targetId) ?? normalizeTargetId(input.group?.id);
+    if (!targetId) return { edited: false, taskRunId: taskRun.id, errors: ["Group targetId is required"], dispatchScheduled: false };
+    const groupIndex = taskRun.groups.findIndex((candidate) => candidate.id === targetId);
+    if (groupIndex < 0) return { edited: false, taskRunId: taskRun.id, errors: [`Group ${targetId} not found`], dispatchScheduled: false };
+
+    const candidate = taskRunToInput(taskRun);
+    candidate.groups ??= [];
+    candidate.groups[groupIndex] = { ...candidate.groups[groupIndex], ...input.group, id: input.group?.id ?? candidate.groups[groupIndex].id };
+    const validationErrors = validateTaskRunInput(candidate);
+    if (validationErrors.length > 0) return { edited: false, taskRunId: taskRun.id, groupId: targetId, errors: validationErrors, dispatchScheduled: false };
+
+    const timestamp = Date.now();
+    const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
+    if (!normalized.taskRun) return { edited: false, taskRunId: taskRun.id, groupId: targetId, errors: normalized.errors, dispatchScheduled: false };
+
+    const oldGroup = taskRun.groups[groupIndex];
+    const nextGroup = normalized.taskRun.groups[groupIndex];
+    nextGroup.status = "ready";
+    nextGroup.completedAt = undefined;
+    nextGroup.createdAt = oldGroup.createdAt;
+    nextGroup.updatedAt = timestamp;
+    taskRun.groups[groupIndex] = nextGroup;
+    taskRun.status = "running";
+    taskRun.completedAt = undefined;
+    taskRun.updatedAt = timestamp;
+    deriveTaskRunStatus(taskRun, timestamp);
+    this.persistState();
+    this.updateUI(ctx ?? this.lastContext);
+    return { edited: true, taskRunId: taskRun.id, groupId: nextGroup.id, errors: [], dispatchScheduled: true };
+  }
+
   private tasksForTarget(target: MutableTarget, options: { directTargetsMustBeRecoverable: boolean }): TaskRecord[] {
     const directTasks = target.kind === "task" || target.kind === "assignment"
       ? [target.task]
-      : target.kind === "phase"
-        ? target.phase.tasks
-        : target.plan.phases.flatMap((phase) => phase.tasks);
+      : target.kind === "group"
+        ? target.taskRun.tasks.filter((task) => task.groupId === target.group.id)
+        : target.taskRun.tasks;
 
     if (target.kind === "task" || target.kind === "assignment") {
       return options.directTargetsMustBeRecoverable
@@ -543,7 +639,7 @@ export class TaskedSubagentsController {
 
   private readyTargetForDispatch(
     targetId: string,
-    continuationForTask: (plan: PlanRecord, task: TaskRecord) => string,
+    continuationForTask: (taskRun: TaskRunRecord, task: TaskRecord) => string,
     options: { ctx?: ExtensionContext; directTargetsMustBeRecoverable: boolean },
   ): Promise<string | undefined> {
     const ctx = options.ctx;
@@ -557,200 +653,53 @@ export class TaskedSubagentsController {
       const taskIds = new Set(tasks.map((task) => task.id));
       for (const task of tasks) {
         task.status = "ready";
-        task.continuation = continuationForTask(target.plan, task).trim();
+        task.continuation = continuationForTask(target.taskRun, task).trim();
         task.completedAt = undefined;
         task.updatedAt = timestamp;
       }
-      for (const phase of target.plan.phases) {
-        if (phase.tasks.some((task) => taskIds.has(task.id))) {
-          phase.status = "ready";
-          phase.completedAt = undefined;
-          phase.updatedAt = timestamp;
+      for (const group of target.taskRun.groups) {
+        if (target.taskRun.tasks.some((task) => task.groupId === group.id && taskIds.has(task.id))) {
+          group.status = "ready";
+          group.completedAt = undefined;
+          group.updatedAt = timestamp;
         }
       }
-      target.plan.status = "running";
-      target.plan.completedAt = undefined;
-      target.plan.updatedAt = timestamp;
-      derivePlanStatus(target.plan, timestamp);
+      target.taskRun.status = "running";
+      target.taskRun.completedAt = undefined;
+      target.taskRun.updatedAt = timestamp;
+      deriveTaskRunStatus(target.taskRun, timestamp);
       this.persistState();
       this.updateUI(ctx ?? this.lastContext);
-      return target.plan.id;
+      return target.taskRun.id;
     });
   }
 
-  private editPlanMutable(input: EditPlanInput, ctx?: ExtensionContext): EditPlanResult {
-    const plan = this.resolvePlanMutable(input.planId);
-    if (!plan) return { edited: false, errors: [input.planId ? `Plan ${input.planId} not found` : "No current plan"], dispatchScheduled: false };
-    const targetId = normalizeTargetId(input.targetId) ?? input.phase?.id ?? input.task?.id ?? plan.id;
-    const timestamp = Date.now();
-
-    if (targetId === plan.id) {
-      const nextTitle = input.title !== undefined ? input.title.trim() : plan.title;
-      const nextRequest = input.request !== undefined ? input.request.trim() : plan.request;
-      const nextSpec = input.spec !== undefined ? input.spec.trim() : plan.spec;
-      if (!nextTitle || !nextRequest || !nextSpec) return { edited: false, planId: plan.id, targetId, errors: ["Plan title, request, and spec must be non-empty"], dispatchScheduled: false };
-      plan.title = nextTitle;
-      plan.request = nextRequest;
-      plan.spec = nextSpec;
-      plan.updatedAt = timestamp;
-      this.persistState();
-      this.updateUI(ctx ?? this.lastContext);
-      return { edited: true, planId: plan.id, targetId, errors: [], dispatchScheduled: false };
-    }
-
-    const phase = plan.phases.find((candidate) => candidate.id === targetId || candidate.id === input.phase?.id);
-    if (phase && input.phase) {
-      const nextPhase = {
-        ...phase,
-        title: input.phase.title !== undefined ? input.phase.title.trim() : phase.title,
-        goal: input.phase.goal !== undefined ? input.phase.goal.trim() || undefined : phase.goal,
-        dependsOn: input.phase.dependsOn !== undefined ? input.phase.dependsOn.map((dep) => dep.trim()).filter(Boolean) : phase.dependsOn,
-        agentHint: input.phase.agentHint !== undefined ? input.phase.agentHint.trim() || undefined : phase.agentHint,
-        filesHint: input.phase.filesHint !== undefined ? input.phase.filesHint.map((file) => file.trim()).filter(Boolean) : phase.filesHint,
-        brief: input.phase.brief !== undefined ? input.phase.brief.trim() || undefined : phase.brief,
-        maxConcurrency: input.phase.maxConcurrency !== undefined ? input.phase.maxConcurrency : phase.maxConcurrency,
-      };
-      if (!nextPhase.title) return { edited: false, planId: plan.id, targetId, errors: ["Phase title must be non-empty"], dispatchScheduled: false };
-      if (nextPhase.maxConcurrency !== undefined && (!Number.isInteger(nextPhase.maxConcurrency) || nextPhase.maxConcurrency < 1)) {
-        return { edited: false, planId: plan.id, targetId, errors: ["Phase maxConcurrency must be a positive integer"], dispatchScheduled: false };
-      }
-
-      let nextTasks = phase.tasks;
-      let replaceTasks = false;
-      if (input.phase.tasks !== undefined) {
-        const replaced = normalizePlanInput({ title: plan.title, spec: plan.spec, phases: [{ ...nextPhase, dependsOn: [], tasks: input.phase.tasks }] }, { planId: plan.id, now: timestamp });
-        if (!replaced.plan) return { edited: false, planId: plan.id, targetId, errors: replaced.errors, dispatchScheduled: false };
-        nextTasks = replaced.plan.phases[0].tasks;
-        replaceTasks = true;
-      }
-
-      const candidate = planRecordToValidationInput(plan);
-      const candidatePhase = candidate.phases.find((candidate) => candidate.id === phase.id);
-      if (candidatePhase) {
-        candidatePhase.title = nextPhase.title;
-        candidatePhase.goal = nextPhase.goal;
-        candidatePhase.dependsOn = nextPhase.dependsOn;
-        candidatePhase.agentHint = nextPhase.agentHint;
-        candidatePhase.filesHint = nextPhase.filesHint;
-        candidatePhase.brief = nextPhase.brief;
-        candidatePhase.maxConcurrency = nextPhase.maxConcurrency;
-        candidatePhase.tasks = nextTasks.map(taskRecordToValidationInput);
-      }
-      const validationErrors = validatePlanInput(candidate);
-      if (validationErrors.length > 0) return { edited: false, planId: plan.id, targetId, errors: validationErrors, dispatchScheduled: false };
-
-      const oldTaskIds = new Set(phase.tasks.map((task) => task.id));
-      phase.title = nextPhase.title;
-      phase.goal = nextPhase.goal;
-      phase.dependsOn = nextPhase.dependsOn;
-      phase.agentHint = nextPhase.agentHint;
-      phase.filesHint = nextPhase.filesHint;
-      phase.brief = nextPhase.brief;
-      phase.maxConcurrency = nextPhase.maxConcurrency;
-      if (replaceTasks) {
-        phase.tasks = nextTasks;
-        phase.completedAt = undefined;
-        plan.assignments = plan.assignments.filter((assignment) => assignment.phaseId !== phase.id || !oldTaskIds.has(assignment.taskId));
-        plan.artifacts = plan.artifacts.filter((artifact) => artifact.phaseId !== phase.id || !oldTaskIds.has(artifact.taskId));
-      }
-      phase.status = "ready";
-      phase.updatedAt = timestamp;
-      plan.status = "running";
-      plan.completedAt = undefined;
-      plan.updatedAt = timestamp;
-      derivePlanStatus(plan, timestamp);
-      this.persistState();
-      this.updateUI(ctx ?? this.lastContext);
-      return { edited: true, planId: plan.id, targetId: phase.id, errors: [], dispatchScheduled: true };
-    }
-
-    const taskRef = this.findTask(plan, targetId);
-    if (taskRef && input.task) {
-      const nextText = input.task.text !== undefined ? input.task.text.trim() : taskRef.task.text;
-      const nextCriteria = input.task.criteria !== undefined
-        ? input.task.criteria.map((text, index) => ({ id: `C${index + 1}`, text: text.trim(), satisfied: false, evidence: [] })).filter((criterion) => criterion.text)
-        : taskRef.task.criteria;
-      const nextDependsOn = input.task.dependsOn !== undefined ? input.task.dependsOn.map((dep) => dep.trim()).filter(Boolean) : taskRef.task.dependsOn;
-      const nextAgentHint = input.task.agentHint !== undefined ? input.task.agentHint.trim() || undefined : taskRef.task.agentHint;
-      const nextFilesHint = input.task.filesHint !== undefined ? input.task.filesHint.map((file) => file.trim()).filter(Boolean) : taskRef.task.filesHint;
-      const nextCwd = input.task.cwd !== undefined ? input.task.cwd.trim() || undefined : taskRef.task.cwd;
-      const nextRetries = input.task.retries !== undefined ? input.task.retries : taskRef.task.retries;
-      if (!nextText || nextCriteria.length === 0) return { edited: false, planId: plan.id, targetId, errors: ["Task text and criteria must be non-empty"], dispatchScheduled: false };
-      if (nextRetries !== undefined && (!Number.isInteger(nextRetries) || nextRetries < 0)) {
-        return { edited: false, planId: plan.id, targetId, errors: ["Task retries must be a non-negative integer"], dispatchScheduled: false };
-      }
-      const candidate = planRecordToValidationInput(plan);
-      const candidatePhase = candidate.phases.find((phase) => phase.id === taskRef.phase.id);
-      const candidateTask = candidatePhase?.tasks.find((task) => task.id === taskRef.task.id);
-      if (candidateTask) {
-        candidateTask.text = nextText;
-        candidateTask.criteria = nextCriteria.map((criterion) => criterion.text);
-        candidateTask.dependsOn = nextDependsOn;
-        candidateTask.agentHint = nextAgentHint;
-        candidateTask.filesHint = nextFilesHint;
-        candidateTask.cwd = nextCwd;
-        candidateTask.retries = nextRetries;
-      }
-      const validationErrors = validatePlanInput(candidate);
-      if (validationErrors.length > 0) return { edited: false, planId: plan.id, targetId, errors: validationErrors, dispatchScheduled: false };
-
-      taskRef.task.text = nextText;
-      taskRef.task.criteria = nextCriteria;
-      taskRef.task.dependsOn = nextDependsOn;
-      taskRef.task.agentHint = nextAgentHint;
-      taskRef.task.filesHint = nextFilesHint;
-      taskRef.task.cwd = nextCwd;
-      taskRef.task.retries = nextRetries;
-      taskRef.task.status = "ready";
-      taskRef.task.assignmentIds = [];
-      taskRef.task.completedAt = undefined;
-      taskRef.task.updatedAt = timestamp;
-      taskRef.phase.status = "ready";
-      taskRef.phase.updatedAt = timestamp;
-      plan.assignments = plan.assignments.filter((assignment) => assignment.taskId !== taskRef.task.id);
-      plan.artifacts = plan.artifacts.filter((artifact) => artifact.taskId !== taskRef.task.id);
-      plan.status = "running";
-      plan.completedAt = undefined;
-      plan.updatedAt = timestamp;
-      derivePlanStatus(plan, timestamp);
-      this.persistState();
-      this.updateUI(ctx ?? this.lastContext);
-      return { edited: true, planId: plan.id, targetId: taskRef.task.id, errors: [], dispatchScheduled: true };
-    }
-
-    return { edited: false, planId: plan.id, targetId, errors: [`Target ${targetId} not found`], dispatchScheduled: false };
-  }
-
-  private scheduleDispatch(planId: string, ctx?: ExtensionContext): void {
-    this.lastDispatchWork = new Promise((resolve) => {
-      setTimeout(() => {
-        void this.dispatchReady({ planId, ctx }).catch((error: unknown) => {
-          console.error(`[${PACKAGE_NAME}] dispatch failed:`, error);
-        }).finally(resolve);
-      }, 0);
+  private scheduleDispatch(taskRunId: string, ctx?: ExtensionContext): void {
+    this.lastDispatchWork = this.dispatchReady({ taskRunId, ctx }).catch((error: unknown) => {
+      console.error(`[${PACKAGE_NAME}] dispatch failed:`, error);
     });
   }
 
-  private async applyRunProgressUpdate(planId: string, snapshot: RunProgressSnapshot, ctx?: ExtensionContext): Promise<void> {
+  private async applyRunProgressUpdate(taskRunId: string, snapshot: RunProgressSnapshot, ctx?: ExtensionContext): Promise<void> {
     const signature = progressSignature(snapshot);
-    const key = `${planId}:${snapshot.runId}`;
+    const key = `${taskRunId}:${snapshot.runId}`;
     if (this.runProgressSignatures.get(key) === signature) return;
     await this.lock.withLock(() => {
-      const plan = this.state.plans.find((candidate) => candidate.id === planId);
-      if (!plan) return;
-      if (!applyAssignmentProgress(plan, snapshot)) return;
+      const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
+      if (!taskRun) return;
+      if (!applyAssignmentProgress(taskRun, snapshot)) return;
       this.runProgressSignatures.set(key, signature);
       this.persistState();
       this.updateUI(ctx ?? this.lastContext);
     });
   }
 
-  private async applyRunOutcome(planId: string, runId: string, status: RunStatus, raw: string | undefined, ctx?: ExtensionContext): Promise<void> {
-    let planForSignal: PlanRecord | undefined;
+  private async applyRunOutcome(taskRunId: string, runId: string, status: RunStatus, raw: string | undefined, ctx?: ExtensionContext): Promise<void> {
+    let taskRunForSignal: TaskRunRecord | undefined;
     await this.lock.withLock(() => {
-      const plan = this.state.plans.find((candidate) => candidate.id === planId);
-      if (!plan) return;
-      const assignments = plan.assignments.filter((assignment) => assignment.runId === runId);
+      const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
+      if (!taskRun) return;
+      const assignments = taskRun.assignments.filter((assignment) => assignment.runId === runId);
       const timestamp = Date.now();
 
       const reports = parseReportsFromRaw(raw);
@@ -760,7 +709,7 @@ export class TaskedSubagentsController {
         const assignment = assignments.find((candidate) => candidate.id === expectedAssignmentId);
         if (!assignment) continue;
         handledAssignmentIds.add(assignment.id);
-        applySubagentTaskReport(plan, report, {
+        applySubagentTaskReport(taskRun, report, {
           now: timestamp,
           rawResultPath: assignment.launchRef?.resultPath,
           expectedAssignmentId: assignment.id,
@@ -775,19 +724,19 @@ export class TaskedSubagentsController {
         assignment.updatedAt = timestamp;
         if (terminalStatus(status)) assignment.completedAt = timestamp;
       }
-      derivePlanStatus(plan, timestamp);
+      deriveTaskRunStatus(taskRun, timestamp);
 
-      planForSignal = cloneState({ version: 3, plans: [plan], currentPlanId: plan.id, updatedAt: plan.updatedAt }).plans[0];
+      taskRunForSignal = cloneState({ version: 4, taskRuns: [taskRun], currentTaskRunId: taskRun.id, updatedAt: taskRun.updatedAt }).taskRuns[0];
       this.persistState();
       this.updateUI(ctx ?? this.lastContext);
     });
-    if (planForSignal && terminalStatus(status)) this.emitRunSignal(planForSignal, runId, status);
+    if (taskRunForSignal && terminalStatus(status)) this.emitRunSignal(taskRunForSignal, runId, status);
   }
 
   private async markRunStatus(runId: string, status: RunStatus): Promise<void> {
     await this.lock.withLock(() => {
-      for (const plan of this.state.plans) {
-        const assignments = plan.assignments.filter((assignment) => assignment.runId === runId);
+      for (const taskRun of this.state.taskRuns) {
+        const assignments = taskRun.assignments.filter((assignment) => assignment.runId === runId);
         if (assignments.length === 0) continue;
         for (const assignment of assignments) {
           const nextStatus = controlStatusForAssignment(assignment.status, status);
@@ -796,23 +745,23 @@ export class TaskedSubagentsController {
           assignment.updatedAt = Date.now();
           if (terminalStatus(status)) assignment.completedAt = Date.now();
         }
-        derivePlanStatus(plan);
+        deriveTaskRunStatus(taskRun);
       }
       this.persistState();
       this.updateUI(this.lastContext);
     });
   }
 
-  private emitRunSignal(plan: PlanRecord, runId: string, status: RunStatus): void {
-    const label = plan.status === "cancelled" || status === "cancelled"
+  private emitRunSignal(taskRun: TaskRunRecord, runId: string, status: RunStatus): void {
+    const label = taskRun.status === "cancelled" || status === "cancelled"
       ? "cancelled"
-      : plan.status === "failed" || status === "failed"
+      : taskRun.status === "failed" || status === "failed"
         ? "failed"
-        : plan.status === "attention"
+        : taskRun.status === "attention"
           ? "attention"
           : "completed";
     const customType = label === "completed" ? ENTRY_TYPE_COMPLETION : label === "attention" ? ENTRY_TYPE_ATTENTION : ENTRY_TYPE_FAILURE;
-    const assignments = plan.assignments.filter((assignment) => assignment.runId === runId);
+    const assignments = taskRun.assignments.filter((assignment) => assignment.runId === runId);
     const assignmentIds = assignments.map((assignment) => assignment.id);
     const assignmentLines = assignments.map((assignment) => {
       const summary = assignment.result?.summary.replace(/\s+/gu, " ").trim();
@@ -827,14 +776,14 @@ export class TaskedSubagentsController {
       this.pi.sendMessage({
         customType,
         content: [
-          `[tasked-subagents] ${label}: ${plan.id} · ${plan.title}`,
+          `[tasked-subagents] ${label}: ${taskRun.id} · ${taskRun.title}`,
           assignmentLines.length > 0 ? "assignments:" : undefined,
           ...assignmentLines,
-          `plan: ${plan.status}`,
+          `taskRun: ${taskRun.status}`,
           detailsHint,
         ].filter(Boolean).join("\n"),
         display: false,
-        details: { planId: plan.id, assignmentIds, status: label, routedCompletion: true },
+        details: { taskRunId: taskRun.id, assignmentIds, status: label, routedCompletion: true },
       }, { triggerTurn: true, deliverAs: "followUp" });
     } catch {
       // best effort follow-up; state/result files remain source of truth
@@ -850,20 +799,18 @@ export class TaskedSubagentsController {
     };
   }
 
-  private resolvePlanMutable(planId?: string): PlanRecord | undefined {
-    const target = normalizeTargetId(planId) ?? this.state.currentPlanId;
-    if (target) return this.state.plans.find((plan) => plan.id === target);
-    return this.state.plans.at(-1);
+  private resolveTaskRunMutable(taskRunId?: string): TaskRunRecord | undefined {
+    const target = normalizeTargetId(taskRunId) ?? this.state.currentTaskRunId;
+    if (target) return this.state.taskRuns.find((taskRun) => taskRun.id === target);
+    return this.state.taskRuns.at(-1);
   }
 
   private resolveHandleForAssignment(assignmentId: string): SubagentRunHandle | undefined {
-    for (const plan of this.state.plans) {
-      const assignment = plan.assignments.find((candidate) => candidate.id === assignmentId);
+    for (const taskRun of this.state.taskRuns) {
+      const assignment = taskRun.assignments.find((candidate) => candidate.id === assignmentId);
       if (!assignment) continue;
       const launchRef = assignment.launchRef;
-      if (!launchRef?.runId || !launchRef.asyncId || !Array.isArray(launchRef.assignments) || launchRef.assignments.length === 0) {
-        return undefined;
-      }
+      if (!launchRef?.runId || !launchRef.asyncId || !Array.isArray(launchRef.assignments) || launchRef.assignments.length === 0) return undefined;
       if (!assignment.runId || assignment.runId !== launchRef.runId) return undefined;
       const ownsAssignment = launchRef.assignments.some((entry) => entry.assignmentId === assignment.id && entry.runId === launchRef.runId);
       if (!ownsAssignment) return undefined;
@@ -872,28 +819,29 @@ export class TaskedSubagentsController {
     return undefined;
   }
 
-  private findTask(plan: PlanRecord, taskId: string): { phase: PlanRecord["phases"][number]; task: PlanRecord["phases"][number]["tasks"][number] } | undefined {
-    for (const phase of plan.phases) {
-      const task = phase.tasks.find((candidate) => candidate.id === taskId);
-      if (task) return { phase, task };
-    }
-    return undefined;
+  private findTask(taskRun: TaskRunRecord, taskId: string): { group?: TaskGroupRecord; task: TaskRecord } | undefined {
+    const task = taskRun.tasks.find((candidate) => candidate.id === taskId);
+    if (!task) return undefined;
+    const group = task.groupId ? taskRun.groups.find((candidate) => candidate.id === task.groupId) : undefined;
+    return { group, task };
+  }
+
+  private taskRunsForTargetResolution(): TaskRunRecord[] {
+    const current = this.state.currentTaskRunId ? this.state.taskRuns.find((taskRun) => taskRun.id === this.state.currentTaskRunId) : undefined;
+    return current ? [current, ...this.state.taskRuns.filter((taskRun) => taskRun.id !== current.id)] : this.state.taskRuns;
   }
 
   private resolveTargetMutable(targetId: string): MutableTarget | undefined {
-    for (const plan of this.state.plans) {
-      if (plan.id === targetId) return { kind: "plan", plan };
-      for (const phase of plan.phases) {
-        if (phase.id === targetId) return { kind: "phase", plan, phase };
-        for (const task of phase.tasks) {
-          if (task.id === targetId) return { kind: "task", plan, phase, task };
-        }
-      }
-      const assignment = plan.assignments.find((candidate) => candidate.id === targetId);
+    for (const taskRun of this.taskRunsForTargetResolution()) {
+      if (taskRun.id === targetId) return { kind: "taskRun", taskRun };
+      const group = taskRun.groups.find((candidate) => candidate.id === targetId);
+      if (group) return { kind: "group", taskRun, group };
+      const task = this.findTask(taskRun, targetId);
+      if (task) return { kind: "task", taskRun, group: task.group, task: task.task };
+      const assignment = taskRun.assignments.find((candidate) => candidate.id === targetId);
       if (assignment) {
-        const phase = plan.phases.find((candidate) => candidate.id === assignment.phaseId);
-        const task = phase?.tasks.find((candidate) => candidate.id === assignment.taskId);
-        if (phase && task) return { kind: "assignment", plan, assignment, phase, task };
+        const assignmentTask = this.findTask(taskRun, assignment.taskId);
+        if (assignmentTask) return { kind: "assignment", taskRun, assignment, group: assignmentTask.group, task: assignmentTask.task };
       }
     }
     return undefined;
