@@ -105,11 +105,12 @@ function hasLossyLaunchAssignmentsNormalization(
 function hasLossyTaskCriteriaNormalization(rawTask: unknown, task: TaskRecord): boolean {
   const input = objectRecord(rawTask);
   if (!input) return false;
-  if (arrayWouldShrink(input.criteria, task.criteria.length)) return true;
-  if (!Array.isArray(input.criteria)) return false;
+  const rawCriteria = input.criteria;
+  if (arrayWouldShrink(rawCriteria, task.criteria.length)) return true;
+  if (!Array.isArray(rawCriteria)) return false;
 
   return task.criteria.some((criterion, index) => {
-    const rawCriterion = objectRecord(input.criteria[index]);
+    const rawCriterion = objectRecord(rawCriteria[index]);
     return rawCriterion ? arrayWouldShrink(rawCriterion.evidence, criterion.evidence.length) : false;
   });
 }
@@ -142,22 +143,25 @@ function hasLossyAssignmentNormalization(rawAssignment: unknown, assignment: Tas
 function hasLossyTaskRunNormalization(rawTaskRun: unknown, taskRun: TaskRunRecord): boolean {
   const input = objectRecord(rawTaskRun);
   if (!input) return false;
+  const rawTasks = input.tasks;
+  const rawAssignments = input.assignments;
   if (arrayWouldShrink(input.groups, taskRun.groups.length)) return true;
-  if (arrayWouldShrink(input.tasks, taskRun.tasks.length)) return true;
-  if (arrayWouldShrink(input.assignments, taskRun.assignments.length)) return true;
+  if (arrayWouldShrink(rawTasks, taskRun.tasks.length)) return true;
+  if (arrayWouldShrink(rawAssignments, taskRun.assignments.length)) return true;
   if (arrayWouldShrink(input.artifacts, taskRun.artifacts.length)) return true;
 
-  if (Array.isArray(input.tasks) && taskRun.tasks.some((task, index) => hasLossyTaskCriteriaNormalization(input.tasks[index], task))) {
+  if (Array.isArray(rawTasks) && taskRun.tasks.some((task, index) => hasLossyTaskCriteriaNormalization(rawTasks[index], task))) {
     return true;
   }
-  return Array.isArray(input.assignments)
-    && taskRun.assignments.some((assignment, index) => hasLossyAssignmentNormalization(input.assignments[index], assignment));
+  return Array.isArray(rawAssignments)
+    && taskRun.assignments.some((assignment, index) => hasLossyAssignmentNormalization(rawAssignments[index], assignment));
 }
 
 function hasLossyStateNormalization(input: Record<string, unknown>, state: TaskedSubagentsState): boolean {
-  if (!Array.isArray(input.taskRuns)) return true;
-  if (input.taskRuns.length !== state.taskRuns.length) return true;
-  return state.taskRuns.some((taskRun, index) => hasLossyTaskRunNormalization(input.taskRuns[index], taskRun));
+  const rawTaskRuns = input.taskRuns;
+  if (!Array.isArray(rawTaskRuns)) return true;
+  if (rawTaskRuns.length !== state.taskRuns.length) return true;
+  return state.taskRuns.some((taskRun, index) => hasLossyTaskRunNormalization(rawTaskRuns[index], taskRun));
 }
 
 function normalizeCurrentStateEntryData(data: unknown): TaskedSubagentsState | undefined {

@@ -675,9 +675,11 @@ export class TaskedSubagentsController {
   }
 
   private scheduleDispatch(taskRunId: string, ctx?: ExtensionContext): void {
-    this.lastDispatchWork = this.dispatchReady({ taskRunId, ctx }).catch((error: unknown) => {
-      console.error(`[${PACKAGE_NAME}] dispatch failed:`, error);
-    });
+    this.lastDispatchWork = this.dispatchReady({ taskRunId, ctx })
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        console.error(`[${PACKAGE_NAME}] dispatch failed:`, error);
+      });
   }
 
   private async applyRunProgressUpdate(taskRunId: string, snapshot: RunProgressSnapshot, ctx?: ExtensionContext): Promise<void> {

@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 import type {
@@ -34,12 +35,12 @@ interface TaskRunControllerApi {
   getState(): TaskedSubagentsState;
 }
 
-function fakePi() {
+function fakePi(): ExtensionAPI {
   return {
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
     sendUserMessage: vi.fn(),
-  };
+  } as unknown as ExtensionAPI;
 }
 
 function asTaskRunApi(controller: TaskedSubagentsController): TaskRunControllerApi {

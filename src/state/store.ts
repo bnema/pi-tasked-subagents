@@ -280,7 +280,7 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
   };
 }
 
-function normalizeTaskRun(raw: unknown, index: number): TaskRunRecord | undefined {
+function normalizeTaskRun(raw: unknown, _index: number): TaskRunRecord | undefined {
   const input = objectRecord(raw);
   const timestamp = now();
   const id = optionalString(input.id);

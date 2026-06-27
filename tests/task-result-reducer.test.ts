@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import { applySubagentTaskReport, parseTaskReport } from "../src/orchestration/task-result-reducer.js";
 import { createReadyAssignments } from "../src/orchestration/task-scheduler.js";
 import { normalizeTaskRunInput } from "../src/state/task-run-validation.js";
+import type { SubagentTaskReport } from "../src/types.js";
 
 function setup() {
   const normalized = normalizeTaskRunInput({
@@ -18,7 +19,7 @@ function setup() {
   return { taskRun, assignment, task: taskRun.tasks[0] };
 }
 
-function completeReport({ taskRun, assignment }: ReturnType<typeof setup>) {
+function completeReport({ taskRun, assignment }: ReturnType<typeof setup>): SubagentTaskReport {
   return {
     taskRunId: taskRun.id,
     groupId: assignment.groupId,
@@ -27,7 +28,7 @@ function completeReport({ taskRun, assignment }: ReturnType<typeof setup>) {
     status: "completed",
     summary: "Done",
     criteriaEvidence: [{ criteriaIndex: 0, evidence: "Evidence one" }, { criteriaIndex: 1, evidence: "Evidence two" }],
-  } as const;
+  };
 }
 
 describe("task result reducer", () => {
