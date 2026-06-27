@@ -1,8 +1,8 @@
 // ──────────────────────────────────────────────
-// Plan-first domain model for pi-tasked-subagents
+// Task-run domain model for pi-tasked-subagents
 // ──────────────────────────────────────────────
 
-export const PLAN_STATUSES = [
+export const TASK_RUN_STATUSES = [
   "pending",
   "running",
   "attention",
@@ -11,9 +11,9 @@ export const PLAN_STATUSES = [
   "cancelled",
 ] as const;
 
-export type PlanStatus = (typeof PLAN_STATUSES)[number];
+export type TaskRunStatus = (typeof TASK_RUN_STATUSES)[number];
 
-export const PHASE_STATUSES = [
+export const TASK_GROUP_STATUSES = [
   "pending",
   "ready",
   "running",
@@ -24,7 +24,7 @@ export const PHASE_STATUSES = [
   "cancelled",
 ] as const;
 
-export type PhaseStatus = (typeof PHASE_STATUSES)[number];
+export type TaskGroupStatus = (typeof TASK_GROUP_STATUSES)[number];
 
 export const TASK_STATUSES = [
   "pending",
@@ -58,11 +58,21 @@ export type TaskReportStatus = "completed" | "attention" | "failed";
 export type OutputMode = "text" | "json";
 
 // ──────────────────────────────────────────────
-// Plan input
+// Task-run input
 // ──────────────────────────────────────────────
 
-export interface PlanTaskInput {
+export interface TaskGroupInput {
+  id: string;
+  title?: string;
+  dependsOn?: string[];
+  maxConcurrency?: number;
+  agentHint?: string;
+  filesHint?: string[];
+}
+
+export interface TaskInput {
   id?: string;
+  group?: string;
   text: string;
   criteria: string[];
   dependsOn?: string[];
@@ -75,48 +85,47 @@ export interface PlanTaskInput {
   when?: string;
 }
 
-export interface PlanPhaseInput {
-  id?: string;
-  title: string;
-  goal?: string;
-  dependsOn?: string[];
-  agentHint?: string;
-  filesHint?: string[];
-  brief?: string;
-  maxConcurrency?: number;
-  tasks: PlanTaskInput[];
-}
-
-export interface ValidatedPlanInput {
-  id?: string;
+export interface SetTasksInput {
+  taskRunId?: string;
   request?: string;
   title?: string;
-  spec: string;
-  phases: PlanPhaseInput[];
+  context?: string;
+  groups?: TaskGroupInput[];
+  tasks: TaskInput[];
   maxConcurrency?: number;
 }
 
-export interface EditPlanInput {
-  planId?: string;
-  targetId?: string;
-  request?: string;
-  title?: string;
-  spec?: string;
-  phase?: Partial<PlanPhaseInput>;
-  task?: Partial<PlanTaskInput>;
+export interface EditTaskInput {
+  taskRunId?: string;
+  targetId: string;
+  task?: Partial<TaskInput>;
 }
 
-export interface AcceptedPlanResult {
+export interface EditGroupInput {
+  taskRunId?: string;
+  targetId: string;
+  group?: Partial<TaskGroupInput>;
+}
+
+export interface SetTasksResult {
   accepted: boolean;
-  planId?: string;
+  taskRunId?: string;
   errors: string[];
   dispatchScheduled: boolean;
 }
 
-export interface EditPlanResult {
+export interface EditTaskResult {
   edited: boolean;
-  planId?: string;
-  targetId?: string;
+  taskRunId?: string;
+  taskId?: string;
+  errors: string[];
+  dispatchScheduled: boolean;
+}
+
+export interface EditGroupResult {
+  edited: boolean;
+  taskRunId?: string;
+  groupId?: string;
   errors: string[];
   dispatchScheduled: boolean;
 }
@@ -142,6 +151,7 @@ export interface TaskEvidence {
 
 export interface TaskRecord {
   id: string;
+  groupId?: string;
   text: string;
   status: TaskStatus;
   criteria: TaskCriterion[];
@@ -160,17 +170,14 @@ export interface TaskRecord {
   completedAt?: number;
 }
 
-export interface PhaseRecord {
+export interface TaskGroupRecord {
   id: string;
   title: string;
-  status: PhaseStatus;
-  tasks: TaskRecord[];
+  status: TaskGroupStatus;
   dependsOn: string[];
-  goal?: string;
+  maxConcurrency: number;
   agentHint?: string;
   filesHint?: string[];
-  brief?: string;
-  maxConcurrency?: number;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
@@ -180,7 +187,8 @@ export interface ArtifactRef {
   label: string;
   path: string;
   assignmentId: string;
-  phaseId: string;
+  taskRunId: string;
+  groupId?: string;
   taskId: string;
 }
 
@@ -201,8 +209,8 @@ export interface TaskResultRecord {
 
 export interface TaskAssignmentRecord {
   id: string;
-  planId: string;
-  phaseId: string;
+  taskRunId: string;
+  groupId?: string;
   taskId: string;
   agent: string;
   prompt: string;
@@ -219,13 +227,14 @@ export interface TaskAssignmentRecord {
   completedAt?: number;
 }
 
-export interface PlanRecord {
+export interface TaskRunRecord {
   id: string;
   title: string;
   request: string;
-  spec: string;
-  status: PlanStatus;
-  phases: PhaseRecord[];
+  context: string;
+  status: TaskRunStatus;
+  groups: TaskGroupRecord[];
+  tasks: TaskRecord[];
   assignments: TaskAssignmentRecord[];
   artifacts: ArtifactRef[];
   maxConcurrency?: number;
@@ -235,9 +244,9 @@ export interface PlanRecord {
 }
 
 export interface TaskedSubagentsState {
-  version: 3;
-  plans: PlanRecord[];
-  currentPlanId?: string;
+  version: 4;
+  taskRuns: TaskRunRecord[];
+  currentTaskRunId?: string;
   updatedAt: number;
 }
 
@@ -246,8 +255,8 @@ export interface TaskedSubagentsState {
 // ──────────────────────────────────────────────
 
 export interface SubagentTaskReport {
-  planId: string;
-  phaseId: string;
+  taskRunId: string;
+  groupId?: string;
   taskId: string;
   assignmentId: string;
   status: TaskReportStatus;
@@ -310,7 +319,8 @@ export interface RunCounts {
 
 export interface LaunchTaskEntry {
   assignmentId: string;
-  phaseId: string;
+  taskRunId: string;
+  groupId?: string;
   taskId: string;
   agent: string;
   prompt: string;
