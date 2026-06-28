@@ -1,8 +1,8 @@
 # pi-tasked-subagents
 
-Plan-first subagent orchestration for Pi.
+Task-run subagent orchestration for Pi.
 
-`pi-tasked-subagents` lets Pi store a validated plan, split it into phases and tasks, dispatch one task per background subagent, and collect criterion-based evidence before marking work complete.
+`pi-tasked-subagents` lets Pi store validated task runs, group tasks for scheduling, dispatch one task per background subagent, and collect criterion-based evidence before marking work complete.
 
 ## Install
 

@@ -4,7 +4,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import type { ArtifactRef, PlanRecord, TaskAssignmentRecord } from "../types.js";
+import type { ArtifactRef, TaskAssignmentRecord, TaskRunRecord } from "../types.js";
 import {
   ENTRY_TYPE_ARTIFACT,
   ENTRY_TYPE_ATTENTION,
@@ -17,8 +17,8 @@ export type AssignmentMessageKind = "launch" | "completion" | "failure" | "atten
 
 export interface AssignmentMessagePayload {
   kind: AssignmentMessageKind;
-  planId: string;
-  phaseId: string;
+  taskRunId: string;
+  groupId?: string;
   taskId: string;
   assignment: TaskAssignmentRecord;
   summary: string;
@@ -27,8 +27,8 @@ export interface AssignmentMessagePayload {
 
 export interface ArtifactMessagePayload {
   kind: "artifact";
-  planId: string;
-  phaseId: string;
+  taskRunId: string;
+  groupId?: string;
   taskId: string;
   assignmentId: string;
   label: string;
@@ -73,40 +73,41 @@ function messageKindLabel(kind: string): string {
 }
 
 function assignmentTitle(assignment: TaskAssignmentRecord): string {
-  return `${assignment.phaseId}/${assignment.taskId}`;
+  return [assignment.groupId, assignment.taskId].filter(Boolean).join("/");
 }
 
-function makeAssignmentPayload(kind: AssignmentMessageKind, plan: PlanRecord, assignment: TaskAssignmentRecord, preview?: string): AssignmentMessagePayload {
-  const summary = `${messageKindLabel(kind)} · ${plan.id} · ${assignment.phaseId}/${assignment.taskId} · ${assignment.agent}`;
-  return { kind, planId: plan.id, phaseId: assignment.phaseId, taskId: assignment.taskId, assignment, summary, preview };
+function makeAssignmentPayload(kind: AssignmentMessageKind, taskRun: TaskRunRecord, assignment: TaskAssignmentRecord, preview?: string): AssignmentMessagePayload {
+  const title = assignmentTitle(assignment);
+  const summary = `${messageKindLabel(kind)} · ${taskRun.id} · ${title} · ${assignment.agent}`;
+  return { kind, taskRunId: taskRun.id, groupId: assignment.groupId, taskId: assignment.taskId, assignment, summary, preview };
 }
 
-export function createLaunchMessagePayload(plan: PlanRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
-  return makeAssignmentPayload("launch", plan, assignment, `Use /tasked-subagents status ${assignment.id}`);
+export function createLaunchMessagePayload(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
+  return makeAssignmentPayload("launch", taskRun, assignment, `Use /tasked-subagents status ${assignment.id}`);
 }
 
-export function createCompletionMessagePayload(plan: PlanRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
-  return makeAssignmentPayload("completion", plan, assignment, assignment.result?.summary ?? `Use /tasked-subagents result ${assignment.id}`);
+export function createCompletionMessagePayload(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
+  return makeAssignmentPayload("completion", taskRun, assignment, assignment.result?.summary ?? `Use /tasked-subagents result ${assignment.id}`);
 }
 
-export function createFailureMessagePayload(plan: PlanRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
-  return makeAssignmentPayload("failure", plan, assignment, assignment.result?.summary ?? `Use /tasked-subagents status ${assignment.id}`);
+export function createFailureMessagePayload(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
+  return makeAssignmentPayload("failure", taskRun, assignment, assignment.result?.summary ?? `Use /tasked-subagents status ${assignment.id}`);
 }
 
-export function createAttentionMessagePayload(plan: PlanRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
-  return makeAssignmentPayload("attention", plan, assignment, assignment.result?.summary ?? `Use /tasked-subagents inspect ${assignment.taskId}`);
+export function createAttentionMessagePayload(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): AssignmentMessagePayload {
+  return makeAssignmentPayload("attention", taskRun, assignment, assignment.result?.summary ?? `Use /tasked-subagents inspect ${assignment.id}`);
 }
 
-export function createArtifactMessagePayload(plan: PlanRecord, artifact: ArtifactRef): ArtifactMessagePayload {
+export function createArtifactMessagePayload(_taskRun: TaskRunRecord, artifact: ArtifactRef): ArtifactMessagePayload {
   return {
     kind: "artifact",
-    planId: plan.id,
-    phaseId: artifact.phaseId,
+    taskRunId: artifact.taskRunId,
+    groupId: artifact.groupId,
     taskId: artifact.taskId,
     assignmentId: artifact.assignmentId,
     label: artifact.label,
     path: artifact.path,
-    summary: `Artifact · ${artifact.label}`,
+    summary: `Artifact · ${artifact.label} · ${artifact.taskRunId}/${artifact.taskId}`,
     preview: `Path: ${artifact.path}`,
   };
 }
@@ -129,7 +130,7 @@ export function renderAssignmentMessageText(
   const title = assignmentTitle(payload.assignment);
   const lines = [
     `${label} ${theme ? theme.bold(title) : title}`,
-    [`plan ${payload.planId}`, `agent ${payload.assignment.agent}`, statusLabel(payload.assignment.status)].join(" · "),
+    [`taskRun ${payload.taskRunId}`, payload.groupId ? `group ${payload.groupId}` : undefined, `agent ${payload.assignment.agent}`, statusLabel(payload.assignment.status)].filter(Boolean).join(" · "),
   ];
   if (payload.preview) lines.push(expanded ? payload.preview : firstPreviewLine(payload.preview) ?? "");
   return lines.join("\n");
@@ -141,7 +142,7 @@ export function renderArtifactMessageText(
   theme?: { fg(color: string, text: string): string; bold(text: string): string },
 ): string {
   const header = `${theme?.fg("accent", "[ARTIFACT]") ?? "[ARTIFACT]"} ${theme?.bold(payload.label) ?? payload.label}`;
-  const lines = [header, [`plan ${payload.planId}`, `task ${payload.taskId}`, `assignment ${payload.assignmentId}`].join(" · ")];
+  const lines = [header, [`taskRun ${payload.taskRunId}`, payload.groupId ? `group ${payload.groupId}` : undefined, `task ${payload.taskId}`, `assignment ${payload.assignmentId}`].filter(Boolean).join(" · ")];
   if (expanded) lines.push(payload.path);
   return lines.join("\n");
 }
@@ -157,11 +158,11 @@ export function assignmentMessageKindToEntryType(kind: AssignmentMessageKind): s
 }
 
 function isAssignmentPayload(value: unknown): value is AssignmentMessagePayload {
-  return typeof value === "object" && value !== null && "assignment" in value && "summary" in value;
+  return typeof value === "object" && value !== null && "assignment" in value && "summary" in value && "taskRunId" in value;
 }
 
 function isArtifactPayload(value: unknown): value is ArtifactMessagePayload {
-  return typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "artifact" && "assignmentId" in value;
+  return typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "artifact" && "taskRunId" in value && "assignmentId" in value;
 }
 
 function renderAssignmentMessage(

@@ -5,8 +5,8 @@
 //
 // Reads a RunnerConfig JSON file, spawns `pi` for each explicit task
 // assignment, writes status.json and result.json so the adapter can poll for
-// completion. The runner accepts only `mode: "task_graph"`; public planning
-// remains Plan -> Phase -> Task -> Assignment -> Evidence.
+// completion. The runner accepts only `mode: "task_graph"`; public orchestration
+// is TaskRun -> Group -> Task -> Assignment -> Evidence.
 // ──────────────────────────────────────────────
 
 import fs from "node:fs/promises";

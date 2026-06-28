@@ -1,5 +1,5 @@
 // ──────────────────────────────────────────────
-// Footer status for plan-first tasked-subagents
+// Footer status for task-run tasked-subagents
 // ──────────────────────────────────────────────
 
 import type { TaskedSubagentsState } from "../types.js";
@@ -28,17 +28,17 @@ function plural(count: number, singular: string, pluralValue = `${singular}s`): 
 }
 
 export function buildFooterStatus(state: TaskedSubagentsState, theme?: StatusThemeLike): string | undefined {
-  if (state.plans.length === 0) return undefined;
-  const activePlans = state.plans.filter((plan) => plan.status === "running" || plan.status === "pending").length;
-  const attentionPlans = state.plans.filter((plan) => plan.status === "attention" || plan.status === "failed").length;
-  const runningAssignments = state.plans.flatMap((plan) => plan.assignments).filter((assignment) => assignment.status === "queued" || assignment.status === "running").length;
-  const completedPlans = state.plans.filter((plan) => plan.status === "completed").length;
+  if (state.taskRuns.length === 0) return undefined;
+  const activeTaskRuns = state.taskRuns.filter((taskRun) => taskRun.status === "running" || taskRun.status === "pending").length;
+  const attentionTaskRuns = state.taskRuns.filter((taskRun) => taskRun.status === "attention" || taskRun.status === "failed").length;
+  const runningAssignments = state.taskRuns.flatMap((taskRun) => taskRun.assignments).filter((assignment) => assignment.status === "queued" || assignment.status === "running").length;
+  const completedTaskRuns = state.taskRuns.filter((taskRun) => taskRun.status === "completed").length;
 
   const parts = [`${colorize(GLYPH_TASKED_SUBAGENTS, "accent", theme)} ${bold("tasked", theme)}`];
-  if (activePlans) parts.push(colorize(plural(activePlans, "active plan"), "accent", theme));
+  if (activeTaskRuns) parts.push(colorize(plural(activeTaskRuns, "active task run"), "accent", theme));
   if (runningAssignments) parts.push(colorize(plural(runningAssignments, "running task"), "accent", theme));
-  if (attentionPlans) parts.push(colorize(plural(attentionPlans, "attention"), "warning", theme));
-  if (completedPlans) parts.push(colorize(plural(completedPlans, "done"), "success", theme));
-  if (parts.length === 1) parts.push(colorize(plural(state.plans.length, "plan"), "muted", theme));
+  if (attentionTaskRuns) parts.push(colorize(plural(attentionTaskRuns, "attention"), "warning", theme));
+  if (completedTaskRuns) parts.push(colorize(plural(completedTaskRuns, "done"), "success", theme));
+  if (parts.length === 1) parts.push(colorize(plural(state.taskRuns.length, "task run"), "muted", theme));
   return parts.join(dim(" · ", theme));
 }

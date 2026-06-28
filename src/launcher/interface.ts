@@ -90,20 +90,45 @@ export function ensureTaskGraphRequest(request: LaunchTaskGraphRequest): void {
   }
 
   const ids = new Set<string>();
+  const normalizedIds: string[] = [];
   for (const task of request.tasks) {
     if (!nonEmptyString(task.assignmentId)) throw new Error("Task assignment id is required");
     const assignmentId = task.assignmentId.trim();
     if (ids.has(assignmentId)) throw new Error(`Duplicate task assignment id: ${assignmentId}`);
     ids.add(assignmentId);
-    if (!nonEmptyString(task.phaseId)) throw new Error(`Task assignment ${assignmentId} missing phaseId`);
+    normalizedIds.push(assignmentId);
+    if (!nonEmptyString(task.taskRunId)) throw new Error(`Task assignment ${assignmentId} missing taskRunId`);
+    if (task.groupId !== undefined && !nonEmptyString(task.groupId)) throw new Error(`Task assignment ${assignmentId} has invalid groupId`);
     if (!nonEmptyString(task.taskId)) throw new Error(`Task assignment ${assignmentId} missing taskId`);
     if (!nonEmptyString(task.agent)) throw new Error(`Task assignment ${assignmentId} missing agent`);
     if (!nonEmptyString(task.prompt)) throw new Error(`Task assignment ${assignmentId} missing prompt`);
+  }
+
+  const dependenciesById = new Map<string, string[]>();
+  for (const [index, task] of request.tasks.entries()) {
+    const assignmentId = normalizedIds[index];
+    const dependencies: string[] = [];
     for (const dependencyId of task.dependsOn ?? []) {
       if (!nonEmptyString(dependencyId)) throw new Error(`Task assignment ${assignmentId} has invalid dependency id`);
-      if (!ids.has(dependencyId) && !request.tasks.some((candidate) => candidate.assignmentId === dependencyId || candidate.taskId === dependencyId)) {
-        throw new Error(`Task assignment ${assignmentId} depends on unknown assignment/task ${dependencyId}`);
-      }
+      const normalizedDependencyId = dependencyId.trim();
+      if (normalizedDependencyId === assignmentId) throw new Error(`Task assignment ${assignmentId} cannot depend on itself`);
+      if (!ids.has(normalizedDependencyId)) throw new Error(`Task assignment ${assignmentId} depends on unknown assignment ${normalizedDependencyId}`);
+      dependencies.push(normalizedDependencyId);
     }
+    dependenciesById.set(assignmentId, dependencies);
   }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (assignmentId: string, path: string[]): void => {
+    if (visited.has(assignmentId)) return;
+    if (visiting.has(assignmentId)) {
+      throw new Error(`Task assignment dependency cycle detected: ${[...path, assignmentId].join(" -> ")}`);
+    }
+    visiting.add(assignmentId);
+    for (const dependencyId of dependenciesById.get(assignmentId) ?? []) visit(dependencyId, [...path, assignmentId]);
+    visiting.delete(assignmentId);
+    visited.add(assignmentId);
+  };
+  for (const assignmentId of normalizedIds) visit(assignmentId, []);
 }

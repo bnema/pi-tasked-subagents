@@ -21,7 +21,7 @@ const EDIT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "diag
 const BUILTIN_PROFILES: Record<string, AgentProfile> = {
   coordinator: {
     name: "coordinator",
-    systemPrompt: "You are a planning coordinator. Return only the requested structured JSON plan.",
+    systemPrompt: "You are a task-run coordinator. Return only the requested structured JSON response.",
     tools: DEFAULT_TOOLS,
   },
   delegate: {

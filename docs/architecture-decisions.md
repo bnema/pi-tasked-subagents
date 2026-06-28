@@ -2,41 +2,41 @@
 
 This document describes the current target architecture for the unreleased v0 package.
 
-## Plan-first task assignment model
+## TaskRun task assignment model
 
-**Decision.** The product model is `Plan → Phase → Task → Assignment → Evidence`.
+**Decision.** The product model is `TaskRun → Group → Task → Assignment → Evidence`.
 
-- A plan contains phases.
-- A phase contains tasks.
+- A `TaskRun` is the root orchestration record for one delegated body of work.
+- A group is an optional scheduling section for dependencies, display, and concurrency.
 - A task is the only unit of work assigned to a subagent.
 - An assignment represents one launched subagent attempt for one task.
 - Evidence maps assignment output back to task criteria.
 
-**Rationale.** This package merges the useful parts of two earlier projects: `pi-tasked-phases` supplied validated specs, phases, tasks, criteria, and progress; `pi-lazy-subagents` supplied background execution, dependencies, result files, stop/cancel, and progress snapshots. The merged product should not expose those as competing modes. It should expose one plan-first coordination model.
+**Rationale.** Main-agent coordination should stay simple and flat. Groups provide enough structure for dependency and concurrency control without exposing recursive subtasks or executable phases.
 
-## Clean v2 state
+## Clean v4 state
 
-**Decision.** The state shape is v2 and contains only plans, the current plan id, and timestamps. Earlier development snapshots with asks, run registries, workflow runs, or quick-run owners are reset instead of migrated.
+**Decision.** The state shape is v4 and contains `taskRuns`, the current task-run id, and timestamps. Older plan/phase development snapshots are reset instead of migrated.
 
-**Rationale.** The plugin is unreleased. Compatibility code would preserve the old conceptual split and make the refactor harder to reason about.
+**Rationale.** The plugin is unreleased. Compatibility code would preserve the old conceptual model and make the task-run refactor harder to reason about.
 
 ## Removed legacy concepts
 
-**Decision.** One-off background work is represented as a one-phase, one-task plan. There are no public quick actions or slash-command run aliases.
+**Decision.** One-off background work is represented as a one-group, one-task `TaskRun`. There are no public quick actions or slash-command run aliases.
 
 Removed public concepts include:
 
-- standalone ad-hoc run actions outside a plan;
-- standalone parallel-run actions outside a plan;
-- standalone workflow actions outside a plan;
+- standalone ad-hoc run actions outside a task run;
+- standalone parallel-run actions outside a task run;
+- standalone workflow actions outside a task run;
 - phase-as-workflow dispatch as product language;
-- phase-level report synthesis as the primary report contract.
+- group-level report synthesis as the primary report contract.
 
-**Rationale.** Subagents should always receive a task, not an arbitrary prompt. Keeping separate quick concepts would fracture state, UI, command handling, and documentation.
+**Rationale.** Subagents should always receive a task with criteria, not an arbitrary prompt. Keeping separate quick concepts would fracture state, UI, command handling, and documentation.
 
 ## Task graph launcher boundary
 
-**Decision.** The controller-facing launcher exposes `launchTaskGraph(request, ctx)`. Each graph entry is a task assignment with plan, phase, task, assignment, agent, prompt, dependencies, retry options, and output settings.
+**Decision.** The controller-facing launcher exposes `launchTaskGraph(request, ctx)`. Each graph entry is a task assignment with task-run, optional group, task, assignment, agent, prompt, dependencies, retry options, and output settings.
 
 **Rationale.** The runner can still use DAG scheduling internally for dependencies and concurrency, but the rest of the plugin should speak task-assignment language.
 
@@ -46,31 +46,32 @@ Removed public concepts include:
 
 **Rationale.** Result-file delivery gives the parent controller one authoritative channel for subagent output. It is easier to test and avoids races between stdout, custom session entries, and direct parent-state mutation.
 
-## Plan acceptance and dispatch
+## Task acceptance and dispatch
 
 **Decision.** The primary flow is tool-driven:
 
 1. ordinary chat stays with the main session;
-2. the main agent and user validate a plan;
-3. the agent calls `replace_plan`;
-4. the controller stores the plan;
+2. the main agent and user validate a task breakdown;
+3. the agent calls `set_tasks` with flat tasks and optional groups;
+4. the controller stores or replaces the `TaskRun`;
 5. the scheduler creates ready task assignments;
 6. the launcher runs the assignments;
 7. the reducer applies task reports and evidence.
 
-**Validation.** A plan is rejected when it has an empty spec, no phases, phases without tasks, tasks without criteria, duplicate ids, unknown dependencies, invalid retry settings, or dependency cycles.
+**Validation.** A task run is rejected when it lacks tasks, lacks task-run metadata, contains groups without tasks, tasks without criteria, duplicate ids, unknown dependencies, invalid retry/concurrency settings, or dependency cycles.
 
 ## Scheduler semantics
 
-**Decision.** The scheduler derives task readiness from plan state.
+**Decision.** The scheduler derives task readiness from task-run state.
 
-- Phase dependencies must complete before the dependent phase can run.
+- Group dependencies must complete before tasks in the dependent group can run.
 - Task dependencies must complete before the dependent task can run.
-- Tasks in a phase run sequentially by default.
-- `maxConcurrency` on a phase allows independent tasks in that phase to run in parallel.
+- Tasks in a group run sequentially by default because `group.maxConcurrency` defaults to `1`.
+- `maxConcurrency` on a group allows independent tasks in that group to run in parallel.
+- Ungrouped tasks are governed only by explicit task dependencies and task-run concurrency.
 - Failed, blocked, cancelled, or attention tasks block dependents.
 
-**Rationale.** Phases remain first-class product structure, while task assignments are the concrete subagent work units.
+**Rationale.** Groups remain scheduling-only product structure, while task assignments are the concrete subagent work units.
 
 ## Task report and evidence semantics
 
@@ -78,8 +79,8 @@ Removed public concepts include:
 
 Required report fields:
 
-- `planId`
-- `phaseId`
+- `taskRunId`
+- optional `groupId`
 - `taskId`
 - `assignmentId`
 - `status`: `completed`, `attention`, or `failed`
@@ -88,34 +89,33 @@ Required report fields:
 - optional `artifacts`
 - optional `followUps`
 
-`cancelled` is not a normal subagent report status. Cancellation is controller/assignment state when the runner is stopped or cancelled before a valid report exists.
+**Rationale.** Criterion-level evidence keeps completion auditable. Optional group ids let ungrouped tasks report cleanly without placeholder values.
 
-**Validation rules.**
+## Public API actions
 
-1. Report ids must match the owning assignment.
-2. Evidence must be non-empty.
-3. Criterion indexes must be unique.
-4. Criterion indexes must be in bounds for the assigned task.
-5. A completed report must cover every criterion.
-6. Insufficient evidence puts the task into attention instead of silently completing it.
+**Decision.** The public tool actions are task-run-first:
 
-**Rationale.** Criteria-mapped evidence prevents vague completion claims and makes recovery explicit.
+- `set_tasks`
+- `edit_task`
+- `edit_group`
+- `dispatch`
+- `status`
+- `inspect`
+- `result`
+- `continue`
+- `resolve`
+- `stop`
+- `cancel`
+- `clear`
+- `list_agents`
 
-## Input-router bypass rules
+Public target ids are `taskRunId`, `groupId`, `taskId`, and `assignmentId`.
 
-**Decision.** The input router is opt-in. It handles only explicit freeform triggers:
-
-- `@tasked-subagents <request>`
-- `tasked-subagents: <request>`
-- `tasked subagents: <request>`
-
-It bypasses ordinary chat, slash commands, extension-originated input, and plugin-generated follow-up messages.
-
-**Rationale.** Ordinary user messages belong to the main session unless the user explicitly opts into tasked-subagents orchestration.
+**Rationale.** These names match the persisted model and avoid compatibility aliases that would keep plan/phase vocabulary alive.
 
 ## UI and messages
 
-**Decision.** UI surfaces show plans, phases, tasks, assignments, and criteria progress. Completion/attention/failure messages identify the plan and assignment run rather than presenting generic background execution.
+**Decision.** UI surfaces show task runs, groups, tasks/subtasks, assignments, and criteria progress. Completion/attention/failure messages identify the task run and assignment run rather than presenting generic background execution.
 
 **Rationale.** Status output should reinforce the product model and make recovery actions obvious.
 
@@ -123,9 +123,7 @@ It bypasses ordinary chat, slash commands, extension-originated input, and plugi
 
 | Type | Purpose |
 |---|---|
-| `pi-tasked-subagents:state` | serialized v2 plan state |
-| `pi-tasked-subagents:completion` | task/plan completion follow-up |
+| `pi-tasked-subagents:state` | serialized v4 task-run state |
+| `pi-tasked-subagents:completion` | task-run completion follow-up |
 | `pi-tasked-subagents:attention` | attention follow-up |
 | `pi-tasked-subagents:failure` | failure/cancellation follow-up |
-
-Launch and artifact renderers may exist in code as UI helpers, but the current controller emits only state and terminal follow-up entries.

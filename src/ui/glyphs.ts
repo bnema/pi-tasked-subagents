@@ -15,7 +15,7 @@ export const GLYPH_FAILED = "\uea87"; // nf-cod-error
 export const GLYPH_PAUSED = "\uead1"; // nf-cod-debug_pause
 export const GLYPH_QUEUED = "\uebb5"; // nf-cod-circle_large
 export const GLYPH_TASK = "\uf0ae"; // nf-fa-tasks
-export const GLYPH_PHASE = ""; // nf-fa-tasks_alt
+export const GLYPH_GROUP = ""; // nf-fa-tasks_alt
 export const GLYPH_WORKFLOW = "\uea68"; // nf-cod-git_branch
 
 export const GLYPH_TREE_BRANCH = "├";

@@ -26,6 +26,7 @@ import {
   formatStatusReport,
   formatStopAcknowledgement,
   parseCommand,
+  parseDispatchArgs,
 } from "../src/orchestration/commands.js";
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 import { routeInput } from "../src/orchestration/input-router.js";
@@ -46,10 +47,20 @@ function stringField(input: Record<string, unknown>, key: string): string | unde
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function sessionEntryCustomType(entry: unknown): string | undefined {
+  if (!entry || typeof entry !== "object" || !("customType" in entry)) return undefined;
+  return typeof entry.customType === "string" ? entry.customType : undefined;
+}
+
+function sessionEntryData(entry: unknown): unknown {
+  if (!entry || typeof entry !== "object" || !("data" in entry)) return undefined;
+  return entry.data;
+}
+
 function parseJsonObject(text: string): Record<string, unknown> | undefined {
   try {
     const parsed = JSON.parse(text) as unknown;
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+    return objectRecord(parsed);
   } catch {
     return undefined;
   }
@@ -63,7 +74,7 @@ function taskReportPreview(text: string): string | undefined {
   if (!summary && !status) return undefined;
   return [
     status ? statusLabel(status) : undefined,
-    stringField(input, "taskId") ?? stringField(input, "assignmentId") ?? stringField(input, "planId"),
+    stringField(input, "taskId") ?? stringField(input, "assignmentId") ?? stringField(input, "taskRunId"),
     summary,
   ].filter(Boolean).join(" · ");
 }
@@ -82,10 +93,10 @@ function collapsedToolResultText(text: string): string {
 function toolCallTarget(input: Record<string, unknown>, action: string | undefined): string | undefined {
   return stringField(input, "assignmentId")
     ?? stringField(input, "targetId")
-    ?? stringField(input, "planId")
-    ?? stringField(input, "phaseId")
+    ?? stringField(input, "taskRunId")
+    ?? stringField(input, "groupId")
     ?? stringField(input, "taskId")
-    ?? (action === "replace_plan" ? stringField(input, "title") ?? stringField(input, "request") : undefined);
+    ?? (action === "set_tasks" ? stringField(input, "title") ?? stringField(input, "request") : undefined);
 }
 
 function collapsedToolCallText(args: unknown): string {
@@ -95,8 +106,9 @@ function collapsedToolCallText(args: unknown): string {
   return shortTitle([TOOL_NAME, action, target].filter(Boolean).join(" "), COLLAPSED_TOOL_CALL_WIDTH);
 }
 
-const PlanTaskSchema = Type.Object({
+const TaskInputSchema = Type.Object({
   id: Type.Optional(NonEmptyString),
+  group: Type.Optional(NonEmptyString),
   text: NonEmptyString,
   criteria: Type.Array(NonEmptyString, { minItems: 1 }),
   dependsOn: Type.Optional(Type.Array(NonEmptyString)),
@@ -109,17 +121,36 @@ const PlanTaskSchema = Type.Object({
   when: Type.Optional(NonEmptyString),
 });
 
-const PlanPhaseSchema = Type.Object({
-  id: Type.Optional(NonEmptyString),
-  title: NonEmptyString,
-  goal: Type.Optional(NonEmptyString),
+const TaskGroupInputSchema = Type.Object({
+  id: NonEmptyString,
+  title: Type.Optional(NonEmptyString),
   dependsOn: Type.Optional(Type.Array(NonEmptyString)),
+  maxConcurrency: Type.Optional(Type.Integer({ minimum: 1 })),
   agentHint: Type.Optional(NonEmptyString),
   filesHint: Type.Optional(Type.Array(NonEmptyString)),
-  brief: Type.Optional(NonEmptyString),
-  maxConcurrency: Type.Optional(Type.Integer({ minimum: 1 })),
-  tasks: Type.Array(PlanTaskSchema, { minItems: 1 }),
 });
+
+const TaskPatchSchema = Type.Partial(Type.Object({
+  group: NonEmptyString,
+  text: NonEmptyString,
+  criteria: Type.Array(NonEmptyString, { minItems: 1 }),
+  dependsOn: Type.Array(NonEmptyString),
+  agentHint: NonEmptyString,
+  filesHint: Type.Array(NonEmptyString),
+  cwd: NonEmptyString,
+  retries: Type.Integer({ minimum: 0 }),
+  outputMode: Type.Union([Type.Literal("text"), Type.Literal("json")]),
+  outputSchema: NonEmptyString,
+  when: NonEmptyString,
+}));
+
+const TaskGroupPatchSchema = Type.Partial(Type.Object({
+  title: NonEmptyString,
+  dependsOn: Type.Array(NonEmptyString),
+  maxConcurrency: Type.Integer({ minimum: 1 }),
+  agentHint: NonEmptyString,
+  filesHint: Type.Array(NonEmptyString),
+}));
 
 const ToolParamsSchema = Type.Object({
   action: Type.Union([
@@ -127,8 +158,9 @@ const ToolParamsSchema = Type.Object({
     Type.Literal("status"),
     Type.Literal("inspect"),
     Type.Literal("result"),
-    Type.Literal("replace_plan"),
-    Type.Literal("edit_plan"),
+    Type.Literal("set_tasks"),
+    Type.Literal("edit_task"),
+    Type.Literal("edit_group"),
     Type.Literal("dispatch"),
     Type.Literal("continue"),
     Type.Literal("resolve"),
@@ -138,16 +170,17 @@ const ToolParamsSchema = Type.Object({
     Type.Literal("list_agents"),
   ], { default: "status" }),
   targetId: Type.Optional(NonEmptyString),
-  planId: Type.Optional(NonEmptyString),
-  phaseId: Type.Optional(NonEmptyString),
+  taskRunId: Type.Optional(NonEmptyString),
+  groupId: Type.Optional(NonEmptyString),
   taskId: Type.Optional(NonEmptyString),
   assignmentId: Type.Optional(NonEmptyString),
   request: Type.Optional(NonEmptyString),
   title: Type.Optional(NonEmptyString),
-  spec: Type.Optional(NonEmptyString),
-  phases: Type.Optional(Type.Array(PlanPhaseSchema, { minItems: 1 })),
-  phase: Type.Optional(Type.Partial(PlanPhaseSchema)),
-  task: Type.Optional(Type.Partial(PlanTaskSchema)),
+  context: Type.Optional(NonEmptyString),
+  groups: Type.Optional(Type.Array(TaskGroupInputSchema, { minItems: 1 })),
+  tasks: Type.Optional(Type.Array(TaskInputSchema, { minItems: 1 })),
+  group: Type.Optional(TaskGroupPatchSchema),
+  task: Type.Optional(TaskPatchSchema),
   prompt: Type.Optional(NonEmptyString),
   details: Type.Optional(Type.Boolean()),
   scope: Type.Optional(Type.Union([Type.Literal("completed"), Type.Literal("all")], { default: "completed" })),
@@ -167,8 +200,8 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     const entries = ctx.sessionManager.getBranch();
     const restored = restoreStateFromSessionEntries(entries.map((entry) => ({
       type: entry.type,
-      customType: (entry as { customType?: string }).customType,
-      data: (entry as { data?: unknown }).data,
+      customType: sessionEntryCustomType(entry),
+      data: sessionEntryData(entry),
     })));
     controller.restoreState(restored);
     controller.updateUI(ctx);
@@ -178,8 +211,8 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     const entries = ctx.sessionManager.getBranch();
     const restored = restoreStateFromSessionEntries(entries.map((entry) => ({
       type: entry.type,
-      customType: (entry as { customType?: string }).customType,
-      data: (entry as { data?: unknown }).data,
+      customType: sessionEntryCustomType(entry),
+      data: sessionEntryData(entry),
     })));
     controller.restoreState(restored);
     controller.updateUI(ctx);
@@ -188,17 +221,17 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOOL_NAME,
     label: "Tasked subagents",
-    description: "Store validated plans as phases and tasks, then dispatch ready task assignments to background subagents.",
-    promptSnippet: "Use tasked_subagents for plan-first subagent delegation. After a plan is validated, call replace_plan with phases and tasks. Every subagent assignment executes exactly one task.",
+    description: "Store validated task runs as groups and tasks, then dispatch ready task assignments to background subagents.",
+    promptSnippet: "Use tasked_subagents for validated subagent delegation. After decomposing work, call set_tasks with tasks and optional groups. Every subagent assignment executes exactly one task.",
     promptGuidelines: [
       "Let ordinary user messages stay in the main session context; do not rely on hidden interception.",
-      "Use replace_plan after validation; every phase contains tasks and every task contains criteria.",
-      "Use a one-phase, one-task plan for one-off delegation.",
-      "Use dispatch to schedule ready task assignments for an existing plan.",
-      "Use edit_plan with targetId plus a phase/task patch for targeted validated changes.",
-      "After replace_plan, edit_plan, or dispatch, do not poll immediately; wait for the automatic completion/attention/failure follow-up signal.",
+      "Use set_tasks after validation; every task contains concrete criteria and may belong to a group.",
+      "Use a one-task task run for one-off delegation.",
+      "Use dispatch to schedule ready task assignments for an existing task run.",
+      "Use edit_task or edit_group with targetId plus a patch for targeted validated changes.",
+      "After set_tasks, edit_task, or dispatch schedules work, do not poll immediately; wait for the automatic completion/attention/failure follow-up signal. edit_group may only update scheduling metadata when no work is launched.",
       "Use status for human-requested health checks, suspected stalls, or after about 60s with no signal.",
-      "Use result with an assignmentId, or with a planId/phaseId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",
+      "Use result with an assignmentId, or with a taskRunId/groupId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",
       "Use resolve with targetId and prompt after fixing an attention/failure finding; the verification assignment decides whether the target is complete.",
       "Use continue, stop, and cancel to manage task assignments.",
       "Use list_agents to discover available subagent profile names before choosing an agentHint.",
@@ -214,7 +247,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
         .map((part) => part.text)
         .join("\n")
         .trim();
-      return new Text(expanded && text ? text : collapsedToolResultText(text), 0, 0);
+      return new Text(expanded && text ? text : collapsedToolResultText(text ?? ""), 0, 0);
     },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const action = params.action ?? "status";
@@ -225,15 +258,15 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           text = buildHelpText();
           break;
         case "status":
-          text = formatStatusReport(controller.getState(), params.targetId ?? params.planId ?? params.phaseId ?? params.taskId ?? params.assignmentId);
+          text = formatStatusReport(controller.getState(), params.targetId ?? params.taskRunId ?? params.groupId ?? params.taskId ?? params.assignmentId);
           break;
         case "inspect": {
-          const target = params.targetId ?? params.planId ?? params.phaseId ?? params.taskId ?? params.assignmentId;
+          const target = params.targetId ?? params.taskRunId ?? params.groupId ?? params.taskId ?? params.assignmentId;
           text = target ? formatInspectReport(controller.getState(), target) : buildHelpText();
           break;
         }
         case "result": {
-          const target = params.assignmentId ?? params.targetId ?? params.taskId ?? params.phaseId ?? params.planId;
+          const target = params.assignmentId ?? params.targetId ?? params.taskId ?? params.groupId ?? params.taskRunId;
           if (!target) {
             text = buildHelpText();
             break;
@@ -242,48 +275,59 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           text = assignmentId ? await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), target);
           break;
         }
-        case "replace_plan": {
-          if (!params.spec || !params.phases) {
-            text = "replace_plan requires spec and phases.";
+        case "set_tasks": {
+          if (!params.tasks) {
+            text = "set_tasks requires tasks.";
             break;
           }
-          const accepted = await controller.acceptValidatedPlan({
+          const accepted = await controller.setTasks({
+            taskRunId: params.taskRunId,
             request: params.request,
             title: params.title,
-            spec: params.spec,
-            phases: params.phases,
+            context: params.context,
+            groups: params.groups,
+            tasks: params.tasks,
+            maxConcurrency: params.maxConcurrency,
           }, ctx);
           text = accepted.accepted
-            ? `Accepted plan ${accepted.planId}; task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
-            : `Plan rejected:\n${accepted.errors.join("\n")}`;
+            ? `Accepted task run ${accepted.taskRunId}; task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
+            : `Task run rejected:\n${accepted.errors.join("\n")}`;
           break;
         }
-        case "edit_plan": {
-          const targetId = params.targetId ?? params.phaseId ?? params.taskId ?? params.assignmentId;
-          const edited = await controller.editPlan({
-            planId: params.planId,
-            targetId,
-            spec: params.spec,
-            title: params.title,
-            request: params.request,
-            phase: params.phase,
-            task: params.task,
-          }, ctx);
+        case "edit_task": {
+          const targetId = params.targetId ?? params.taskId ?? params.assignmentId;
+          if (!targetId || !params.task) {
+            text = "edit_task requires targetId or taskId, plus task.";
+            break;
+          }
+          const edited = await controller.editTask({ taskRunId: params.taskRunId, targetId, task: params.task }, ctx);
+          text = edited.edited
+            ? `Edited ${edited.taskId ?? targetId}; affected task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
+            : `Task edit rejected:\n${edited.errors.join("\n")}`;
+          break;
+        }
+        case "edit_group": {
+          const targetId = params.targetId ?? params.groupId;
+          if (!targetId || !params.group) {
+            text = "edit_group requires targetId or groupId, plus group.";
+            break;
+          }
+          const edited = await controller.editGroup({ taskRunId: params.taskRunId, targetId, group: params.group }, ctx);
           text = edited.edited
             ? edited.dispatchScheduled
-              ? `Edited ${edited.targetId ?? targetId ?? edited.planId}; affected task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
-              : `Edited ${edited.targetId ?? targetId ?? edited.planId}.`
-            : `Plan edit rejected:\n${edited.errors.join("\n")}`;
+              ? `Edited ${edited.groupId ?? targetId}; affected task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
+              : `Edited ${edited.groupId ?? targetId}.`
+            : `Group edit rejected:\n${edited.errors.join("\n")}`;
           break;
         }
         case "dispatch": {
-          const result = await controller.dispatchReady({ planId: params.planId, maxConcurrency: params.maxConcurrency, ctx });
+          const result = await controller.dispatchReady({ taskRunId: params.taskRunId, maxConcurrency: params.maxConcurrency, ctx });
           text = `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;
           if (result.errors.length > 0) text += `\n${result.errors.join("\n")}`;
           break;
         }
         case "continue": {
-          const target = params.targetId ?? params.taskId ?? params.assignmentId ?? params.phaseId;
+          const target = params.targetId ?? params.taskId ?? params.assignmentId ?? params.groupId ?? params.taskRunId;
           if (!target || !params.prompt) {
             text = buildHelpText();
             break;
@@ -293,7 +337,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           break;
         }
         case "resolve": {
-          const target = params.targetId ?? params.taskId ?? params.assignmentId ?? params.phaseId ?? params.planId;
+          const target = params.targetId ?? params.taskId ?? params.assignmentId ?? params.groupId ?? params.taskRunId;
           if (!target || !params.prompt) {
             text = buildHelpText();
             break;
@@ -337,7 +381,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand(COMMAND_NAME, {
-    description: "Manage plan-first tasked subagent state: status, inspect, result, agents, continue, resolve, stop, cancel, clear.",
+    description: "Manage tasked subagent task runs: status, inspect, result, dispatch, agents, continue, resolve, stop, cancel, clear.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parsed = parseCommand(args);
       let output: string;
@@ -405,7 +449,12 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           output = formatAgentsReport(listAvailableAgentProfiles(), { details: parsed.details });
           break;
         case "dispatch": {
-          const result = await controller.dispatchReady({ ctx });
+          const dispatchArgs = parseDispatchArgs(parsed.args);
+          if (dispatchArgs.errors.length > 0) {
+            output = `Dispatch rejected:\n${dispatchArgs.errors.join("\n")}`;
+            break;
+          }
+          const result = await controller.dispatchReady({ taskRunId: dispatchArgs.taskRunId, maxConcurrency: dispatchArgs.maxConcurrency, ctx });
           output = `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;
           if (result.errors.length > 0) output += `\n${result.errors.join("\n")}`;
           break;

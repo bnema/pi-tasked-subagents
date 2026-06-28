@@ -1,7 +1,7 @@
 {
   "name": "pi-tasked-subagents",
   "version": "0.0.0",
-  "description": "Plan-first subagent orchestration for Pi: phases contain tasks, and tasks are assigned to background subagents with evidence.",
+  "description": "Task-run subagent orchestration for Pi: groups schedule tasks, and tasks are assigned to background subagents with evidence.",
   "license": "MIT",
   "author": "bnema",
   "type": "module",
@@ -10,8 +10,8 @@
     "pi-extension",
     "subagents",
     "orchestration",
-    "planning",
-    "task-assignments"
+    "task-runs",
+    "task-graphs"
   ],
   "repository": {
     "type": "git",

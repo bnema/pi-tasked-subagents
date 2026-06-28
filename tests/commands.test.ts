@@ -1,40 +1,42 @@
 import { describe, expect, test } from "vitest";
 
-import { buildHelpText, formatAgentsReport, formatInspectReport, formatResultReport, formatStatusReport, parseCommand, resolveResultAssignmentId } from "../src/orchestration/commands.js";
+import { buildHelpText, formatAgentsReport, formatInspectReport, formatResultReport, formatStatusReport, parseCommand, parseDispatchArgs, resolveResultAssignmentId } from "../src/orchestration/commands.js";
 import type { TaskedSubagentsState } from "../src/types.js";
 
 const state: TaskedSubagentsState = {
-  version: 3,
-  currentPlanId: "plan-1",
+  version: 4,
+  currentTaskRunId: "task-run-1",
   updatedAt: 1,
-  plans: [{
-    id: "plan-1",
-    title: "Plan",
+  taskRuns: [{
+    id: "task-run-1",
+    title: "Task run",
     request: "Do it",
-    spec: "Spec",
+    context: "Spec",
     status: "running",
-    phases: [{
+    groups: [{
       id: "main",
       title: "Main",
       status: "running",
       dependsOn: [],
-      tasks: [{
-        id: "task",
-        text: "Do task",
-        status: "running",
-        criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }],
-        dependsOn: [],
-        assignmentIds: ["a1"],
-        createdAt: 1,
-        updatedAt: 1,
-      }],
+      maxConcurrency: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }],
+    tasks: [{
+      id: "task",
+      groupId: "main",
+      text: "Do task",
+      status: "running",
+      criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }],
+      dependsOn: [],
+      assignmentIds: ["a1"],
       createdAt: 1,
       updatedAt: 1,
     }],
     assignments: [{
       id: "a1",
-      planId: "plan-1",
-      phaseId: "main",
+      taskRunId: "task-run-1",
+      groupId: "main",
       taskId: "task",
       agent: "delegate",
       prompt: "Do task",
@@ -50,41 +52,64 @@ const state: TaskedSubagentsState = {
 };
 
 describe("commands", () => {
-  test("parses plan-first commands and rejects run command", () => {
-    expect(parseCommand("status plan-1")).toEqual({ action: "status", targetId: "plan-1" });
+  test("parses TaskRun-first commands and rejects run command", () => {
+    expect(parseCommand("status task-run-1")).toEqual({ action: "status", targetId: "task-run-1" });
     expect(parseCommand("continue task fix it")).toEqual({ action: "continue", targetId: "task", prompt: "fix it" });
-    expect(parseCommand("resolve task fixed in commit abc123")).toEqual({ action: "resolve", targetId: "task", prompt: "fixed in commit abc123" });
+    expect(parseCommand("resolve a1 fixed in commit abc123")).toEqual({ action: "resolve", targetId: "a1", prompt: "fixed in commit abc123" });
     expect(parseCommand("resolve task")).toEqual({ action: "help" });
     expect(parseCommand("run do arbitrary prompt")).toEqual({ action: "help" });
   });
 
-  test("formats status for plans, tasks, and assignments", () => {
-    expect(formatStatusReport(state)).toContain("Plans: 1 total");
+  test("parses dispatch arguments and rejects unsupported values", () => {
+    expect(parseCommand("dispatch taskRunId=task-run-1 maxConcurrency=2")).toEqual({
+      action: "dispatch",
+      args: { taskRunId: "task-run-1", maxConcurrency: "2" },
+    });
+    expect(parseDispatchArgs({ taskRunId: " task-run-1 ", maxConcurrency: "2" })).toEqual({
+      taskRunId: "task-run-1",
+      maxConcurrency: 2,
+      errors: [],
+    });
+    expect(parseDispatchArgs(parseCommand("dispatch foo").args)).toEqual({
+      errors: ["Unsupported dispatch argument: foo"],
+    });
+    expect(parseDispatchArgs({ maxConcurrency: "0" })).toEqual({
+      errors: ["dispatch maxConcurrency must be a positive integer"],
+    });
+    expect(parseDispatchArgs({ maxConcurrency: "9007199254740993" })).toEqual({
+      errors: ["dispatch maxConcurrency must be a positive integer"],
+    });
+  });
+
+  test("formats status for task runs, groups, tasks, and assignments", () => {
+    expect(formatStatusReport(state)).toContain("Task runs: 1 total");
+    expect(formatStatusReport(state, "main")).toContain("Group: main");
     expect(formatStatusReport(state, "task")).toContain("criteria: 0/1 satisfied");
     expect(formatInspectReport(state, "a1")).toContain("Assignment: a1");
   });
 
-  test("plan and phase inspect expose task assignment ids", () => {
-    expect(formatInspectReport(state, "plan-1")).toContain("task · RUNNING · a1 · Do task");
+  test("taskRun and group inspect expose task assignment ids", () => {
+    expect(formatInspectReport(state, "task-run-1")).toContain("task · RUNNING · a1 · Do task");
     expect(formatInspectReport(state, "main")).toContain("task · RUNNING · a1 · Do task");
   });
 
-  test("help documents unambiguous result targets", () => {
-    expect(buildHelpText()).toContain("/tasked-subagents result <planId|phaseId|taskId|assignmentId>");
+  test("help documents TaskRun result targets", () => {
+    expect(buildHelpText()).toContain("/tasked-subagents result <taskRunId|groupId|taskId|assignmentId>");
   });
 
-  test("result target resolution accepts plan, phase, task, and assignment ids", () => {
-    expect(resolveResultAssignmentId(state, "plan-1")).toBe("a1");
+  test("result target resolution accepts taskRun, group, task, and assignment ids when unambiguous", () => {
+    expect(resolveResultAssignmentId(state, "task-run-1")).toBe("a1");
     expect(resolveResultAssignmentId(state, "main")).toBe("a1");
     expect(resolveResultAssignmentId(state, "task")).toBe("a1");
     expect(resolveResultAssignmentId(state, "a1")).toBe("a1");
-    expect(formatResultReport(state, "plan-1")).toContain("Assignment: a1");
+    expect(formatResultReport(state, "task-run-1")).toContain("Assignment: a1");
   });
 
-  test("result target resolution refuses ambiguous plan targets", () => {
+  test("result target resolution refuses ambiguous taskRun and group targets", () => {
     const multi = structuredClone(state);
-    multi.plans[0].phases[0].tasks.push({
+    multi.taskRuns[0].tasks.push({
       id: "second",
+      groupId: "main",
       text: "Do second task",
       status: "completed",
       criteria: [{ id: "C1", text: "Done", satisfied: true, evidence: [{ criterionId: "C1", assignmentId: "a2", summary: "second done", createdAt: 1 }] }],
@@ -94,10 +119,10 @@ describe("commands", () => {
       updatedAt: 1,
       completedAt: 1,
     });
-    multi.plans[0].assignments.push({
+    multi.taskRuns[0].assignments.push({
       id: "a2",
-      planId: "plan-1",
-      phaseId: "main",
+      taskRunId: "task-run-1",
+      groupId: "main",
       taskId: "second",
       agent: "delegate",
       prompt: "Do second task",
@@ -109,21 +134,32 @@ describe("commands", () => {
       completedAt: 1,
     });
 
-    expect(resolveResultAssignmentId(multi, "plan-1")).toBeUndefined();
-    expect(formatResultReport(multi, "plan-1")).toContain("Ambiguous result target: plan-1");
-    expect(formatResultReport(multi, "plan-1")).toContain("a1 · RUNNING · task");
-    expect(formatResultReport(multi, "plan-1")).toContain("a2 · DONE · second");
+    expect(resolveResultAssignmentId(multi, "task-run-1")).toBeUndefined();
+    expect(resolveResultAssignmentId(multi, "main")).toBeUndefined();
+    expect(formatResultReport(multi, "task-run-1")).toContain("Ambiguous result target: task-run-1");
+    expect(formatResultReport(multi, "main")).toContain("Ambiguous result target: main");
+    expect(formatResultReport(multi, "main")).toContain("a1 · RUNNING · task");
+    expect(formatResultReport(multi, "main")).toContain("a2 · DONE · second");
   });
 
-  test("help omits quick actions", () => {
+  test("help exposes TaskRun actions and omits plan and phase schema", () => {
     const help = buildHelpText();
-    expect(help).toContain("replace_plan");
+    expect(help).toContain("set_tasks");
+    expect(help).toContain("edit_task");
+    expect(help).toContain("edit_group");
     expect(help).toContain("resolve");
+    expect(help).not.toContain("replace_plan");
+    expect(help).not.toContain("edit_plan");
+    expect(help).not.toContain("planId");
+    expect(help).not.toContain("phaseId");
+    expect(help).not.toContain("phases");
     expect(help).not.toContain(["quick", "run"].join("_"));
     expect(help).not.toContain(["/tasked-subagents", "run"].join(" "));
   });
 
-  test("agent report tells users to use agentHint", () => {
-    expect(formatAgentsReport([{ name: "delegate", systemPrompt: "hidden", tools: [] }])).toContain("agentHint");
+  test("agent report tells users to use agentHint with set_tasks/edit_task", () => {
+    const report = formatAgentsReport([{ name: "delegate", systemPrompt: "hidden", tools: [] }]);
+    expect(report).toContain("agentHint");
+    expect(report).toContain("set_tasks");
   });
 });
