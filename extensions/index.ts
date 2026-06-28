@@ -103,7 +103,8 @@ function collapsedToolCallText(args: unknown): string {
   const input = objectRecord(args);
   const action = input ? stringField(input, "action") ?? "status" : "status";
   const target = input ? toolCallTarget(input, action) : undefined;
-  return shortTitle([TOOL_NAME, action, target].filter(Boolean).join(" "), COLLAPSED_TOOL_CALL_WIDTH);
+  const wait = input?.wait === true ? "wait=true" : undefined;
+  return shortTitle([TOOL_NAME, action, target, wait].filter(Boolean).join(" "), COLLAPSED_TOOL_CALL_WIDTH);
 }
 
 const TaskInputSchema = Type.Object({
@@ -158,6 +159,7 @@ const ToolParamsSchema = Type.Object({
     Type.Literal("status"),
     Type.Literal("inspect"),
     Type.Literal("result"),
+    Type.Literal("attach"),
     Type.Literal("set_tasks"),
     Type.Literal("edit_task"),
     Type.Literal("edit_group"),
@@ -185,6 +187,7 @@ const ToolParamsSchema = Type.Object({
   details: Type.Optional(Type.Boolean()),
   scope: Type.Optional(Type.Union([Type.Literal("completed"), Type.Literal("all")], { default: "completed" })),
   maxConcurrency: Type.Optional(Type.Integer({ minimum: 1 })),
+  wait: Type.Optional(Type.Boolean()),
 });
 
 export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
@@ -228,8 +231,10 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
       "Use set_tasks after validation; every task contains concrete criteria and may belong to a group.",
       "Use a one-task task run for one-off delegation.",
       "Use dispatch to schedule ready task assignments for an existing task run.",
+      "Use wait=true on set_tasks, edit_task, edit_group, or dispatch when launching work should lock the main agent until the scheduled assignments finish.",
+      "Use attach later when work was already launched in background mode and the main agent should re-join it before using results.",
       "Use edit_task or edit_group with targetId plus a patch for targeted validated changes.",
-      "After set_tasks, edit_task, or dispatch schedules work, do not poll immediately; wait for the automatic completion/attention/failure follow-up signal. edit_group may only update scheduling metadata when no work is launched.",
+      "After set_tasks, edit_task, or dispatch schedules background work without wait=true, either call attach to wait later or wait for the automatic completion/attention/failure follow-up signal. edit_group may only update scheduling metadata when no work is launched.",
       "Use status for human-requested health checks, suspected stalls, or after about 60s with no signal.",
       "Use result with an assignmentId, or with a taskRunId/groupId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",
       "Use resolve with targetId and prompt after fixing an attention/failure finding; the verification assignment decides whether the target is complete.",
@@ -275,6 +280,12 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           text = assignmentId ? await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), target);
           break;
         }
+        case "attach": {
+          const target = params.targetId ?? params.assignmentId ?? params.taskId ?? params.groupId ?? params.taskRunId;
+          const attached = await controller.attachTarget(target, ctx);
+          text = attached.report;
+          break;
+        }
         case "set_tasks": {
           if (!params.tasks) {
             text = "set_tasks requires tasks.";
@@ -288,9 +299,12 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             groups: params.groups,
             tasks: params.tasks,
             maxConcurrency: params.maxConcurrency,
+            wait: params.wait,
           }, ctx);
           text = accepted.accepted
-            ? `Accepted task run ${accepted.taskRunId}; task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
+            ? params.wait
+              ? `Accepted task run ${accepted.taskRunId}; waited for task assignments to finish.\n\n${(await controller.attachTarget(accepted.taskRunId, ctx)).report}`
+              : `Accepted task run ${accepted.taskRunId}; task assignments are running in the background. Call attach to wait later, or wait for the automatic completion/attention/failure follow-up signal.`
             : `Task run rejected:\n${accepted.errors.join("\n")}`;
           break;
         }
@@ -300,9 +314,11 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             text = "edit_task requires targetId or taskId, plus task.";
             break;
           }
-          const edited = await controller.editTask({ taskRunId: params.taskRunId, targetId, task: params.task }, ctx);
+          const edited = await controller.editTask({ taskRunId: params.taskRunId, targetId, task: params.task, wait: params.wait }, ctx);
           text = edited.edited
-            ? `Edited ${edited.taskId ?? targetId}; affected task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
+            ? params.wait
+              ? `Edited ${edited.taskId ?? targetId}; waited for affected task assignments to finish.\n\n${(await controller.attachTarget(edited.taskId ?? targetId, ctx)).report}`
+              : `Edited ${edited.taskId ?? targetId}; affected task assignments are running in the background. Call attach to wait later, or wait for the automatic completion/attention/failure follow-up signal.`
             : `Task edit rejected:\n${edited.errors.join("\n")}`;
           break;
         }
@@ -312,17 +328,25 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             text = "edit_group requires targetId or groupId, plus group.";
             break;
           }
-          const edited = await controller.editGroup({ taskRunId: params.taskRunId, targetId, group: params.group }, ctx);
+          const edited = await controller.editGroup({ taskRunId: params.taskRunId, targetId, group: params.group, wait: params.wait }, ctx);
           text = edited.edited
             ? edited.dispatchScheduled
-              ? `Edited ${edited.groupId ?? targetId}; affected task assignments are running in the background. Do not poll; wait for the automatic completion/attention/failure follow-up signal.`
+              ? params.wait
+                ? `Edited ${edited.groupId ?? targetId}; waited for affected task assignments to finish.\n\n${(await controller.attachTarget(edited.groupId ?? targetId, ctx)).report}`
+                : `Edited ${edited.groupId ?? targetId}; affected task assignments are running in the background. Call attach to wait later, or wait for the automatic completion/attention/failure follow-up signal.`
               : `Edited ${edited.groupId ?? targetId}.`
             : `Group edit rejected:\n${edited.errors.join("\n")}`;
           break;
         }
         case "dispatch": {
+          if (params.wait && !params.taskRunId) {
+            text = "dispatch wait=true requires taskRunId so the wait is bound to a specific task run.";
+            break;
+          }
           const result = await controller.dispatchReady({ taskRunId: params.taskRunId, maxConcurrency: params.maxConcurrency, ctx });
-          text = `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;
+          text = params.wait
+            ? `Dispatched and waited for ${result.launched} task assignment(s), skipped ${result.skipped}.\n\n${(await controller.attachTarget(params.taskRunId, ctx)).report}`
+            : `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;
           if (result.errors.length > 0) text += `\n${result.errors.join("\n")}`;
           break;
         }
@@ -381,7 +405,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand(COMMAND_NAME, {
-    description: "Manage tasked subagent task runs: status, inspect, result, dispatch, agents, continue, resolve, stop, cancel, clear.",
+    description: "Manage tasked subagent task runs: status, inspect, result, attach, dispatch, agents, continue, resolve, stop, cancel, clear.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parsed = parseCommand(args);
       let output: string;
@@ -402,6 +426,11 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           }
           const assignmentId = resolveResultAssignmentId(controller.getState(), parsed.assignmentId);
           output = assignmentId ? await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), parsed.assignmentId);
+          break;
+        }
+        case "attach": {
+          const attached = await controller.attachTarget(parsed.targetId, ctx);
+          output = attached.report;
           break;
         }
         case "continue": {
@@ -454,8 +483,14 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             output = `Dispatch rejected:\n${dispatchArgs.errors.join("\n")}`;
             break;
           }
+          if (dispatchArgs.wait && !dispatchArgs.taskRunId) {
+            output = "Dispatch rejected:\ndispatch wait=true requires taskRunId so the wait is bound to a specific task run.";
+            break;
+          }
           const result = await controller.dispatchReady({ taskRunId: dispatchArgs.taskRunId, maxConcurrency: dispatchArgs.maxConcurrency, ctx });
-          output = `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;
+          output = dispatchArgs.wait
+            ? `Dispatched and waited for ${result.launched} task assignment(s), skipped ${result.skipped}.\n\n${(await controller.attachTarget(dispatchArgs.taskRunId, ctx)).report}`
+            : `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;
           if (result.errors.length > 0) output += `\n${result.errors.join("\n")}`;
           break;
         }

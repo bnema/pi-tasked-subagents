@@ -12,6 +12,7 @@ export type CommandAction =
   | "status"
   | "inspect"
   | "result"
+  | "attach"
   | "stop"
   | "continue"
   | "resolve"
@@ -33,10 +34,11 @@ export interface ParsedCommand {
 export interface ParsedDispatchArgs {
   taskRunId?: string;
   maxConcurrency?: number;
+  wait?: boolean;
   errors: string[];
 }
 
-const DISPATCH_ARG_KEYS = new Set(["taskRunId", "maxConcurrency"]);
+const DISPATCH_ARG_KEYS = new Set(["taskRunId", "maxConcurrency", "wait"]);
 
 export function parseDispatchArgs(args?: Record<string, unknown>): ParsedDispatchArgs {
   const result: ParsedDispatchArgs = { errors: [] };
@@ -51,6 +53,13 @@ export function parseDispatchArgs(args?: Record<string, unknown>): ParsedDispatc
     if (key === "taskRunId") {
       if (typeof value === "string" && value.trim()) result.taskRunId = value.trim();
       else result.errors.push("dispatch taskRunId must be a non-empty string");
+      continue;
+    }
+
+    if (key === "wait") {
+      if (value === true || value === "true") result.wait = true;
+      else if (value === false || value === "false") result.wait = false;
+      else result.errors.push("dispatch wait must be true or false");
       continue;
     }
 
@@ -132,6 +141,8 @@ export function parseCommand(input: string, internal = false): ParsedCommand {
     case "stop":
     case "cancel":
       return tokens[1] ? { action, assignmentId: tokens[1] } : { action: "help" };
+    case "attach":
+      return tokens[1] ? { action: "attach", targetId: tokens[1] } : { action: "attach" };
     case "continue":
     case "resolve": {
       const targetId = tokens[1];
@@ -362,6 +373,27 @@ export function formatResultReport(state: TaskedSubagentsState, targetId: string
   ].join("\n");
 }
 
+export function formatAttachReport(state: TaskedSubagentsState, targetId?: string): string {
+  const target = targetId ?? state.currentTaskRunId ?? state.taskRuns.at(-1)?.id;
+  if (!target) return "No tracked task runs.";
+
+  const assignments = assignmentsForTarget(state, target);
+  if (!assignments) return `Attach target not found: ${target}.`;
+
+  const lines = [`Attached to ${target}.`, "", formatStatusReport(state, target)];
+  if (assignments.length === 0) {
+    lines.push("", `No assignments for attach target: ${target}. Use /tasked-subagents inspect ${target} for details.`);
+    return lines.join("\n");
+  }
+
+  lines.push("", assignments.length === 1 ? "Result:" : "Results:");
+  for (const assignment of assignments) {
+    const found = findAssignment(state, assignment.id);
+    lines.push(found ? formatAssignmentDetail(found.taskRun, found.assignment) : `Assignment not found: ${assignment.id}.`, "");
+  }
+  return lines.join("\n").trimEnd();
+}
+
 export function formatContinueAcknowledgement(targetId: string, prompt: string): string {
   return `Continued ${targetId} with: ${shortTitle(prompt)}`;
 }
@@ -420,7 +452,8 @@ export function buildHelpText(): string {
     "  /tasked-subagents status [taskRunId|groupId|taskId|assignmentId]",
     "  /tasked-subagents inspect <taskRunId|groupId|taskId|assignmentId>",
     "  /tasked-subagents result <taskRunId|groupId|taskId|assignmentId>  (taskRun/group/task must resolve to one assignment)",
-    "  /tasked-subagents dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>]",
+    "  /tasked-subagents attach [taskRunId|groupId|taskId|assignmentId]",
+    "  /tasked-subagents dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>] [wait=true|false]", 
     "  /tasked-subagents stop <assignmentId>",
     "  /tasked-subagents continue <taskId|assignmentId|groupId> <prompt>",
     "  /tasked-subagents resolve <taskId|assignmentId|groupId|taskRunId> <fix-summary>",
@@ -432,10 +465,12 @@ export function buildHelpText(): string {
     "  tasked_subagents action=set_tasks context=<context> tasks=<tasks> [groups=<groups>]",
     "  tasked_subagents action=edit_task taskRunId=<taskRunId> targetId=<taskId> task=<patch>",
     "  tasked_subagents action=edit_group taskRunId=<taskRunId> targetId=<groupId> group=<patch>",
-    "  tasked_subagents action=dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>]",
+    "  tasked_subagents action=dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>] [wait=true]", 
     "  tasked_subagents action=status [targetId=<id>]",
     "  tasked_subagents action=inspect targetId=<id>",
     "  tasked_subagents action=result assignmentId=<assignmentId>",
+    "  tasked_subagents action=attach [targetId=<taskRunId|groupId|taskId|assignmentId>]",
+    "  Add wait=true to set_tasks/edit_task/edit_group/dispatch when the main agent should remain locked until launched work finishes.",
     "  tasked_subagents action=continue targetId=<taskId|assignmentId|groupId> prompt=<prompt>",
     "  tasked_subagents action=resolve targetId=<taskId|assignmentId|groupId|taskRunId> prompt=<fix-summary>",
     "  tasked_subagents action=stop assignmentId=<assignmentId>",

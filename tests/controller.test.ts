@@ -3,6 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 import type {
+  AttachResult,
   EditGroupInput,
   EditGroupResult,
   EditTaskInput,
@@ -24,6 +25,7 @@ interface TaskRunControllerApi {
   editTask(input: EditTaskInput, ctx?: unknown): Promise<EditTaskResult>;
   editGroup(input: EditGroupInput, ctx?: unknown): Promise<EditGroupResult>;
   dispatchReady(options?: { taskRunId?: string; ctx?: unknown }): Promise<{ launched: number; skipped: number; errors: string[]; hasBlockingIssue: boolean }>;
+  attachTarget(targetId?: string, ctx?: unknown): Promise<AttachResult>;
   continueTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
   resolveTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
   stopRun(assignmentId: string): Promise<boolean>;
@@ -486,6 +488,83 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     const deploy = controller.getState().taskRuns[0].groups.find((group) => group.id === "deploy");
     expect(deploy).toMatchObject({ dependsOn: ["setup"], maxConcurrency: 2 });
     expect(JSON.stringify(controller.getState())).not.toContain("phaseId");
+  });
+
+  test("setTasks wait mode blocks until scheduled task work finishes", async () => {
+    const runtime = new ControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    let settled = false;
+    const accepted = controller.setTasks({ ...baseSetTasks, wait: true }).then((result) => {
+      settled = true;
+      return result;
+    });
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    await runtime.waitStarted;
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+
+    runtime.complete();
+
+    await expect(accepted).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-1" });
+    expect(controller.getState().taskRuns[0].status).toBe("completed");
+    expect(controller.getState().taskRuns[0].assignments[0].result?.summary).toBe("task done");
+  });
+
+  test("attachTarget fails fast for unknown explicit targets without waiting on unrelated work", async () => {
+    const runtime = new ControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await expect(controller.setTasks(baseSetTasks)).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-1" });
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    await runtime.waitStarted;
+
+    let settled = false;
+    await expect(controller.attachTarget("missing-target").then((result) => {
+      settled = true;
+      return result;
+    })).resolves.toMatchObject({
+      attached: false,
+      targetId: "missing-target",
+      report: "Attach target not found: missing-target.",
+    });
+
+    expect(settled).toBe(true);
+    expect(controller.getState().taskRuns[0].status).toBe("running");
+
+    runtime.complete();
+    await controller.awaitLastWork();
+  });
+
+  test("attachTarget waits for scheduled task work before returning results", async () => {
+    const runtime = new ControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await expect(controller.setTasks(baseSetTasks)).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-1" });
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    await runtime.waitStarted;
+
+    let settled = false;
+    const attached = controller.attachTarget("task-run-1").then((result) => {
+      settled = true;
+      return result;
+    });
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+
+    runtime.complete();
+
+    await expect(attached).resolves.toMatchObject({
+      attached: true,
+      targetId: "task-run-1",
+    });
+    await expect(attached).resolves.toMatchObject({
+      report: expect.stringContaining("Assignment: task-run-1-group-main-task-task-assignment-1"),
+    });
+    expect(controller.getState().taskRuns[0].status).toBe("completed");
+    expect(controller.getState().taskRuns[0].assignments[0].result?.summary).toBe("task done");
   });
 
   test("dispatchReady launches ready assignments for the requested taskRunId only", async () => {
