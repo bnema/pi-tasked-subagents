@@ -130,6 +130,28 @@ const TaskGroupInputSchema = Type.Object({
   filesHint: Type.Optional(Type.Array(NonEmptyString)),
 });
 
+const TaskPatchSchema = Type.Partial(Type.Object({
+  group: NonEmptyString,
+  text: NonEmptyString,
+  criteria: Type.Array(NonEmptyString, { minItems: 1 }),
+  dependsOn: Type.Array(NonEmptyString),
+  agentHint: NonEmptyString,
+  filesHint: Type.Array(NonEmptyString),
+  cwd: NonEmptyString,
+  retries: Type.Integer({ minimum: 0 }),
+  outputMode: Type.Union([Type.Literal("text"), Type.Literal("json")]),
+  outputSchema: NonEmptyString,
+  when: NonEmptyString,
+}));
+
+const TaskGroupPatchSchema = Type.Partial(Type.Object({
+  title: NonEmptyString,
+  dependsOn: Type.Array(NonEmptyString),
+  maxConcurrency: Type.Integer({ minimum: 1 }),
+  agentHint: NonEmptyString,
+  filesHint: Type.Array(NonEmptyString),
+}));
+
 const ToolParamsSchema = Type.Object({
   action: Type.Union([
     Type.Literal("help"),
@@ -157,8 +179,8 @@ const ToolParamsSchema = Type.Object({
   context: Type.Optional(NonEmptyString),
   groups: Type.Optional(Type.Array(TaskGroupInputSchema, { minItems: 1 })),
   tasks: Type.Optional(Type.Array(TaskInputSchema, { minItems: 1 })),
-  group: Type.Optional(Type.Partial(TaskGroupInputSchema)),
-  task: Type.Optional(Type.Partial(TaskInputSchema)),
+  group: Type.Optional(TaskGroupPatchSchema),
+  task: Type.Optional(TaskPatchSchema),
   prompt: Type.Optional(NonEmptyString),
   details: Type.Optional(Type.Boolean()),
   scope: Type.Optional(Type.Union([Type.Literal("completed"), Type.Literal("all")], { default: "completed" })),
@@ -207,7 +229,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
       "Use a one-task task run for one-off delegation.",
       "Use dispatch to schedule ready task assignments for an existing task run.",
       "Use edit_task or edit_group with targetId plus a patch for targeted validated changes.",
-      "After set_tasks, edit_task, edit_group, or dispatch, do not poll immediately; wait for the automatic completion/attention/failure follow-up signal.",
+      "After set_tasks, edit_task, or dispatch schedules work, do not poll immediately; wait for the automatic completion/attention/failure follow-up signal. edit_group may only update scheduling metadata when no work is launched.",
       "Use status for human-requested health checks, suspected stalls, or after about 60s with no signal.",
       "Use result with an assignmentId, or with a taskRunId/groupId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",
       "Use resolve with targetId and prompt after fixing an attention/failure finding; the verification assignment decides whether the target is complete.",
@@ -359,7 +381,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand(COMMAND_NAME, {
-    description: "Manage tasked subagent task runs: status, inspect, result, agents, continue, resolve, stop, cancel, clear.",
+    description: "Manage tasked subagent task runs: status, inspect, result, dispatch, agents, continue, resolve, stop, cancel, clear.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parsed = parseCommand(args);
       let output: string;

@@ -128,7 +128,8 @@ function currentTaskRun(state: TaskedSubagentsState): TaskRunRecord | undefined 
     if (current && taskRunVisibleInWidget(current)) return current;
   }
   return state.taskRuns.find((taskRun) => (taskRun.status === "attention" || taskRun.status === "failed") && taskRunVisibleInWidget(taskRun))
-    ?? state.taskRuns.find((taskRun) => (taskRun.status === "running" || taskRun.status === "pending") && taskRunVisibleInWidget(taskRun));
+    ?? state.taskRuns.find((taskRun) => (taskRun.status === "running" || taskRun.status === "pending") && taskRunVisibleInWidget(taskRun))
+    ?? state.taskRuns.find(taskRunVisibleInWidget);
 }
 
 function taskDisplaysDone(taskRun: TaskRunRecord, task: TaskRecord): boolean {
@@ -328,13 +329,17 @@ function buildCompletedTasksLine(count: number, parentLast: boolean, isLast: boo
   return `${childPrefix(parentLast, theme)}${linePrefix(isLast, theme)}${color(GLYPH_DONE, "success", theme)} ${muted(`${count} completed`, theme)}`;
 }
 
+function groupKey(group: WidgetGroupView): string {
+  return group.id === undefined ? "ungrouped" : `group:${group.id}`;
+}
+
 function hiddenGroupCounts(taskRun: TaskRunRecord, groups: WidgetGroupView[]): { completed: number; completedTasks: number; other: number } {
-  const visibleIds = new Set(groups.map((group) => group.id).filter((id): id is string => typeof id === "string"));
+  const visibleKeys = new Set(groups.map(groupKey));
   let completed = 0;
   let completedTasks = 0;
   let other = 0;
-  for (const group of taskRun.groups) {
-    if (visibleIds.has(group.id)) continue;
+  for (const group of widgetGroups(taskRun)) {
+    if (visibleKeys.has(groupKey(group))) continue;
     if (group.status === "completed") {
       completed += 1;
       completedTasks += completedTaskCount(taskRun, group);

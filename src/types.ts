@@ -95,16 +95,19 @@ export interface SetTasksInput {
   maxConcurrency?: number;
 }
 
+export type TaskPatchInput = Partial<Omit<TaskInput, "id">>;
+export type TaskGroupPatchInput = Partial<Omit<TaskGroupInput, "id">>;
+
 export interface EditTaskInput {
   taskRunId?: string;
   targetId: string;
-  task?: Partial<TaskInput>;
+  task?: TaskPatchInput;
 }
 
 export interface EditGroupInput {
   taskRunId?: string;
   targetId: string;
-  group?: Partial<TaskGroupInput>;
+  group?: TaskGroupPatchInput;
 }
 
 export interface SetTasksResult {

@@ -161,6 +161,85 @@ class ControlledSpyRuntime extends ControlledRuntime {
   }
 }
 
+class LaunchControlledRuntime extends CompletingRuntime {
+  cancelled: SubagentRunHandle[] = [];
+  private launchStartedResolve!: () => void;
+  private launchReleaseResolve: (() => void) | undefined;
+  readonly launchStarted = new Promise<void>((resolve) => {
+    this.launchStartedResolve = resolve;
+  });
+
+  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
+    this.requests.push(request);
+    this.launchStartedResolve();
+    await new Promise<void>((resolve) => {
+      this.launchReleaseResolve = resolve;
+    });
+    return {
+      runId: request.runId,
+      asyncId: `async-${request.runId}`,
+      resultPath: `/tmp/${request.runId}.json`,
+      assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
+    };
+  }
+
+  releaseLaunch(): void {
+    this.launchReleaseResolve?.();
+  }
+
+  async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.cancelled.push(handle);
+    return true;
+  }
+}
+
+class LaunchRejectControlledRuntime extends CompletingRuntime {
+  private launchStartedResolve!: () => void;
+  private launchReject: ((error: Error) => void) | undefined;
+  readonly launchStarted = new Promise<void>((resolve) => {
+    this.launchStartedResolve = resolve;
+  });
+
+  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
+    this.requests.push(request);
+    this.launchStartedResolve();
+    return new Promise<SubagentRunHandle>((_resolve, reject) => {
+      this.launchReject = reject;
+    });
+  }
+
+  rejectLaunch(error = new Error("launch failed")): void {
+    this.launchReject?.(error);
+  }
+}
+
+class MultiLaunchControlledRuntime extends CompletingRuntime {
+  cancelled: SubagentRunHandle[] = [];
+  private readonly launchResolvers: Array<() => void> = [];
+
+  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
+    this.requests.push(request);
+    await new Promise<void>((resolve) => {
+      this.launchResolvers.push(resolve);
+    });
+    return {
+      runId: request.runId,
+      asyncId: `async-${request.runId}`,
+      resultPath: `/tmp/${request.runId}.json`,
+      assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
+    };
+  }
+
+  releaseLaunch(index: number): void {
+    this.launchResolvers[index]?.();
+  }
+
+  async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.cancelled.push(handle);
+    return true;
+  }
+}
+
 class CompletedProgressFailRuntime extends CompletingRuntime {
   private waitStartedResolve!: () => void;
   private waitReject: ((error: Error) => void) | undefined;
@@ -693,5 +772,201 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     await expect(controller.clear()).resolves.toBe(1);
 
     expect(controller.getState().taskRuns).toEqual([]);
+  });
+
+  test("clear fences in-flight launch before it can update state", async () => {
+    const runtime = new LaunchControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await runtime.launchStarted;
+    await expect(controller.clear("all")).resolves.toBe(1);
+
+    runtime.releaseLaunch();
+    await controller.awaitLastWork();
+
+    expect(runtime.cancelled).toHaveLength(1);
+    expect(controller.getState().taskRuns).toEqual([]);
+  });
+
+  test("launch rejection after epoch changes rolls back stale queued assignments", async () => {
+    const runtime = new LaunchRejectControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState({
+      version: 4,
+      currentTaskRunId: "task-run-active",
+      updatedAt: 1,
+      taskRuns: [{
+        id: "task-run-active",
+        title: "Active run",
+        request: "Do it",
+        context: "Do it",
+        status: "pending",
+        groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 }],
+        tasks: [{ id: "task", groupId: "main", text: "Do task", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 }],
+        assignments: [],
+        artifacts: [],
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    });
+
+    const dispatch = controller.dispatchReady({ taskRunId: "task-run-active" });
+    await runtime.launchStarted;
+    await expect(controller.editGroup({ taskRunId: "task-run-active", targetId: "main", group: { maxConcurrency: 2 } })).resolves.toMatchObject({ edited: true });
+
+    runtime.rejectLaunch();
+    await dispatch;
+
+    const activeRun = controller.getState().taskRuns.find((taskRun) => taskRun.id === "task-run-active");
+    expect(activeRun?.assignments).toEqual([]);
+    expect(activeRun?.tasks[0].assignmentIds).toEqual([]);
+    expect(activeRun?.tasks[0].status).toBe("ready");
+  });
+
+  test("stale rollback does not remove replacement assignment with reused id", async () => {
+    const runtime = new MultiLaunchControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState({
+      version: 4,
+      currentTaskRunId: "task-run-active",
+      updatedAt: 1,
+      taskRuns: [{
+        id: "task-run-active",
+        title: "Active run",
+        request: "Do it",
+        context: "Do it",
+        status: "pending",
+        groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 }],
+        tasks: [{ id: "task", groupId: "main", text: "Do task", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 }],
+        assignments: [],
+        artifacts: [],
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    });
+
+    const firstDispatch = controller.dispatchReady({ taskRunId: "task-run-active" });
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(1));
+    const firstAssignmentId = runtime.requests[0].tasks[0].assignmentId;
+    await expect(controller.editTask({ taskRunId: "task-run-active", targetId: "task", task: { text: "Do task again", criteria: ["Done again"] } })).resolves.toMatchObject({ edited: true });
+    await vi.waitFor(() => expect(runtime.requests).toHaveLength(2));
+
+    runtime.releaseLaunch(0);
+    await firstDispatch;
+
+    const activeRun = controller.getState().taskRuns[0];
+    expect(runtime.cancelled).toHaveLength(1);
+    expect(runtime.requests[1].tasks[0].assignmentId).toBe(firstAssignmentId);
+    expect(activeRun.assignments).toHaveLength(1);
+    expect(activeRun.assignments[0].id).toBe(firstAssignmentId);
+    expect(activeRun.tasks[0].assignmentIds).toEqual([firstAssignmentId]);
+
+    runtime.releaseLaunch(1);
+    await controller.awaitLastWork();
+    expect(controller.getState().taskRuns[0].tasks[0].status).toBe("completed");
+  });
+
+  test("clear completed does not invalidate active post-commit dispatch", async () => {
+    const runtime = new ControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState({
+      version: 4,
+      currentTaskRunId: "task-run-active",
+      updatedAt: 1,
+      taskRuns: [
+        {
+          id: "task-run-completed",
+          title: "Completed run",
+          request: "Done",
+          context: "Done",
+          status: "completed",
+          groups: [],
+          tasks: [{ id: "done", text: "Done", status: "completed", criteria: [{ id: "C1", text: "Done", satisfied: true, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1, completedAt: 1 }],
+          assignments: [],
+          artifacts: [],
+          createdAt: 1,
+          updatedAt: 1,
+          completedAt: 1,
+        },
+        {
+          id: "task-run-active",
+          title: "Active run",
+          request: "Do it",
+          context: "Do it",
+          status: "pending",
+          groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 }],
+          tasks: [{ id: "task", groupId: "main", text: "Do task", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 }],
+          assignments: [],
+          artifacts: [],
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+    });
+
+    const dispatch = controller.dispatchReady({ taskRunId: "task-run-active" });
+    await runtime.waitStarted;
+    await expect(controller.clear()).resolves.toBe(1);
+
+    runtime.complete();
+    await dispatch;
+
+    const activeRun = controller.getState().taskRuns.find((taskRun) => taskRun.id === "task-run-active");
+    expect(controller.getState().taskRuns.map((taskRun) => taskRun.id)).toEqual(["task-run-active"]);
+    expect(activeRun?.assignments[0].status).toBe("completed");
+    expect(activeRun?.tasks[0].status).toBe("completed");
+  });
+
+  test("clear completed does not invalidate active pre-commit dispatch", async () => {
+    const runtime = new LaunchControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState({
+      version: 4,
+      currentTaskRunId: "task-run-active",
+      updatedAt: 1,
+      taskRuns: [
+        {
+          id: "task-run-completed",
+          title: "Completed run",
+          request: "Done",
+          context: "Done",
+          status: "completed",
+          groups: [],
+          tasks: [{ id: "done", text: "Done", status: "completed", criteria: [{ id: "C1", text: "Done", satisfied: true, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1, completedAt: 1 }],
+          assignments: [],
+          artifacts: [],
+          createdAt: 1,
+          updatedAt: 1,
+          completedAt: 1,
+        },
+        {
+          id: "task-run-active",
+          title: "Active run",
+          request: "Do it",
+          context: "Do it",
+          status: "pending",
+          groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 }],
+          tasks: [{ id: "task", groupId: "main", text: "Do task", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 }],
+          assignments: [],
+          artifacts: [],
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+    });
+
+    const dispatch = controller.dispatchReady({ taskRunId: "task-run-active" });
+    await runtime.launchStarted;
+    await expect(controller.clear()).resolves.toBe(1);
+
+    runtime.releaseLaunch();
+    await dispatch;
+
+    const activeRun = controller.getState().taskRuns.find((taskRun) => taskRun.id === "task-run-active");
+    expect(runtime.cancelled).toHaveLength(0);
+    expect(controller.getState().taskRuns.map((taskRun) => taskRun.id)).toEqual(["task-run-active"]);
+    expect(activeRun?.assignments).toHaveLength(1);
+    expect(activeRun?.tasks[0].status).toBe("completed");
   });
 });

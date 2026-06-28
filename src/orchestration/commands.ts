@@ -58,7 +58,12 @@ export function parseDispatchArgs(args?: Record<string, unknown>): ParsedDispatc
       result.errors.push("dispatch maxConcurrency must be a positive integer");
       continue;
     }
-    result.maxConcurrency = Number(value.trim());
+    const parsed = Number(value.trim());
+    if (!Number.isSafeInteger(parsed)) {
+      result.errors.push("dispatch maxConcurrency must be a positive integer");
+      continue;
+    }
+    result.maxConcurrency = parsed;
   }
 
   return result;

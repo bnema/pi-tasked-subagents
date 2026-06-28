@@ -251,7 +251,7 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
   const agent = optionalString(input.agent);
   const prompt = optionalString(input.prompt);
   if (!id || !taskId || !agent || !prompt) return undefined;
-  const groupId = optionalString(input.groupId) ?? groupIdByTaskId.get(taskId);
+  const groupId = groupIdByTaskId.has(taskId) ? groupIdByTaskId.get(taskId) : optionalString(input.groupId);
   const launchInput = objectRecord(input.launchRef);
   const runId = optionalString(input.runId) ?? optionalString(launchInput.runId) ?? optionalString(launchInput.asyncId);
   const assignmentResultPath = optionalString(input.resultPath);
@@ -292,10 +292,26 @@ function normalizeTaskRun(raw: unknown, _index: number): TaskRunRecord | undefin
   const groups = Array.isArray(input.groups)
     ? input.groups.map(normalizeGroup).filter((entry): entry is TaskGroupRecord => Boolean(entry))
     : [];
+  const groupIds = new Set(groups.map((group) => group.id));
   const tasks = Array.isArray(input.tasks)
-    ? input.tasks.map(normalizeTask).filter((entry): entry is TaskRecord => Boolean(entry))
+    ? input.tasks
+      .map(normalizeTask)
+      .filter((entry): entry is TaskRecord => Boolean(entry))
+      .filter((task) => !task.groupId || groupIds.has(task.groupId))
     : [];
   const groupIdByTaskId = new Map(tasks.map((task) => [task.id, task.groupId]));
+  const taskIds = new Set(tasks.map((task) => task.id));
+  const assignments = Array.isArray(input.assignments)
+    ? input.assignments
+      .map((assignment) => normalizeAssignment(assignment, id, groupIdByTaskId))
+      .filter((entry): entry is TaskAssignmentRecord => Boolean(entry))
+      .filter((entry) => taskIds.has(entry.taskId))
+    : [];
+  const assignmentIds = new Set(assignments.map((assignment) => assignment.id));
+  const reconciledTasks = tasks.map((task) => ({
+    ...task,
+    assignmentIds: task.assignmentIds.filter((assignmentId) => assignmentIds.has(assignmentId)),
+  }));
   return {
     id,
     title,
@@ -303,12 +319,13 @@ function normalizeTaskRun(raw: unknown, _index: number): TaskRunRecord | undefin
     context,
     status: Object.prototype.hasOwnProperty.call(TASK_RUN_STATUS, rawStatus) ? rawStatus : "pending",
     groups,
-    tasks,
-    assignments: Array.isArray(input.assignments)
-      ? input.assignments.map((assignment) => normalizeAssignment(assignment, id, groupIdByTaskId)).filter((entry): entry is TaskAssignmentRecord => Boolean(entry))
-      : [],
+    tasks: reconciledTasks,
+    assignments,
     artifacts: Array.isArray(input.artifacts)
-      ? input.artifacts.map((artifact) => normalizeArtifact(artifact, { taskRunId: id })).filter((entry): entry is ArtifactRef => Boolean(entry))
+      ? input.artifacts
+        .map((artifact) => normalizeArtifact(artifact, { taskRunId: id }))
+        .filter((entry): entry is ArtifactRef => Boolean(entry))
+        .filter((entry) => taskIds.has(entry.taskId) && assignmentIds.has(entry.assignmentId))
       : [],
     maxConcurrency: optionalPositiveInteger(input.maxConcurrency),
     createdAt: numberValue(input.createdAt, timestamp),

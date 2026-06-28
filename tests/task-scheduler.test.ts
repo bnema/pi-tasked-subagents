@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import type { SetTasksInput, TaskAssignmentRecord, TaskRunRecord } from "../src/types.js";
 import {
   applyAssignmentProgress,
+  buildTaskAssignmentPrompt,
   createReadyAssignments,
   deriveTaskRunStatus,
   toLaunchTaskEntries,
@@ -139,7 +140,7 @@ describe("task scheduler", () => {
     expect(result.assignments.map((assignment) => assignment.taskId)).toEqual(["one", "two"]);
   });
 
-  test("ungrouped tasks without task-run maxConcurrency dispatch sequentially by declaration order", () => {
+  test("ungrouped tasks without task-run maxConcurrency dispatch independently", () => {
     const taskRun = makeTaskRun({
       tasks: [
         { id: "one", text: "Do one", criteria: ["One done"] },
@@ -148,20 +149,12 @@ describe("task scheduler", () => {
       ],
     });
 
-    const first = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 });
+    const result = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 });
 
-    expect(first.assignments.map((assignment) => assignment.taskId)).toEqual(["one"]);
-    expect(task(taskRun, "two").status).toBe("pending");
-    expect(task(taskRun, "three").status).toBe("pending");
-
-    completeAssignment(taskRun, first.assignments[0], 3);
-    const second = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 4 });
-
-    expect(second.assignments.map((assignment) => assignment.taskId)).toEqual(["two"]);
-    expect(task(taskRun, "three").status).toBe("pending");
+    expect(result.assignments.map((assignment) => assignment.taskId)).toEqual(["one", "two", "three"]);
   });
 
-  test("ungrouped tasks without task-run maxConcurrency keep declaration order with explicit dependencies", () => {
+  test("ungrouped tasks without task-run maxConcurrency obey explicit dependencies only", () => {
     const taskRun = makeTaskRun({
       tasks: [
         { id: "one", text: "Do one", criteria: ["One done"] },
@@ -175,8 +168,17 @@ describe("task scheduler", () => {
     completeAssignment(taskRun, first.assignments[0], 3);
     const second = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 4 });
 
-    expect(second.assignments.map((assignment) => assignment.taskId)).toEqual(["two"]);
-    expect(task(taskRun, "three").status).toBe("pending");
+    expect(second.assignments.map((assignment) => assignment.taskId)).toEqual(["two", "three"]);
+  });
+
+  test("ungrouped task prompt omits groupId from required JSON", () => {
+    const taskRun = makeTaskRun();
+
+    const prompt = buildTaskAssignmentPrompt(taskRun, undefined, task(taskRun, "one"));
+
+    expect(prompt).not.toContain("OMIT_FOR_UNGROUPED_TASK");
+    expect(prompt).not.toContain('"groupId"');
+    expect(prompt).toContain("Omit groupId only when this prompt has no Group id line.");
   });
 
   test("ungrouped tasks obey task dependencies and task-run maxConcurrency", () => {

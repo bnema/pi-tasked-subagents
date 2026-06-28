@@ -78,14 +78,7 @@ function dependencyIdsForTask(taskRun: TaskRunRecord, task: TaskRecord): string[
     if (!dependencyIds.includes(taskId)) dependencyIds.push(taskId);
   };
 
-  if (!task.groupId) {
-    if (taskRun.maxConcurrency === undefined) {
-      const ungroupedTasks = tasksForGroup(taskRun, undefined);
-      const index = ungroupedTasks.findIndex((candidate) => candidate.id === task.id);
-      if (index > 0) addImplicitDependency(ungroupedTasks[index - 1].id);
-    }
-    return dependencyIds;
-  }
+  if (!task.groupId) return dependencyIds;
 
   const group = groupById(taskRun).get(task.groupId);
   const groupMaxConcurrency = group?.maxConcurrency ?? 1;
@@ -151,7 +144,7 @@ function groupCanDispatchReadyTasks(taskRun: TaskRunRecord, group: TaskGroupReco
 }
 
 function taskRunAvailableSlots(taskRun: TaskRunRecord): number {
-  if (!taskRun.maxConcurrency) return Number.POSITIVE_INFINITY;
+  if (taskRun.maxConcurrency === undefined) return Number.POSITIVE_INFINITY;
   return Math.max(0, taskRun.maxConcurrency - activeCountForTaskRun(taskRun));
 }
 
@@ -169,6 +162,17 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
       return summary ? `Task ${taskId}: ${summary}` : undefined;
     })
     .filter((line): line is string => Boolean(line));
+  const requiredReport = {
+    taskRunId: taskRun.id,
+    ...(group ? { groupId: group.id } : {}),
+    taskId: task.id,
+    assignmentId: "ASSIGNMENT_ID",
+    status: "completed | attention | failed",
+    summary: "short summary",
+    criteriaEvidence: [{ criteriaIndex: 0, evidence: "specific evidence" }],
+    artifacts: [{ label: "optional", path: "optional/path" }],
+    followUps: ["optional blocker or follow-up"],
+  };
 
   return [
     "You are a subagent assigned one task by pi-tasked-subagents.",
@@ -194,17 +198,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     ...upstreamOutputs,
     "",
     "Required JSON:",
-    JSON.stringify({
-      taskRunId: taskRun.id,
-      groupId: group?.id ?? "OMIT_FOR_UNGROUPED_TASK",
-      taskId: task.id,
-      assignmentId: "ASSIGNMENT_ID",
-      status: "completed | attention | failed",
-      summary: "short summary",
-      criteriaEvidence: [{ criteriaIndex: 0, evidence: "specific evidence" }],
-      artifacts: [{ label: "optional", path: "optional/path" }],
-      followUps: ["optional blocker or follow-up"],
-    }, null, 2),
+    JSON.stringify(requiredReport, null, 2),
     "",
     "Rules:",
     "- Use the exact taskRunId, groupId, taskId, and assignmentId provided by the launcher prompt.",
@@ -302,6 +296,7 @@ export function deriveTaskRunStatus(taskRun: TaskRunRecord, timestamp = Date.now
   else if (statuses.some((status) => status === "attention" || status === "blocked")) taskRun.status = "attention";
   else if (statuses.some((status) => status === "cancelled")) taskRun.status = "cancelled";
   else taskRun.status = "running";
+  if (taskRun.status !== "completed") taskRun.completedAt = undefined;
   taskRun.updatedAt = timestamp;
 }
 

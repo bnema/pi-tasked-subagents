@@ -76,6 +76,9 @@ describe("commands", () => {
     expect(parseDispatchArgs({ maxConcurrency: "0" })).toEqual({
       errors: ["dispatch maxConcurrency must be a positive integer"],
     });
+    expect(parseDispatchArgs({ maxConcurrency: "9007199254740993" })).toEqual({
+      errors: ["dispatch maxConcurrency must be a positive integer"],
+    });
   });
 
   test("formats status for task runs, groups, tasks, and assignments", () => {

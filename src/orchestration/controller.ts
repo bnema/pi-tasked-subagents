@@ -400,7 +400,13 @@ export class TaskedSubagentsController {
         }, runtimeCtx), launch.assignments);
         ref = launchedRef;
         this.liveRunIds.add(launchedRef.runId);
-        if (this.stateEpoch !== dispatchEpoch) return aggregate;
+        if (this.stateEpoch !== dispatchEpoch) {
+          await this.runtime.cancelRun(launchedRef, runtimeCtx).catch((cancelError: unknown) => {
+            console.error(`[${PACKAGE_NAME}] failed to cancel stale dispatch:`, cancelError);
+          });
+          await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext);
+          return aggregate;
+        }
 
         await this.lock.withLock(() => {
           if (this.stateEpoch !== dispatchEpoch) return;
@@ -432,6 +438,7 @@ export class TaskedSubagentsController {
         const message = error instanceof Error ? error.message : String(error);
         aggregate.errors.push(message);
         aggregate.hasBlockingIssue = true;
+        if (this.stateEpoch !== dispatchEpoch) await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext);
         if (this.stateEpoch === dispatchEpoch) await this.lock.withLock(() => {
           if (this.stateEpoch !== dispatchEpoch) return;
           const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
@@ -524,9 +531,15 @@ export class TaskedSubagentsController {
         }
         this.state.updatedAt = Date.now();
       }
+      const removed = before - this.state.taskRuns.length;
+      if (scope === "all") {
+        this.stateEpoch += 1;
+        this.runProgressSignatures.clear();
+        this.liveRunIds.clear();
+      }
       this.persistState();
       this.updateUI(this.lastContext);
-      return before - this.state.taskRuns.length;
+      return removed;
     });
   }
 
@@ -575,7 +588,7 @@ export class TaskedSubagentsController {
   private editTaskMutable(input: EditTaskInput, ctx?: ExtensionContext): EditTaskResult {
     const taskRun = this.resolveTaskRunMutable(input.taskRunId);
     if (!taskRun) return { edited: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
-    const requestedTargetId = normalizeTargetId(input.targetId) ?? normalizeTargetId(input.task?.id);
+    const requestedTargetId = normalizeTargetId(input.targetId);
     if (!requestedTargetId) return { edited: false, taskRunId: taskRun.id, errors: ["Task targetId is required"], dispatchScheduled: false };
     const assignmentTarget = taskRun.assignments.find((assignment) => assignment.id === requestedTargetId);
     const targetId = assignmentTarget?.taskId ?? requestedTargetId;
@@ -583,7 +596,7 @@ export class TaskedSubagentsController {
     if (taskIndex < 0) return { edited: false, taskRunId: taskRun.id, errors: [`Task ${requestedTargetId} not found`], dispatchScheduled: false };
 
     const candidate = taskRunToInput(taskRun);
-    candidate.tasks[taskIndex] = { ...candidate.tasks[taskIndex], ...input.task, id: input.task?.id ?? candidate.tasks[taskIndex].id };
+    candidate.tasks[taskIndex] = { ...candidate.tasks[taskIndex], ...input.task, id: candidate.tasks[taskIndex].id };
     const validationErrors = validateTaskRunInput(candidate);
     if (validationErrors.length > 0) return { edited: false, taskRunId: taskRun.id, taskId: targetId, errors: validationErrors, dispatchScheduled: false };
 
@@ -621,14 +634,14 @@ export class TaskedSubagentsController {
   private editGroupMutable(input: EditGroupInput, ctx?: ExtensionContext): EditGroupResult {
     const taskRun = this.resolveTaskRunMutable(input.taskRunId);
     if (!taskRun) return { edited: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
-    const targetId = normalizeTargetId(input.targetId) ?? normalizeTargetId(input.group?.id);
+    const targetId = normalizeTargetId(input.targetId);
     if (!targetId) return { edited: false, taskRunId: taskRun.id, errors: ["Group targetId is required"], dispatchScheduled: false };
     const groupIndex = taskRun.groups.findIndex((candidate) => candidate.id === targetId);
     if (groupIndex < 0) return { edited: false, taskRunId: taskRun.id, errors: [`Group ${targetId} not found`], dispatchScheduled: false };
 
     const candidate = taskRunToInput(taskRun);
     candidate.groups ??= [];
-    candidate.groups[groupIndex] = { ...candidate.groups[groupIndex], ...input.group, id: input.group?.id ?? candidate.groups[groupIndex].id };
+    candidate.groups[groupIndex] = { ...candidate.groups[groupIndex], ...input.group, id: candidate.groups[groupIndex].id };
     const validationErrors = validateTaskRunInput(candidate);
     if (validationErrors.length > 0) return { edited: false, taskRunId: taskRun.id, groupId: targetId, errors: validationErrors, dispatchScheduled: false };
 
@@ -712,6 +725,30 @@ export class TaskedSubagentsController {
       .catch((error: unknown) => {
         console.error(`[${PACKAGE_NAME}] dispatch failed:`, error);
       });
+  }
+
+  private async rollbackUncommittedLaunch(taskRunId: string, assignments: TaskAssignmentRecord[], ctx?: ExtensionContext): Promise<void> {
+    const staleAssignments = new Set(assignments);
+    await this.lock.withLock(() => {
+      const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
+      if (!taskRun) return;
+      const removable = taskRun.assignments.filter((assignment) => staleAssignments.has(assignment) && assignment.status === "queued" && !assignment.runId && !assignment.launchRef);
+      if (removable.length === 0) return;
+      const removableObjects = new Set(removable);
+      const timestamp = Date.now();
+      taskRun.assignments = taskRun.assignments.filter((assignment) => !removableObjects.has(assignment));
+      for (const task of taskRun.tasks) {
+        const before = task.assignmentIds.length;
+        task.assignmentIds = task.assignmentIds.filter((assignmentId) => taskRun.assignments.some((assignment) => assignment.id === assignmentId && assignment.taskId === task.id));
+        if (task.assignmentIds.length !== before) {
+          task.completedAt = undefined;
+          task.updatedAt = timestamp;
+        }
+      }
+      deriveTaskRunStatus(taskRun, timestamp);
+      this.persistState();
+      this.updateUI(ctx ?? this.lastContext);
+    });
   }
 
   private async applyRunProgressUpdate(taskRunId: string, snapshot: RunProgressSnapshot, expectedEpoch: number | undefined, ctx?: ExtensionContext): Promise<void> {
