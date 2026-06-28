@@ -14,6 +14,7 @@ import {
   PACKAGE_NAME,
 } from "../defaults.js";
 import type {
+  AttachResult,
   EditGroupInput,
   EditGroupResult,
   EditTaskInput,
@@ -47,8 +48,9 @@ import {
   toLaunchTaskEntries,
 } from "./task-scheduler.js";
 import { applySubagentTaskReport, parseTaskReport } from "./task-result-reducer.js";
+import { formatAttachReport } from "./commands.js";
 
-export type { EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, SetTasksInput, SetTasksResult } from "../types.js";
+export type { AttachResult, EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, SetTasksInput, SetTasksResult } from "../types.js";
 
 export interface DispatchOptions {
   maxConcurrency?: number;
@@ -279,6 +281,7 @@ export class TaskedSubagentsController {
   private taskRunCounter = 0;
   private lastContext: ExtensionContext | undefined;
   private lastDispatchWork: Promise<void> = Promise.resolve();
+  private readonly scheduledDispatches = new Map<string, Promise<void>>();
   private readonly runProgressSignatures = new Map<string, string>();
   private readonly liveRunIds = new Set<string>();
   private stateEpoch = 0;
@@ -298,11 +301,35 @@ export class TaskedSubagentsController {
     this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
     this.runProgressSignatures.clear();
     this.liveRunIds.clear();
+    this.scheduledDispatches.clear();
+    this.lastDispatchWork = Promise.resolve();
     this.stateEpoch += 1;
   }
 
   async awaitLastWork(): Promise<void> {
     await this.lastDispatchWork;
+  }
+
+  async attachTarget(targetId?: string, ctx?: ExtensionContext): Promise<AttachResult> {
+    if (ctx) this.lastContext = ctx;
+    const requestedTargetId = normalizeTargetId(targetId);
+    const taskRunId = await this.lock.withLock(() => this.resolveTaskRunIdForTarget(requestedTargetId));
+    if (requestedTargetId && !taskRunId) {
+      return {
+        attached: false,
+        targetId: requestedTargetId,
+        report: `Attach target not found: ${requestedTargetId}.`,
+      };
+    }
+    const work = taskRunId ? this.scheduledDispatches.get(taskRunId) : this.lastDispatchWork;
+    if (work) await work;
+    const finalTargetId = requestedTargetId ?? taskRunId;
+    return {
+      attached: Boolean(taskRunId),
+      targetId: finalTargetId,
+      taskRunId,
+      report: formatAttachReport(this.getState(), finalTargetId),
+    };
   }
 
   /** Explicit freeform routing creates a real one-group/one-task TaskRun. */
@@ -340,21 +367,30 @@ export class TaskedSubagentsController {
       return { accepted: true, taskRunId: normalized.taskRun.id, errors: [], dispatchScheduled: true } satisfies SetTasksResult;
     });
 
-    if (result.accepted && result.taskRunId) this.scheduleDispatch(result.taskRunId, ctx);
+    if (result.accepted && result.taskRunId) {
+      const work = this.scheduleDispatch(result.taskRunId, ctx);
+      if (input.wait) await work;
+    }
     return result;
   }
 
   async editTask(input: EditTaskInput, ctx?: ExtensionContext): Promise<EditTaskResult> {
     if (ctx) this.lastContext = ctx;
     const result = await this.lock.withLock(() => this.editTaskMutable(input, ctx));
-    if (result.edited && result.dispatchScheduled && result.taskRunId) this.scheduleDispatch(result.taskRunId, ctx);
+    if (result.edited && result.dispatchScheduled && result.taskRunId) {
+      const work = this.scheduleDispatch(result.taskRunId, ctx);
+      if (input.wait) await work;
+    }
     return result;
   }
 
   async editGroup(input: EditGroupInput, ctx?: ExtensionContext): Promise<EditGroupResult> {
     if (ctx) this.lastContext = ctx;
     const result = await this.lock.withLock(() => this.editGroupMutable(input, ctx));
-    if (result.edited && result.dispatchScheduled && result.taskRunId) this.scheduleDispatch(result.taskRunId, ctx);
+    if (result.edited && result.dispatchScheduled && result.taskRunId) {
+      const work = this.scheduleDispatch(result.taskRunId, ctx);
+      if (input.wait) await work;
+    }
     return result;
   }
 
@@ -536,6 +572,8 @@ export class TaskedSubagentsController {
         this.stateEpoch += 1;
         this.runProgressSignatures.clear();
         this.liveRunIds.clear();
+        this.scheduledDispatches.clear();
+        this.lastDispatchWork = Promise.resolve();
       }
       this.persistState();
       this.updateUI(this.lastContext);
@@ -719,12 +757,18 @@ export class TaskedSubagentsController {
     });
   }
 
-  private scheduleDispatch(taskRunId: string, ctx?: ExtensionContext): void {
-    this.lastDispatchWork = this.dispatchReady({ taskRunId, ctx })
+  private scheduleDispatch(taskRunId: string, ctx?: ExtensionContext): Promise<void> {
+    const work = this.dispatchReady({ taskRunId, ctx })
       .then(() => undefined)
       .catch((error: unknown) => {
         console.error(`[${PACKAGE_NAME}] dispatch failed:`, error);
       });
+    this.lastDispatchWork = work;
+    this.scheduledDispatches.set(taskRunId, work);
+    void work.finally(() => {
+      if (this.scheduledDispatches.get(taskRunId) === work) this.scheduledDispatches.delete(taskRunId);
+    });
+    return work;
   }
 
   private async rollbackUncommittedLaunch(taskRunId: string, assignments: TaskAssignmentRecord[], ctx?: ExtensionContext): Promise<void> {
@@ -877,6 +921,17 @@ export class TaskedSubagentsController {
     const target = normalizeTargetId(taskRunId) ?? this.state.currentTaskRunId;
     if (target) return this.state.taskRuns.find((taskRun) => taskRun.id === target);
     return this.state.taskRuns.at(-1);
+  }
+
+  private resolveTaskRunIdForTarget(targetId?: string): string | undefined {
+    if (!targetId) return this.resolveTaskRunMutable()?.id;
+    for (const taskRun of this.taskRunsForTargetResolution()) {
+      if (taskRun.id === targetId) return taskRun.id;
+      if (taskRun.groups.some((group) => group.id === targetId)) return taskRun.id;
+      if (taskRun.tasks.some((task) => task.id === targetId)) return taskRun.id;
+      if (taskRun.assignments.some((assignment) => assignment.id === targetId)) return taskRun.id;
+    }
+    return undefined;
   }
 
   private resolveHandleForAssignment(assignmentId: string): SubagentRunHandle | undefined {

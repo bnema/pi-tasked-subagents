@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { buildHelpText, formatAgentsReport, formatInspectReport, formatResultReport, formatStatusReport, parseCommand, parseDispatchArgs, resolveResultAssignmentId } from "../src/orchestration/commands.js";
+import { buildHelpText, formatAgentsReport, formatAttachReport, formatInspectReport, formatResultReport, formatStatusReport, parseCommand, parseDispatchArgs, resolveResultAssignmentId } from "../src/orchestration/commands.js";
 import type { TaskedSubagentsState } from "../src/types.js";
 
 const state: TaskedSubagentsState = {
@@ -56,18 +56,21 @@ describe("commands", () => {
     expect(parseCommand("status task-run-1")).toEqual({ action: "status", targetId: "task-run-1" });
     expect(parseCommand("continue task fix it")).toEqual({ action: "continue", targetId: "task", prompt: "fix it" });
     expect(parseCommand("resolve a1 fixed in commit abc123")).toEqual({ action: "resolve", targetId: "a1", prompt: "fixed in commit abc123" });
+    expect(parseCommand("attach task-run-1")).toEqual({ action: "attach", targetId: "task-run-1" });
+    expect(parseCommand("wait task-run-1")).toEqual({ action: "help" });
     expect(parseCommand("resolve task")).toEqual({ action: "help" });
     expect(parseCommand("run do arbitrary prompt")).toEqual({ action: "help" });
   });
 
   test("parses dispatch arguments and rejects unsupported values", () => {
-    expect(parseCommand("dispatch taskRunId=task-run-1 maxConcurrency=2")).toEqual({
+    expect(parseCommand("dispatch taskRunId=task-run-1 maxConcurrency=2 wait=true")).toEqual({
       action: "dispatch",
-      args: { taskRunId: "task-run-1", maxConcurrency: "2" },
+      args: { taskRunId: "task-run-1", maxConcurrency: "2", wait: "true" },
     });
-    expect(parseDispatchArgs({ taskRunId: " task-run-1 ", maxConcurrency: "2" })).toEqual({
+    expect(parseDispatchArgs({ taskRunId: " task-run-1 ", maxConcurrency: "2", wait: "true" })).toEqual({
       taskRunId: "task-run-1",
       maxConcurrency: 2,
+      wait: true,
       errors: [],
     });
     expect(parseDispatchArgs(parseCommand("dispatch foo").args)).toEqual({
@@ -93,8 +96,16 @@ describe("commands", () => {
     expect(formatInspectReport(state, "main")).toContain("task · RUNNING · a1 · Do task");
   });
 
-  test("help documents TaskRun result targets", () => {
-    expect(buildHelpText()).toContain("/tasked-subagents result <taskRunId|groupId|taskId|assignmentId>");
+  test("help documents TaskRun result, attach targets, and wait mode", () => {
+    const help = buildHelpText();
+    expect(help).toContain("/tasked-subagents result <taskRunId|groupId|taskId|assignmentId>");
+    expect(help).toContain("/tasked-subagents attach [taskRunId|groupId|taskId|assignmentId]");
+    expect(help).toContain("wait=true");
+    expect(help).not.toContain("alias: wait");
+  });
+
+  test("attach report does not claim success for unknown targets", () => {
+    expect(formatAttachReport(state, "missing-target")).toBe("Attach target not found: missing-target.");
   });
 
   test("result target resolution accepts taskRun, group, task, and assignment ids when unambiguous", () => {

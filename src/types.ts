@@ -93,6 +93,7 @@ export interface SetTasksInput {
   groups?: TaskGroupInput[];
   tasks: TaskInput[];
   maxConcurrency?: number;
+  wait?: boolean;
 }
 
 export type TaskPatchInput = Partial<Omit<TaskInput, "id">>;
@@ -102,12 +103,14 @@ export interface EditTaskInput {
   taskRunId?: string;
   targetId: string;
   task?: TaskPatchInput;
+  wait?: boolean;
 }
 
 export interface EditGroupInput {
   taskRunId?: string;
   targetId: string;
   group?: TaskGroupPatchInput;
+  wait?: boolean;
 }
 
 export interface SetTasksResult {
@@ -131,6 +134,13 @@ export interface EditGroupResult {
   groupId?: string;
   errors: string[];
   dispatchScheduled: boolean;
+}
+
+export interface AttachResult {
+  attached: boolean;
+  targetId?: string;
+  taskRunId?: string;
+  report: string;
 }
 
 // ──────────────────────────────────────────────
