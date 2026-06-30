@@ -61,6 +61,8 @@ describe("tasked_subagents extension rendering", () => {
     expect(publicSurface).toContain("edit_task");
     expect(publicSurface).toContain("edit_group");
     expect(publicSurface).toContain("patch_task_run");
+    expect(publicSurface).toContain("expansionMode");
+    expect(publicSurface).toContain("append_tasks");
     expect(publicSurface).toContain("attach");
     expect(publicSurface).toContain("wait");
     expect(publicSurface).toContain("taskRunId");

@@ -119,6 +119,28 @@ function validateReport(
     }
   }
 
+  if (report.taskRunPatch !== undefined) {
+    if (found.task.expansionMode !== "append_tasks") errors.push(`Task ${found.task.id} is not allowed to return taskRunPatch`);
+    if (report.status !== "completed") errors.push("taskRunPatch is only allowed on completed reports");
+    if (!report.taskRunPatch || typeof report.taskRunPatch !== "object" || Array.isArray(report.taskRunPatch)) {
+      errors.push("Report taskRunPatch must be an object");
+    } else {
+      const patch = report.taskRunPatch as Record<string, unknown>;
+      if (patch.groups !== undefined && !Array.isArray(patch.groups)) errors.push("Report taskRunPatch.groups must be an array");
+      if (Array.isArray(patch.groups)) {
+        for (const [groupIndex, group] of patch.groups.entries()) {
+          if (!group || typeof group !== "object" || Array.isArray(group)) errors.push(`Report taskRunPatch.groups entry ${groupIndex} must be an object`);
+        }
+      }
+      if (patch.tasks !== undefined && !Array.isArray(patch.tasks)) errors.push("Report taskRunPatch.tasks must be an array");
+      if (Array.isArray(patch.tasks)) {
+        for (const [taskIndex, task] of patch.tasks.entries()) {
+          if (!task || typeof task !== "object" || Array.isArray(task)) errors.push(`Report taskRunPatch.tasks entry ${taskIndex} must be an object`);
+        }
+      }
+    }
+  }
+
   return { errors, warnings };
 }
 

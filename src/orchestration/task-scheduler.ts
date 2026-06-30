@@ -172,6 +172,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     criteriaEvidence: [{ criteriaIndex: 0, evidence: "specific evidence" }],
     artifacts: [{ label: "optional", path: "optional/path" }],
     followUps: ["optional blocker or follow-up"],
+    ...(task.expansionMode === "append_tasks" ? { taskRunPatch: { groups: [], tasks: [] } } : {}),
   };
 
   return [
@@ -187,6 +188,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     group ? `Group title: ${group.title}` : undefined,
     group?.filesHint?.length ? `Group files: ${group.filesHint.join(", ")}` : undefined,
     task.filesHint?.length ? `Task files: ${task.filesHint.join(", ")}` : undefined,
+    task.expansionMode === "append_tasks" ? "Task expansion: this task may append newly discovered visible groups/tasks by returning taskRunPatch." : undefined,
     "",
     `Task id: ${task.id}`,
     `Task: ${task.text}`,
@@ -207,6 +209,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     "- Evidence must be concrete and non-empty.",
     "- Use status=attention when blocked or evidence is insufficient.",
     "- Use status=failed only for unrecoverable failure.",
+    task.expansionMode === "append_tasks" ? "- taskRunPatch may only add new task ids. Do not include existing task ids." : undefined,
   ].filter((line): line is string => typeof line === "string").join("\n");
 }
 

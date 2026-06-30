@@ -181,6 +181,19 @@ describe("task-run validation", () => {
     );
   });
 
+  test("accepts append task expansion mode", () => {
+    expect(validateTaskRunInput(validInput({
+      tasks: [validTask({ id: "triage", expansionMode: "append_tasks" })],
+    }))).toEqual([]);
+  });
+
+  test("rejects invalid task expansion mode", () => {
+    expectValidationError(
+      validInput({ tasks: [validTask({ id: "triage", expansionMode: "fan_out" as TaskInput["expansionMode"] })] }),
+      "Task triage expansionMode must be append_tasks",
+    );
+  });
+
   test("returns validation errors for malformed list values instead of throwing", () => {
     const input = validInput({
       tasks: [

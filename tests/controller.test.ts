@@ -103,6 +103,30 @@ class CompletingRuntime implements SubagentRuntime {
   }
 }
 
+class ExpansionRuntime extends CompletingRuntime {
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    const request = this.requests.find((candidate) => candidate.runId === handle.runId) ?? this.requests.at(-1);
+    const task = request?.tasks[0];
+    if (!task) return undefined;
+    if (task.taskId === "triage") {
+      return JSON.stringify({
+        taskRunId: task.taskRunId,
+        ...(task.groupId ? { groupId: task.groupId } : {}),
+        taskId: task.taskId,
+        assignmentId: task.assignmentId,
+        status: "completed",
+        summary: "Triage produced review task",
+        criteriaEvidence: [{ criteriaIndex: 0, evidence: "Identified review follow-up" }],
+        taskRunPatch: {
+          tasks: [{ id: "review", group: "main", text: "Review triage output", criteria: ["Reviewed"], dependsOn: ["triage"] }],
+        },
+      });
+    }
+    return super.getRunResult(handle);
+  }
+}
+
 class DuplicateEvidenceRuntime extends CompletingRuntime {
   async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
     this.resultHandles.push(handle);
@@ -481,6 +505,23 @@ describe("TaskedSubagentsController TaskRun public API", () => {
       "second criterion evidence",
       "additional second criterion evidence",
     ]);
+  });
+
+  test("triage expansion appends visible tasks to the same TaskRun and continues dispatch", async () => {
+    const runtime = new ExpansionRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks({
+      ...baseSetTasks,
+      tasks: [{ id: "triage", group: "main", text: "Plan review work", criteria: ["Plan produced"], expansionMode: "append_tasks" }],
+      wait: true,
+    });
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.tasks.map((task) => task.id)).toEqual(["triage", "review"]);
+    expect(taskRun.tasks.find((task) => task.id === "triage")?.status).toBe("completed");
+    expect(taskRun.tasks.find((task) => task.id === "review")?.status).toBe("completed");
+    expect(runtime.requests.map((request) => request.tasks.map((task) => task.taskId))).toEqual([["triage"], ["review"]]);
   });
 
   test("setTasks appends a new task run when taskRunId is omitted", async () => {

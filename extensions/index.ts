@@ -120,6 +120,7 @@ const TaskInputSchema = Type.Object({
   outputMode: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
   outputSchema: Type.Optional(NonEmptyString),
   when: Type.Optional(NonEmptyString),
+  expansionMode: Type.Optional(Type.Literal("append_tasks")),
 });
 
 const TaskGroupInputSchema = Type.Object({
@@ -143,6 +144,7 @@ const TaskPatchSchema = Type.Partial(Type.Object({
   outputMode: Type.Union([Type.Literal("text"), Type.Literal("json")]),
   outputSchema: NonEmptyString,
   when: NonEmptyString,
+  expansionMode: Type.Literal("append_tasks"),
 }));
 
 const TaskGroupPatchSchema = Type.Partial(Type.Object({
@@ -237,6 +239,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
       "Use attach later when work was already launched in background mode and the main agent should re-join it before using results.",
       "Use edit_task or edit_group with targetId plus a patch for targeted validated changes.",
       "Use patch_task_run instead of set_tasks when triage or planning discovers additional tasks for the same visible TaskRun.",
+      "Use task expansionMode=append_tasks only for triage/planning tasks that are allowed to return taskRunPatch with new visible tasks.",
       "After set_tasks, edit_task, or dispatch schedules background work without wait=true, either call attach to wait later or wait for the automatic completion/attention/failure follow-up signal. edit_group may only update scheduling metadata when no work is launched.",
       "Use status for human-requested health checks, suspected stalls, or after about 60s with no signal.",
       "Use result with an assignmentId, or with a taskRunId/groupId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",

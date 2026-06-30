@@ -56,6 +56,7 @@ export type RunStatus = AssignmentStatus;
 
 export type TaskReportStatus = "completed" | "attention" | "failed";
 export type OutputMode = "text" | "json";
+export type TaskExpansionMode = "append_tasks";
 
 // ──────────────────────────────────────────────
 // Task-run input
@@ -83,6 +84,7 @@ export interface TaskInput {
   outputMode?: OutputMode;
   outputSchema?: string;
   when?: string;
+  expansionMode?: TaskExpansionMode;
 }
 
 export interface SetTasksInput {
@@ -191,6 +193,7 @@ export interface TaskRecord {
   outputMode?: OutputMode;
   outputSchema?: string;
   when?: string;
+  expansionMode?: TaskExpansionMode;
   continuation?: string;
   createdAt: number;
   updatedAt: number;
@@ -294,6 +297,10 @@ export interface SubagentTaskReport {
   }>;
   artifacts?: Array<{ label: string; path: string }>;
   followUps?: string[];
+  taskRunPatch?: {
+    groups?: TaskGroupInput[];
+    tasks?: TaskInput[];
+  };
 }
 
 // ──────────────────────────────────────────────

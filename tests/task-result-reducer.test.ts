@@ -117,6 +117,39 @@ describe("task result reducer", () => {
     expect(taskRun.status).toBe("completed");
   });
 
+  test("rejects malformed taskRunPatch arrays before controller patching", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+    task.expansionMode = "append_tasks";
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      taskRunPatch: { tasks: {} as never },
+    }, { now: 3 });
+
+    expect(result.applied).toBe(false);
+    expect(result.errors).toContain("Report taskRunPatch.tasks must be an array");
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+  });
+
+  test("rejects malformed taskRunPatch entries before controller patching", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+    task.expansionMode = "append_tasks";
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      taskRunPatch: { groups: [null] as never, tasks: [null] as never },
+    }, { now: 3 });
+
+    expect(result.applied).toBe(false);
+    expect(result.errors).toContain("Report taskRunPatch.groups entry 0 must be an object");
+    expect(result.errors).toContain("Report taskRunPatch.tasks entry 0 must be an object");
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+  });
+
   test("keeps failed reports failed even when all criteria include evidence", () => {
     const fixture = setup();
     const { taskRun, assignment, task } = fixture;

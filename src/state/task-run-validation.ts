@@ -195,6 +195,9 @@ export function validateTaskRunInput(input: unknown): string[] {
     if (task.outputMode !== undefined && task.outputMode !== "text" && task.outputMode !== "json") {
       errors.push(`Task ${taskId} outputMode must be text or json`);
     }
+    if (task.expansionMode !== undefined && task.expansionMode !== "append_tasks") {
+      errors.push(`Task ${taskId} expansionMode must be append_tasks`);
+    }
 
     const groupIdResult = cleanIdentifier(task.group, `Task ${taskId} group reference`);
     if (groupIdResult.error) {
@@ -264,6 +267,7 @@ function normalizeTask(taskIndex: number, input: TaskInput, now: number): TaskRe
     outputMode: input.outputMode === "text" || input.outputMode === "json" ? input.outputMode : undefined,
     outputSchema: cleanText(input.outputSchema) || undefined,
     when: cleanText(input.when) || undefined,
+    expansionMode: input.expansionMode === "append_tasks" ? input.expansionMode : undefined,
     createdAt: now,
     updatedAt: now,
   };
