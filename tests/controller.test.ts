@@ -103,6 +103,27 @@ class CompletingRuntime implements SubagentRuntime {
   }
 }
 
+class DuplicateExpansionRuntime extends CompletingRuntime {
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    const request = this.requests.find((candidate) => candidate.runId === handle.runId) ?? this.requests.at(-1);
+    const task = request?.tasks[0];
+    if (!task) return undefined;
+    return JSON.stringify({
+      taskRunId: task.taskRunId,
+      ...(task.groupId ? { groupId: task.groupId } : {}),
+      taskId: task.taskId,
+      assignmentId: task.assignmentId,
+      status: "completed",
+      summary: "Triage attempted duplicate task",
+      criteriaEvidence: [{ criteriaIndex: 0, evidence: "Identified duplicate follow-up" }],
+      taskRunPatch: {
+        tasks: [{ id: "triage", group: "main", text: "Replace triage", criteria: ["Replaced"] }],
+      },
+    });
+  }
+}
+
 class ExpansionRuntime extends CompletingRuntime {
   async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
     this.resultHandles.push(handle);
@@ -522,6 +543,25 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(taskRun.tasks.find((task) => task.id === "triage")?.status).toBe("completed");
     expect(taskRun.tasks.find((task) => task.id === "review")?.status).toBe("completed");
     expect(runtime.requests.map((request) => request.tasks.map((task) => task.taskId))).toEqual([["triage"], ["review"]]);
+  });
+
+  test("triage expansion duplicate task ids mark visible task attention without hidden work", async () => {
+    const runtime = new DuplicateExpansionRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks({
+      ...baseSetTasks,
+      tasks: [{ id: "triage", group: "main", text: "Plan review work", criteria: ["Plan produced"], expansionMode: "append_tasks" }],
+      wait: true,
+    });
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.tasks.map((task) => task.id)).toEqual(["triage"]);
+    expect(taskRun.tasks[0].status).toBe("attention");
+    expect(taskRun.assignments).toHaveLength(1);
+    expect(taskRun.assignments[0].status).toBe("attention");
+    expect(taskRun.assignments[0].result?.followUps).toContain("Task triage already exists; use edit_task to modify existing tasks");
+    expect(runtime.requests.map((request) => request.tasks.map((task) => task.taskId))).toEqual([["triage"]]);
   });
 
   test("setTasks appends a new task run when taskRunId is omitted", async () => {
