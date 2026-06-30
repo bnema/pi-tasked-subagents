@@ -5,6 +5,7 @@
 import type { AgentProfile } from "../launcher/agent-profiles.js";
 import type { TaskAssignmentRecord, TaskGroupRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
 import { statusLabel } from "../ui/messages.js";
+import { buildTaskRunChecklistLines } from "../ui/widget.js";
 import { shortTitle } from "../utils/text.js";
 
 export type CommandAction =
@@ -308,7 +309,9 @@ export function formatInspectReport(state: TaskedSubagentsState, targetId: strin
 }
 
 function formatTaskRunDetail(taskRun: TaskRunRecord): string {
-  const lines = [`TaskRun: ${taskRun.id}`, `  title: ${taskRun.title}`, `  status: ${statusLabel(taskRun.status)}`, `  request: ${taskRun.request}`, `  context: ${taskRun.context}`, "", `Groups (${taskRun.groups.length}):`];
+  const lines = [`TaskRun: ${taskRun.id}`, `  title: ${taskRun.title}`, `  status: ${statusLabel(taskRun.status)}`, `  request: ${taskRun.request}`, `  context: ${taskRun.context}`, "", "Checklist:"];
+  lines.push(...buildTaskRunChecklistLines(taskRun, 200).map((line) => `  ${line}`));
+  lines.push("", `Groups (${taskRun.groups.length}):`);
   for (const group of taskRun.groups) lines.push(`  ${group.id} · ${statusLabel(group.status)} · ${group.title}`);
   lines.push("", `Tasks (${taskRun.tasks.length}):`);
   for (const task of taskRun.tasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(taskRun, task)} · ${task.text}`);

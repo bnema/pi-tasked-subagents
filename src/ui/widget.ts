@@ -357,6 +357,62 @@ function buildHiddenLine(hidden: { completed: number; completedTasks: number; ot
   return parts.length > 0 ? `${color(GLYPH_TREE_LAST, "muted", theme)} ${muted(parts.join(", "), theme)}` : undefined;
 }
 
+function pushLimited(lines: string[], line: string, limit: number): boolean {
+  if (lines.length >= limit) return false;
+  lines.push(line);
+  return true;
+}
+
+function checklistTaskLine(taskRun: TaskRunRecord, task: TaskRecord, groupLast: boolean, taskLast: boolean): string {
+  const assignment = assignmentForTask(taskRun, task);
+  const criteria = taskCriteriaProgress(task);
+  const details = [
+    `${criteria.done}/${criteria.total} criteria`,
+    task.dependsOn.length > 0 ? `depends on: ${task.dependsOn.join(", ")}` : undefined,
+    assignment?.agent,
+  ].filter(Boolean).join(" · ");
+  return `${childPrefix(groupLast)}${linePrefix(taskLast)}${statusGlyph(task.status)} ${shortTitle(task.text, TASK_TITLE_WIDTH)}${details ? ` ${details}` : ""}`;
+}
+
+function checklistAssignmentLine(assignment: TaskAssignmentRecord, groupLast: boolean, taskLast: boolean): string {
+  const taskChildPrefix = `${childPrefix(groupLast)}${childPrefix(taskLast)}`;
+  return `${taskChildPrefix}${linePrefix(true)}${statusGlyph(assignment.status)} ${assignment.agent} ${shortAssignmentId(assignment.id)}`;
+}
+
+export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100): string[] {
+  if (limit <= 0) return [];
+  const rawLines: string[] = [];
+  const append = (line: string): boolean => pushLimited(rawLines, line, limit);
+  const progress = taskRunTaskProgress(taskRun);
+  append(`${GLYPH_TASKED_SUBAGENTS} TaskRun ${taskRun.id} ${statusGlyph(taskRun.status)} ${progress.done}/${progress.total} ${shortTitle(taskRun.title || taskRun.request, SUMMARY_TITLE_WIDTH)}`);
+
+  const groups = widgetGroups(taskRun);
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    const group = groups[groupIndex];
+    const groupLast = groupIndex === groups.length - 1;
+    if (!append(`${linePrefix(groupLast)}${GLYPH_GROUP} ${shortTitle(group.title, GROUP_TITLE_WIDTH)} ${statusGlyph(group.status)} ${groupProgress(taskRun, group).done}/${groupProgress(taskRun, group).total}`)) break;
+    const groupTasks = tasksForGroup(taskRun, group.id);
+    for (let taskIndex = 0; taskIndex < groupTasks.length; taskIndex += 1) {
+      const task = groupTasks[taskIndex];
+      const taskLast = taskIndex === groupTasks.length - 1;
+      if (!append(checklistTaskLine(taskRun, task, groupLast, taskLast))) break;
+      const assignment = assignmentForTask(taskRun, task);
+      if (assignment && !append(checklistAssignmentLine(assignment, groupLast, taskLast))) break;
+    }
+  }
+
+  const totalLineCount = 1 + groups.reduce((count, group) => {
+    const groupTasks = tasksForGroup(taskRun, group.id);
+    const assignmentCount = groupTasks.filter((task) => assignmentForTask(taskRun, task)).length;
+    return count + 1 + groupTasks.length + assignmentCount;
+  }, 0);
+  if (rawLines.length < totalLineCount && rawLines.length > 0) {
+    rawLines.splice(rawLines.length - 1, 1, `${GLYPH_TREE_LAST} ${totalLineCount - rawLines.length + 1} more checklist lines`);
+  }
+
+  return rawLines.map((line) => truncateToWidth(line, COMPACT_WIDGET_MAX_WIDTH, "…"));
+}
+
 export function buildWidgetLines(
   state: TaskedSubagentsState,
   limit: number = DEFAULT_WIDGET_LINES,

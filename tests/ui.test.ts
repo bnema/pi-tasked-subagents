@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 
 import type { TaskedSubagentsState } from "../src/types.js";
 import { buildFooterStatus } from "../src/ui/status.js";
-import { buildWidgetLines, createWidgetContent } from "../src/ui/widget.js";
+import { buildTaskRunChecklistLines, buildWidgetLines, createWidgetContent } from "../src/ui/widget.js";
 import { statusLabel } from "../src/ui/messages.js";
 
 const state: TaskedSubagentsState = {
@@ -231,6 +231,104 @@ describe("ui", () => {
     expect(rendered).toContain("tool: bash");
     expect(rendered).not.toContain("Completed task 1");
     expect(rendered).not.toContain("Active completed task 1");
+  });
+
+  test("full checklist renders completed triage with pending generated review tasks", () => {
+    const planned = cloneState(state);
+    planned.taskRuns[0].title = "Review workflow";
+    planned.taskRuns[0].groups[0].title = "Review plan";
+    planned.taskRuns[0].groups[0].status = "running";
+    planned.taskRuns[0].tasks = [
+      {
+        id: "triage",
+        groupId: "main",
+        text: "Decide needed reviewers",
+        status: "completed",
+        criteria: [{ id: "C1", text: "Reviewer plan produced", satisfied: true, evidence: [] }],
+        dependsOn: [],
+        assignmentIds: ["triage-a1"],
+        createdAt: 1,
+        updatedAt: 2,
+        completedAt: 2,
+      },
+      {
+        id: "review-security",
+        groupId: "main",
+        text: "Review security risks",
+        status: "pending",
+        criteria: [{ id: "C1", text: "Security reviewed", satisfied: false, evidence: [] }],
+        dependsOn: ["triage"],
+        assignmentIds: [],
+        createdAt: 2,
+        updatedAt: 2,
+      },
+      {
+        id: "review-tests",
+        groupId: "main",
+        text: "Review test coverage",
+        status: "pending",
+        criteria: [{ id: "C1", text: "Tests reviewed", satisfied: false, evidence: [] }],
+        dependsOn: ["triage"],
+        assignmentIds: [],
+        createdAt: 2,
+        updatedAt: 2,
+      },
+    ];
+    planned.taskRuns[0].assignments = [{
+      id: "triage-a1",
+      taskRunId: "task-run-1",
+      groupId: "main",
+      taskId: "triage",
+      agent: "delegate",
+      prompt: "Plan reviewers",
+      status: "completed",
+      createdAt: 1,
+      updatedAt: 2,
+      completedAt: 2,
+    }];
+
+    const rendered = buildTaskRunChecklistLines(planned.taskRuns[0], 20).join("\n");
+
+    expect(rendered).toContain("Review workflow");
+    expect(rendered).toContain("Review plan");
+    expect(rendered).toContain("Decide needed reviewers");
+    expect(rendered).toContain("Review security risks");
+    expect(rendered).toContain("Review test coverage");
+    expect(rendered).toContain("triage-a1");
+    expect(rendered).toContain("depends on: triage");
+  });
+
+  test("full checklist preserves declaration order across completed running and pending tasks", () => {
+    const mixed = cloneState(state);
+    mixed.taskRuns[0].tasks = [
+      { ...mixed.taskRuns[0].tasks[0], id: "completed", text: "Completed first", status: "completed", assignmentIds: [], completedAt: 2 },
+      { ...mixed.taskRuns[0].tasks[0], id: "running", text: "Running second", status: "running", assignmentIds: ["a1"] },
+      { ...mixed.taskRuns[0].tasks[0], id: "pending", text: "Pending third", status: "pending", assignmentIds: [] },
+    ];
+    mixed.taskRuns[0].assignments[0].taskId = "running";
+
+    const rendered = buildTaskRunChecklistLines(mixed.taskRuns[0], 20).join("\n");
+
+    expect(rendered.indexOf("Completed first")).toBeLessThan(rendered.indexOf("Running second"));
+    expect(rendered.indexOf("Running second")).toBeLessThan(rendered.indexOf("Pending third"));
+    expect(rendered).toContain("delegate");
+  });
+
+  test("full checklist reports hidden line count when height is limited", () => {
+    const many = cloneState(state);
+    many.taskRuns[0].tasks = Array.from({ length: 8 }, (_, index) => ({
+      ...many.taskRuns[0].tasks[0],
+      id: `task-${index + 1}`,
+      text: `Task ${index + 1}`,
+      status: index === 0 ? "completed" as const : "pending" as const,
+      assignmentIds: [],
+    }));
+    many.taskRuns[0].assignments = [];
+
+    const rendered = buildTaskRunChecklistLines(many.taskRuns[0], 5).join("\n");
+
+    expect(rendered).toContain("Task 1");
+    expect(rendered).toContain("more checklist lines");
   });
 
   test("widget component caps wide renders and still respects narrow terminal widths", () => {

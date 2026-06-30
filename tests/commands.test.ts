@@ -91,8 +91,13 @@ describe("commands", () => {
     expect(formatInspectReport(state, "a1")).toContain("Assignment: a1");
   });
 
-  test("taskRun and group inspect expose task assignment ids", () => {
-    expect(formatInspectReport(state, "task-run-1")).toContain("task · RUNNING · a1 · Do task");
+  test("taskRun and group inspect expose full checklist and task assignment ids", () => {
+    const taskRunInspect = formatInspectReport(state, "task-run-1");
+    expect(taskRunInspect).toContain("Checklist:");
+    expect(taskRunInspect).toContain("TaskRun task-run-1");
+    expect(taskRunInspect).toContain("Do task");
+    expect(taskRunInspect).toContain("a1");
+    expect(taskRunInspect).toContain("task · RUNNING · a1 · Do task");
     expect(formatInspectReport(state, "main")).toContain("task · RUNNING · a1 · Do task");
   });
 
