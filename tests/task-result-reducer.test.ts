@@ -96,6 +96,27 @@ describe("task result reducer", () => {
     expect(taskRun.status).toBe("attention");
   });
 
+  test("accepts duplicate completed evidence when every criterion is covered", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      criteriaEvidence: [
+        { criteriaIndex: 0, evidence: "Evidence one" },
+        { criteriaIndex: 1, evidence: "Evidence two" },
+        { criteriaIndex: 1, evidence: "Extra evidence two" },
+      ],
+    }, { now: 3 });
+
+    expect(result.applied).toBe(true);
+    expect(result.warnings).toContain("Duplicate criteria index 1; preserving additional evidence");
+    expect(assignment.status).toBe("completed");
+    expect(task.status).toBe("completed");
+    expect(task.criteria[1].evidence.map((evidence) => evidence.summary)).toEqual(["Evidence two", "Extra evidence two"]);
+    expect(taskRun.status).toBe("completed");
+  });
+
   test("keeps failed reports failed even when all criteria include evidence", () => {
     const fixture = setup();
     const { taskRun, assignment, task } = fixture;
@@ -218,7 +239,6 @@ describe("task result reducer", () => {
     ["empty summary", { summary: " " }, "Report summary is required"],
     ["missing criteria evidence", { criteriaEvidence: undefined }, "Report criteriaEvidence is required"],
     ["empty criteria evidence", { criteriaEvidence: [] }, "Report criteriaEvidence is required"],
-    ["duplicate criteria index", { criteriaEvidence: [{ criteriaIndex: 0, evidence: "one" }, { criteriaIndex: 0, evidence: "two" }] }, "Duplicate criteria index 0"],
     ["non-integer criteria index", { criteriaEvidence: [{ criteriaIndex: 0.5, evidence: "one" }] }, "Criterion index must be an integer"],
     ["out-of-bounds criteria index", { criteriaEvidence: [{ criteriaIndex: 2, evidence: "one" }] }, "Criteria index 2 is out of bounds"],
     ["empty evidence", { criteriaEvidence: [{ criteriaIndex: 0, evidence: " " }] }, "Evidence for criteria index 0 is required"],

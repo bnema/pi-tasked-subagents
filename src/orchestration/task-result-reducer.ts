@@ -37,9 +37,14 @@ function putTaskAttention(taskRun: TaskRunRecord, assignment: TaskAssignmentReco
   taskRun.updatedAt = timestamp;
 }
 
-function validateReport(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord | undefined, report: SubagentTaskReport): string[] {
+function validateReport(
+  taskRun: TaskRunRecord,
+  assignment: TaskAssignmentRecord | undefined,
+  report: SubagentTaskReport,
+): { errors: string[]; warnings: string[] } {
   const errors: string[] = [];
-  if (!assignment) return [`Assignment ${report.assignmentId} not found`];
+  const warnings: string[] = [];
+  if (!assignment) return { errors: [`Assignment ${report.assignmentId} not found`], warnings };
   if (report.taskRunId !== taskRun.id) errors.push(`Report taskRunId ${report.taskRunId} does not match ${taskRun.id}`);
   if (report.groupId !== assignment.groupId) errors.push(`Report groupId ${report.groupId} does not match ${assignment.groupId}`);
   if (report.taskId !== assignment.taskId) errors.push(`Report taskId ${report.taskId} does not match ${assignment.taskId}`);
@@ -48,7 +53,7 @@ function validateReport(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord
   if (!found || found.task.groupId !== assignment.groupId) {
     const groupText = assignment.groupId ? ` in group ${assignment.groupId}` : "";
     errors.push(`Task ${assignment.taskId} not found${groupText}`);
-    return errors;
+    return { errors, warnings };
   }
 
   if (report.status !== "completed" && report.status !== "attention" && report.status !== "failed") {
@@ -57,7 +62,7 @@ function validateReport(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord
   if (!report.summary?.trim()) errors.push("Report summary is required");
   if (!Array.isArray(report.criteriaEvidence) || report.criteriaEvidence.length === 0) {
     errors.push("Report criteriaEvidence is required");
-    return errors;
+    return { errors, warnings };
   }
 
   const seen = new Set<number>();
@@ -75,7 +80,7 @@ function validateReport(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord
     }
     const validatedCriteriaIndex = criteriaIndex as number;
 
-    if (seen.has(validatedCriteriaIndex)) errors.push(`Duplicate criteria index ${validatedCriteriaIndex}`);
+    if (seen.has(validatedCriteriaIndex)) warnings.push(`Duplicate criteria index ${validatedCriteriaIndex}; preserving additional evidence`);
     seen.add(validatedCriteriaIndex);
     if (validatedCriteriaIndex < 0 || validatedCriteriaIndex >= found.task.criteria.length) {
       errors.push(`Criteria index ${validatedCriteriaIndex} is out of bounds`);
@@ -114,7 +119,7 @@ function validateReport(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord
     }
   }
 
-  return errors;
+  return { errors, warnings };
 }
 
 export function applySubagentTaskReport(
@@ -141,10 +146,10 @@ export function applySubagentTaskReport(
     }
   }
 
-  const errors = validateReport(taskRun, assignment, report);
-  if (errors.length > 0) {
+  const validation = validateReport(taskRun, assignment, report);
+  if (validation.errors.length > 0) {
     putTaskAttention(taskRun, assignment, timestamp);
-    return { applied: false, errors, warnings: [] };
+    return { applied: false, errors: validation.errors, warnings: validation.warnings };
   }
 
   const found = findTask(taskRun, assignment!.taskId)!;
@@ -204,7 +209,7 @@ export function applySubagentTaskReport(
   found.task.updatedAt = timestamp;
   taskRun.artifacts.push(...artifacts);
   deriveTaskRunStatus(taskRun, timestamp);
-  return { applied: true, errors: [], warnings: [] };
+  return { applied: true, errors: [], warnings: validation.warnings };
 }
 
 function isTaskReport(value: unknown): value is SubagentTaskReport {

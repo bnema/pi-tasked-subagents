@@ -102,6 +102,30 @@ class CompletingRuntime implements SubagentRuntime {
   }
 }
 
+class DuplicateEvidenceRuntime extends CompletingRuntime {
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    const request = this.requests.find((candidate) => candidate.runId === handle.runId) ?? this.requests.at(-1);
+    const task = request?.tasks[0];
+    if (!task) return undefined;
+    return JSON.stringify({
+      taskRunId: task.taskRunId,
+      ...(task.groupId ? { groupId: task.groupId } : {}),
+      taskId: task.taskId,
+      assignmentId: task.assignmentId,
+      status: "completed",
+      summary: "completed with extra evidence",
+      criteriaEvidence: [
+        { criteriaIndex: 0, evidence: "first criterion evidence" },
+        { criteriaIndex: 1, evidence: "second criterion evidence" },
+        { criteriaIndex: 1, evidence: "additional second criterion evidence" },
+      ],
+      artifacts: [],
+      followUps: [],
+    });
+  }
+}
+
 class ControlledRuntime extends CompletingRuntime {
   private waitStartedResolve!: () => void;
   private waitResolve: ((status: RunStatus) => void) | undefined;
@@ -413,6 +437,25 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(state).toMatchObject({ version: 4, currentTaskRunId: "task-run-1" });
     expect(state.taskRuns[0].tasks[0].status).toBe("completed");
     expect(state.taskRuns[0].status).toBe("completed");
+  });
+
+  test("completed dispatch accepts duplicate criterion evidence when all criteria are covered", async () => {
+    const { controller } = controllerWith(new DuplicateEvidenceRuntime());
+
+    await controller.setTasks({
+      ...baseSetTasks,
+      tasks: [{ id: "task", group: "main", text: "Do task", criteria: ["First", "Second"], agentHint: "delegate" }],
+    });
+    await controller.awaitLastWork();
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.status).toBe("completed");
+    expect(taskRun.assignments[0].status).toBe("completed");
+    expect(taskRun.tasks[0].status).toBe("completed");
+    expect(taskRun.tasks[0].criteria[1].evidence.map((evidence) => evidence.summary)).toEqual([
+      "second criterion evidence",
+      "additional second criterion evidence",
+    ]);
   });
 
   test("setTasks appends a new task run when taskRunId is omitted", async () => {
