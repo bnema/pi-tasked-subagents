@@ -98,12 +98,14 @@ export interface SetTasksInput {
   wait?: boolean;
 }
 
-export interface PatchTaskRunInput {
+export type TaskRunPatchContent =
+  | { groups: TaskGroupInput[]; tasks?: TaskInput[] }
+  | { groups?: TaskGroupInput[]; tasks: TaskInput[] };
+
+export type PatchTaskRunInput = TaskRunPatchContent & {
   taskRunId?: string;
-  groups?: TaskGroupInput[];
-  tasks?: TaskInput[];
   wait?: boolean;
-}
+};
 
 export type TaskPatchInput = Partial<Omit<TaskInput, "id">>;
 export type TaskGroupPatchInput = Partial<Omit<TaskGroupInput, "id">>;
@@ -297,7 +299,7 @@ export interface SubagentTaskReport {
   }>;
   artifacts?: Array<{ label: string; path: string }>;
   followUps?: string[];
-  taskRunPatch?: Pick<PatchTaskRunInput, "groups" | "tasks">;
+  taskRunPatch?: TaskRunPatchContent;
 }
 
 // ──────────────────────────────────────────────

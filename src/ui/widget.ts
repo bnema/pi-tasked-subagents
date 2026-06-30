@@ -385,6 +385,7 @@ export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100):
   if (limit <= 0) return [];
   const rawLines: string[] = [];
   const append = (line: string): boolean => pushLimited(rawLines, line, limit);
+  let totalLineCount = 1;
   const progress = taskRunTaskProgress(taskRun);
   append(`${GLYPH_TASKED_SUBAGENTS} TaskRun ${taskRun.id} ${statusGlyph(taskRun.status)} ${progress.done}/${progress.total} ${shortTitle(taskRun.title || taskRun.request, SUMMARY_TITLE_WIDTH)}`);
 
@@ -393,25 +394,23 @@ export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100):
     const group = groups[groupIndex];
     const groupLast = groupIndex === groups.length - 1;
     const progressForGroup = groupProgress(taskRun, group);
-    if (!append(`${linePrefix(groupLast)}${GLYPH_GROUP} ${shortTitle(group.title, GROUP_TITLE_WIDTH)} ${statusGlyph(group.status)} ${progressForGroup.done}/${progressForGroup.total}`)) break;
+    totalLineCount += 1;
+    append(`${linePrefix(groupLast)}${GLYPH_GROUP} ${shortTitle(group.title, GROUP_TITLE_WIDTH)} ${statusGlyph(group.status)} ${progressForGroup.done}/${progressForGroup.total}`);
     const groupTasks = tasksForGroup(taskRun, group.id);
     for (let taskIndex = 0; taskIndex < groupTasks.length; taskIndex += 1) {
       const task = groupTasks[taskIndex];
       const taskLast = taskIndex === groupTasks.length - 1;
-      if (!append(checklistTaskLine(taskRun, task, groupLast, taskLast))) break;
+      totalLineCount += 1;
+      append(checklistTaskLine(taskRun, task, groupLast, taskLast));
       const assignments = assignmentsForTask(taskRun, task);
       for (const [assignmentIndex, assignment] of assignments.entries()) {
         const assignmentLast = assignmentIndex === assignments.length - 1;
-        if (!append(checklistAssignmentLine(assignment, groupLast, taskLast, assignmentLast))) break;
+        totalLineCount += 1;
+        append(checklistAssignmentLine(assignment, groupLast, taskLast, assignmentLast));
       }
     }
   }
 
-  const totalLineCount = 1 + groups.reduce((count, group) => {
-    const groupTasks = tasksForGroup(taskRun, group.id);
-    const assignmentCount = groupTasks.reduce((sum, task) => sum + assignmentsForTask(taskRun, task).length, 0);
-    return count + 1 + groupTasks.length + assignmentCount;
-  }, 0);
   if (rawLines.length < totalLineCount && rawLines.length > 0) {
     rawLines.splice(rawLines.length - 1, 1, `${GLYPH_TREE_LAST} ${totalLineCount - rawLines.length + 1} more checklist lines`);
   }

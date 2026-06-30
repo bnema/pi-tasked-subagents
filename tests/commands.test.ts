@@ -94,7 +94,7 @@ describe("commands", () => {
   test("taskRun and group inspect expose full checklist and task assignment ids", () => {
     const taskRunInspect = formatInspectReport(state, "task-run-1");
     expect(taskRunInspect).toContain("Checklist:");
-    expect(taskRunInspect).toContain("TaskRun task-run-1");
+    expect(taskRunInspect).toContain("TaskRun: task-run-1");
     expect(taskRunInspect).toContain("Do task");
     expect(taskRunInspect).toContain("a1");
     expect(taskRunInspect).toContain("task · RUNNING · a1 · Do task");

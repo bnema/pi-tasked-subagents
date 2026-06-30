@@ -150,6 +150,22 @@ describe("task result reducer", () => {
     expect(task.status).toBe("attention");
   });
 
+  test("rejects invalid taskRunPatch task expansion modes before controller patching", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+    task.expansionMode = "append_tasks";
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      taskRunPatch: { tasks: [{ id: "next", text: "Next task", criteria: ["Done"], expansionMode: "unsupported" as never }] },
+    }, { now: 3 });
+
+    expect(result.applied).toBe(false);
+    expect(result.errors).toContain("Report taskRunPatch.tasks entry 0 expansionMode must be append_tasks");
+    expect(assignment.status).toBe("attention");
+    expect(task.status).toBe("attention");
+  });
+
   test("keeps failed reports failed even when all criteria include evidence", () => {
     const fixture = setup();
     const { taskRun, assignment, task } = fixture;

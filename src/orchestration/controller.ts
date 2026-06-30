@@ -51,6 +51,7 @@ import {
 import { applySubagentTaskReport, parseTaskReport } from "./task-result-reducer.js";
 import { formatAttachReport } from "./commands.js";
 import { normalizeTargetId } from "./ids.js";
+import { maxDispatchRunCounter, maxTaskRunCounter } from "./run-counters.js";
 import { applyTaskRunPatchMutable, taskRunToInput } from "./task-run-patch.js";
 
 export type { AttachResult, EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, PatchTaskRunInput, PatchTaskRunResult, SetTasksInput, SetTasksResult } from "../types.js";
@@ -115,13 +116,6 @@ function controlStatusForAssignment(
   if (targetStatus === "paused") return currentStatus === "queued" || currentStatus === "running" ? "paused" : undefined;
   if (targetStatus === "cancelled") return finalAssignmentStatus(currentStatus) ? undefined : "cancelled";
   return undefined;
-}
-
-function maxTaskRunCounter(taskRuns: TaskRunRecord[]): number {
-  return taskRuns.reduce((max, taskRun) => {
-    const match = /^task-run-(\d+)$/u.exec(taskRun.id);
-    return match ? Math.max(max, Number(match[1])) : max;
-  }, 0);
 }
 
 function progressSignature(snapshot: RunProgressSnapshot): string {
@@ -263,7 +257,7 @@ export class TaskedSubagentsController {
     this.scheduledDispatches.clear();
     this.lastDispatchWork = Promise.resolve();
     this.stateEpoch += 1;
-    this.dispatchRunCounter = 0;
+    this.dispatchRunCounter = Math.max(this.dispatchRunCounter, maxDispatchRunCounter(this.state.taskRuns));
   }
 
   async awaitLastWork(): Promise<void> {

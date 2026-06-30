@@ -135,7 +135,14 @@ function validateReport(
       if (patch.tasks !== undefined && !Array.isArray(patch.tasks)) errors.push("Report taskRunPatch.tasks must be an array");
       if (Array.isArray(patch.tasks)) {
         for (const [taskIndex, task] of patch.tasks.entries()) {
-          if (!task || typeof task !== "object" || Array.isArray(task)) errors.push(`Report taskRunPatch.tasks entry ${taskIndex} must be an object`);
+          if (!task || typeof task !== "object" || Array.isArray(task)) {
+            errors.push(`Report taskRunPatch.tasks entry ${taskIndex} must be an object`);
+            continue;
+          }
+          const taskPatch = task as Record<string, unknown>;
+          if (taskPatch.expansionMode !== undefined && taskPatch.expansionMode !== "append_tasks") {
+            errors.push(`Report taskRunPatch.tasks entry ${taskIndex} expansionMode must be append_tasks`);
+          }
         }
       }
     }

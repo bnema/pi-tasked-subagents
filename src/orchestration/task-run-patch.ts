@@ -2,7 +2,7 @@
 // Task-run patch application helpers
 // ──────────────────────────────────────────────
 
-import type { PatchTaskRunInput, SetTasksInput, TaskGroupRecord, TaskInput, TaskRecord, TaskRunRecord } from "../types.js";
+import type { SetTasksInput, TaskGroupRecord, TaskInput, TaskRecord, TaskRunPatchContent, TaskRunRecord } from "../types.js";
 import { normalizeTaskRunInput, validateTaskRunInput } from "../state/task-run-validation.js";
 import { normalizeTargetId } from "./ids.js";
 import { deriveTaskRunStatus } from "./task-scheduler.js";
@@ -56,9 +56,12 @@ export function taskRunToInput(taskRun: TaskRunRecord): SetTasksInput {
 
 export function applyTaskRunPatchMutable(
   taskRun: TaskRunRecord,
-  input: Pick<PatchTaskRunInput, "groups" | "tasks">,
+  input: TaskRunPatchContent,
   timestamp: number,
 ): ApplyTaskRunPatchResult {
+  if ("expansionMode" in input) {
+    return { patched: false, errors: ["Patch expansionMode is not supported; set expansionMode on appended tasks"], dispatchScheduled: false };
+  }
   if ((!input.groups || input.groups.length === 0) && (!input.tasks || input.tasks.length === 0)) {
     return { patched: false, errors: ["Patch requires groups or tasks"], dispatchScheduled: false };
   }
@@ -81,11 +84,13 @@ export function applyTaskRunPatchMutable(
   const candidate = taskRunToInput(taskRun);
   candidate.groups ??= [];
   let updatedExistingGroup = false;
+  const patchedGroupIds = new Set<string>();
   for (const groupPatch of input.groups ?? []) {
     const groupId = normalizeTargetId(groupPatch.id);
     const existingIndex = groupId ? candidate.groups.findIndex((group) => group.id === groupId) : -1;
     if (existingIndex >= 0) {
       updatedExistingGroup = true;
+      patchedGroupIds.add(candidate.groups[existingIndex].id);
       candidate.groups[existingIndex] = { ...candidate.groups[existingIndex], ...groupPatch, id: candidate.groups[existingIndex].id };
     } else candidate.groups.push(groupPatch);
   }
@@ -101,6 +106,7 @@ export function applyTaskRunPatchMutable(
   for (const normalizedGroup of normalized.taskRun.groups) {
     const existing = taskRun.groups.find((group) => group.id === normalizedGroup.id);
     if (existing) {
+      if (!patchedGroupIds.has(normalizedGroup.id)) continue;
       existing.title = normalizedGroup.title;
       existing.dependsOn = normalizedGroup.dependsOn;
       existing.maxConcurrency = normalizedGroup.maxConcurrency;

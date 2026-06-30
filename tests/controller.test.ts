@@ -695,12 +695,28 @@ describe("TaskedSubagentsController TaskRun public API", () => {
 
     await controller.setTasks(baseSetTasks);
     await controller.awaitLastWork();
-    const beforePatch = controller.getState().taskRuns[0];
+    const beforePatch = structuredClone(controller.getState().taskRuns[0]);
 
     await expect(controller.patchTaskRun({
       taskRunId: "task-run-1",
       tasks: [{ id: "task", group: "main", text: "Replace task", criteria: ["Replaced"] }],
     })).resolves.toMatchObject({ patched: false, dispatchScheduled: false, errors: ["Task task already exists; use edit_task to modify existing tasks"] });
+
+    expect(controller.getState().taskRuns[0]).toEqual(beforePatch);
+  });
+
+  test("patchTaskRun rejects unsupported top-level expansionMode before mutating", async () => {
+    const { controller } = controllerWith(new CompletingRuntime());
+
+    await controller.setTasks(baseSetTasks);
+    await controller.awaitLastWork();
+    const beforePatch = structuredClone(controller.getState().taskRuns[0]);
+
+    await expect(controller.patchTaskRun({
+      taskRunId: "task-run-1",
+      expansionMode: "append_tasks",
+      tasks: [{ id: "review", group: "main", text: "Review task", criteria: ["Reviewed"] }],
+    } as never)).resolves.toMatchObject({ patched: false, dispatchScheduled: false, errors: ["Patch expansionMode is not supported; set expansionMode on appended tasks"] });
 
     expect(controller.getState().taskRuns[0]).toEqual(beforePatch);
   });
@@ -716,6 +732,8 @@ describe("TaskedSubagentsController TaskRun public API", () => {
       taskRunId: "task-run-1",
       tasks: [{ id: "review", group: "main", text: "Review after task", criteria: ["Reviewed"], dependsOn: ["task"] }],
     })).resolves.toMatchObject({ patched: true, taskRunId: "task-run-1", dispatchScheduled: true });
+
+    expect(runtime.requests.map((request) => request.tasks.map((task) => task.taskId))).toEqual([["task"]]);
 
     runtime.releaseResult();
     await controller.awaitLastWork();
@@ -991,6 +1009,38 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     await expect(controller.stopRun("a1")).resolves.toBe(false);
 
     expect(runtime.stopped).toEqual([]);
+  });
+
+  test("restoreState seeds dispatch run counter from restored assignment run ids", async () => {
+    const runtime = new CompletingRuntime();
+    const { controller } = controllerWith(runtime);
+    const restored: TaskedSubagentsState = {
+      version: 4,
+      currentTaskRunId: "task-run-1",
+      updatedAt: 1,
+      taskRuns: [{
+        id: "task-run-1",
+        title: "Task run",
+        request: "Ship it",
+        context: "Context",
+        status: "running",
+        groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 2, createdAt: 1, updatedAt: 1 }],
+        tasks: [
+          { id: "done", groupId: "main", text: "Done task", status: "completed", criteria: [{ id: "C1", text: "Done", satisfied: true, evidence: [] }], dependsOn: [], assignmentIds: ["old-a1"], createdAt: 1, updatedAt: 1, completedAt: 1 },
+          { id: "next", groupId: "main", text: "Next task", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+        ],
+        assignments: [{ id: "old-a1", taskRunId: "task-run-1", groupId: "main", taskId: "done", agent: "delegate", prompt: "done", status: "completed", runId: "task-run-1-123-7", createdAt: 1, updatedAt: 1, completedAt: 1 }],
+        artifacts: [],
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    };
+    controller.restoreState(restored);
+
+    await controller.dispatchReady({ taskRunId: "task-run-1" });
+    await controller.awaitLastWork();
+
+    expect(runtime.requests[0].runId).toMatch(/-8$/u);
   });
 
   test("restoreState fences in-flight dispatch results from restored state", async () => {

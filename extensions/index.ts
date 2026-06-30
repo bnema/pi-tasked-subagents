@@ -319,12 +319,10 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             text = "patch_task_run requires groups or tasks.";
             break;
           }
-          const patched = await controller.patchTaskRun({
-            taskRunId: params.taskRunId,
-            groups: params.groups,
-            tasks: params.tasks,
-            wait: params.wait,
-          }, ctx);
+          const patchInput = params.tasks
+            ? { taskRunId: params.taskRunId, groups: params.groups, tasks: params.tasks, wait: params.wait }
+            : { taskRunId: params.taskRunId, groups: params.groups!, wait: params.wait };
+          const patched = await controller.patchTaskRun(patchInput, ctx);
           text = patched.patched
             ? params.wait && patched.dispatchScheduled
               ? `Patched task run ${patched.taskRunId}; waited for new task assignments to finish.\n\n${(await controller.attachTarget(patched.taskRunId, ctx)).report}`
