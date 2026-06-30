@@ -123,6 +123,7 @@ function normalizeTask(raw: unknown): TaskRecord | undefined {
     outputMode: input.outputMode === "json" ? "json" : input.outputMode === "text" ? "text" : undefined,
     outputSchema: optionalString(input.outputSchema),
     when: optionalString(input.when),
+    expansionMode: input.expansionMode === "append_tasks" ? "append_tasks" : undefined,
     continuation: optionalString(input.continuation),
     createdAt,
     updatedAt,

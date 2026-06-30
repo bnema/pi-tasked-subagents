@@ -107,6 +107,15 @@ describe("task-run state store", () => {
     expect(deserializeState(serialized)).toEqual(currentState);
   });
 
+  test("preserves expansion mode when restoring task-run state", () => {
+    const expandableState: TaskedSubagentsState = structuredClone(currentState);
+    expandableState.taskRuns[0].tasks[0].expansionMode = "append_tasks";
+
+    const restored = deserializeState(serializeState(expandableState));
+
+    expect(restored.taskRuns[0].tasks[0].expansionMode).toBe("append_tasks");
+  });
+
   test("resets serialized v3 state to empty current-version state", () => {
     const serialized = JSON.stringify({ version: 3, plans: [{ id: "plan-1" }], currentPlanId: "plan-1", updatedAt: 1 });
 
