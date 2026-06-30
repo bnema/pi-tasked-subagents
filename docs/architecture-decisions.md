@@ -46,7 +46,7 @@ Removed public concepts include:
 
 **Rationale.** Result-file delivery gives the parent controller one authoritative channel for subagent output. It is easier to test and avoids races between stdout, custom session entries, and direct parent-state mutation.
 
-## Task acceptance and dispatch
+## Task acceptance, patching, and dispatch
 
 **Decision.** The primary flow is tool-driven:
 
@@ -56,9 +56,12 @@ Removed public concepts include:
 4. the controller stores or replaces the `TaskRun`;
 5. the scheduler creates ready task assignments;
 6. the launcher runs the assignments;
-7. the reducer applies task reports and evidence.
+7. the reducer applies task reports and evidence;
+8. the agent calls `patch_task_run`, or an expansion-enabled task returns `taskRunPatch`, when newly discovered tasks should be appended to the same visible TaskRun.
 
-**Validation.** A task run is rejected when it lacks tasks, lacks task-run metadata, contains groups without tasks, tasks without criteria, duplicate ids, unknown dependencies, invalid retry/concurrency settings, or dependency cycles.
+**Validation.** A task run is rejected when it lacks tasks, lacks task-run metadata, contains groups without tasks, tasks without criteria, duplicate ids, unknown dependencies, invalid retry/concurrency settings, invalid expansion modes, or dependency cycles.
+
+TaskRun patches are append-first. A patch may add new groups or new task ids, but it cannot silently replace an existing task. Existing task changes use `edit_task` so assignment history is handled explicitly.
 
 ## Scheduler semantics
 
@@ -73,7 +76,7 @@ Removed public concepts include:
 
 **Rationale.** Groups remain scheduling-only product structure, while task assignments are the concrete subagent work units.
 
-## Task report and evidence semantics
+## Task report, evidence, and expansion semantics
 
 **Decision.** Subagents return `SubagentTaskReport` JSON for exactly one assignment.
 
@@ -88,8 +91,11 @@ Required report fields:
 - `criteriaEvidence`
 - optional `artifacts`
 - optional `followUps`
+- optional `taskRunPatch` only when the task has `expansionMode: "append_tasks"` and the report status is `completed`
 
 **Rationale.** Criterion-level evidence keeps completion auditable. Optional group ids let ungrouped tasks report cleanly without placeholder values.
+
+Expansion is visible by construction. A triage task can append new groups or tasks, but new groups are stored in `taskRun.groups` and new tasks are stored in `taskRun.tasks` before any subagent assignment runs for the new tasks. Duplicate task ids, malformed patch arrays, malformed patch entries, unknown dependencies, and dependency cycles are rejected safely.
 
 ## Public API actions
 
@@ -98,10 +104,12 @@ Required report fields:
 - `set_tasks`
 - `edit_task`
 - `edit_group`
+- `patch_task_run`
 - `dispatch`
 - `status`
 - `inspect`
 - `result`
+- `attach`
 - `continue`
 - `resolve`
 - `stop`
@@ -115,7 +123,7 @@ Public target ids are `taskRunId`, `groupId`, `taskId`, and `assignmentId`.
 
 ## UI and messages
 
-**Decision.** UI surfaces show task runs, groups, tasks/subtasks, assignments, and criteria progress. Completion/attention/failure messages identify the task run and assignment run rather than presenting generic background execution.
+**Decision.** UI surfaces show task runs, groups, tasks, assignments, and criteria progress. Completion/attention/failure messages identify the task run and assignment run rather than presenting generic background execution. The compact widget prioritizes active progress, while `inspect` includes a full checklist view for the selected TaskRun.
 
 **Rationale.** Status output should reinforce the product model and make recovery actions obvious.
 
