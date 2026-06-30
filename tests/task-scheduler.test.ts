@@ -181,6 +181,19 @@ describe("task scheduler", () => {
     expect(prompt).toContain("Omit groupId only when this prompt has no Group id line.");
   });
 
+  test("append expansion prompt does not suggest an empty rejected taskRunPatch", () => {
+    const taskRun = makeTaskRun({
+      tasks: [{ id: "triage", text: "Plan follow-up tasks", criteria: ["Plan done"], expansionMode: "append_tasks" }],
+    });
+
+    const prompt = buildTaskAssignmentPrompt(taskRun, undefined, task(taskRun, "triage"));
+
+    expect(prompt).toContain("taskRunPatch");
+    expect(prompt).toContain("new-task-id");
+    expect(prompt).not.toContain('"tasks": []');
+    expect(prompt).not.toContain('"groups": []');
+  });
+
   test("ungrouped tasks obey task dependencies and task-run maxConcurrency", () => {
     const taskRun = makeTaskRun({
       maxConcurrency: 2,

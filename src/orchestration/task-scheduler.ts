@@ -172,7 +172,11 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     criteriaEvidence: [{ criteriaIndex: 0, evidence: "specific evidence" }],
     artifacts: [{ label: "optional", path: "optional/path" }],
     followUps: ["optional blocker or follow-up"],
-    ...(task.expansionMode === "append_tasks" ? { taskRunPatch: { groups: [], tasks: [] } } : {}),
+    ...(task.expansionMode === "append_tasks" ? {
+      taskRunPatch: {
+        tasks: [{ id: "new-task-id", text: "new visible task", criteria: ["specific completion criterion"] }],
+      },
+    } : {}),
   };
 
   return [
