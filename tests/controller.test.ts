@@ -651,7 +651,43 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(taskRun.assignments.some((assignment) => assignment.id === originalAssignmentId)).toBe(true);
     expect(taskRun.tasks[0]).toMatchObject({ id: "task", status: "completed", assignmentIds: [originalAssignmentId] });
     expect(taskRun.tasks[1]).toMatchObject({ id: "review", status: "completed" });
-    expect(runtime.requests.at(-1)?.tasks.map((task) => task.taskId)).toEqual(["review"]);
+    expect(runtime.requests.map((request) => request.tasks.map((task) => task.taskId))).toEqual([["task"], ["review"]]);
+  });
+
+  test("patchTaskRun schedules existing tasks after existing group dependency changes", async () => {
+    const runtime = new CompletingRuntime();
+    const { controller } = controllerWith(runtime);
+    const blockedState: TaskedSubagentsState = {
+      version: 4,
+      currentTaskRunId: "task-run-1",
+      updatedAt: 1,
+      taskRuns: [{
+        id: "task-run-1",
+        title: "Task run",
+        request: "Ship the feature",
+        context: "Repo context",
+        status: "attention",
+        groups: [
+          { id: "gate", title: "Gate", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+          { id: "main", title: "Main", status: "pending", dependsOn: ["gate"], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+        ],
+        tasks: [
+          { id: "gate-task", groupId: "gate", text: "Gate task", status: "attention", criteria: [{ id: "C1", text: "Gate done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+          { id: "main-task", groupId: "main", text: "Main task", status: "pending", criteria: [{ id: "C1", text: "Main done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+        ],
+        assignments: [],
+        artifacts: [],
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    };
+    controller.restoreState(blockedState);
+
+    await expect(controller.patchTaskRun({ taskRunId: "task-run-1", groups: [{ id: "main", dependsOn: [] }], wait: true }))
+      .resolves.toMatchObject({ patched: true, dispatchScheduled: true });
+
+    expect(runtime.requests.map((request) => request.tasks.map((task) => task.taskId))).toEqual([["main-task"]]);
+    expect(controller.getState().taskRuns[0].tasks.find((task) => task.id === "main-task")?.status).toBe("completed");
   });
 
   test("patchTaskRun rejects duplicate task ids instead of replacing existing tasks", async () => {

@@ -80,11 +80,14 @@ export function applyTaskRunPatchMutable(
 
   const candidate = taskRunToInput(taskRun);
   candidate.groups ??= [];
+  let updatedExistingGroup = false;
   for (const groupPatch of input.groups ?? []) {
     const groupId = normalizeTargetId(groupPatch.id);
     const existingIndex = groupId ? candidate.groups.findIndex((group) => group.id === groupId) : -1;
-    if (existingIndex >= 0) candidate.groups[existingIndex] = { ...candidate.groups[existingIndex], ...groupPatch, id: candidate.groups[existingIndex].id };
-    else candidate.groups.push(groupPatch);
+    if (existingIndex >= 0) {
+      updatedExistingGroup = true;
+      candidate.groups[existingIndex] = { ...candidate.groups[existingIndex], ...groupPatch, id: candidate.groups[existingIndex].id };
+    } else candidate.groups.push(groupPatch);
   }
   candidate.tasks.push(...(input.tasks ?? []));
 
@@ -113,11 +116,12 @@ export function applyTaskRunPatchMutable(
     taskRun.tasks.push(normalizedTask);
   }
 
-  if (newTaskIds.size > 0) {
+  const dispatchScheduled = newTaskIds.size > 0 || updatedExistingGroup;
+  if (dispatchScheduled) {
     taskRun.status = "running";
     taskRun.completedAt = undefined;
   }
   taskRun.updatedAt = timestamp;
   deriveTaskRunStatus(taskRun, timestamp);
-  return { patched: true, errors: [], dispatchScheduled: newTaskIds.size > 0 };
+  return { patched: true, errors: [], dispatchScheduled };
 }
