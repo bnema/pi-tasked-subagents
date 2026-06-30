@@ -30,7 +30,6 @@ import type {
   SubagentTaskReport,
   TaskAssignmentRecord,
   TaskGroupRecord,
-  TaskInput,
   TaskRecord,
   TaskRunRecord,
   TaskedSubagentsState,
@@ -51,6 +50,8 @@ import {
 } from "./task-scheduler.js";
 import { applySubagentTaskReport, parseTaskReport } from "./task-result-reducer.js";
 import { formatAttachReport } from "./commands.js";
+import { normalizeTargetId } from "./ids.js";
+import { applyTaskRunPatchMutable, taskRunToInput } from "./task-run-patch.js";
 
 export type { AttachResult, EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, PatchTaskRunInput, PatchTaskRunResult, SetTasksInput, SetTasksResult } from "../types.js";
 
@@ -114,12 +115,6 @@ function controlStatusForAssignment(
   if (targetStatus === "paused") return currentStatus === "queued" || currentStatus === "running" ? "paused" : undefined;
   if (targetStatus === "cancelled") return finalAssignmentStatus(currentStatus) ? undefined : "cancelled";
   return undefined;
-}
-
-function normalizeTargetId(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
 }
 
 function maxTaskRunCounter(taskRuns: TaskRunRecord[]): number {
@@ -197,47 +192,6 @@ type MutableTarget =
 
 function recoverableTaskStatus(status: string): boolean {
   return status === "attention" || status === "failed" || status === "blocked" || status === "cancelled";
-}
-
-function taskToInput(task: TaskRecord): TaskInput {
-  return {
-    id: task.id,
-    group: task.groupId,
-    text: task.text,
-    criteria: task.criteria.map((criterion) => criterion.text),
-    dependsOn: task.dependsOn,
-    agentHint: task.agentHint,
-    filesHint: task.filesHint,
-    cwd: task.cwd,
-    retries: task.retries,
-    outputMode: task.outputMode,
-    outputSchema: task.outputSchema,
-    when: task.when,
-    expansionMode: task.expansionMode,
-  };
-}
-
-function groupToInput(group: TaskGroupRecord): NonNullable<SetTasksInput["groups"]>[number] {
-  return {
-    id: group.id,
-    title: group.title,
-    dependsOn: group.dependsOn,
-    maxConcurrency: group.maxConcurrency,
-    agentHint: group.agentHint,
-    filesHint: group.filesHint,
-  };
-}
-
-function taskRunToInput(taskRun: TaskRunRecord): SetTasksInput {
-  return {
-    taskRunId: taskRun.id,
-    title: taskRun.title,
-    request: taskRun.request,
-    context: taskRun.context,
-    groups: taskRun.groups.map(groupToInput),
-    tasks: taskRun.tasks.map(taskToInput),
-    maxConcurrency: taskRun.maxConcurrency,
-  };
 }
 
 function assignmentResolutionLines(taskRun: TaskRunRecord, task: TaskRecord): string[] {
@@ -644,78 +598,10 @@ export class TaskedSubagentsController {
     return candidate;
   }
 
-  private applyTaskRunPatchMutable(
-    taskRun: TaskRunRecord,
-    input: Pick<PatchTaskRunInput, "groups" | "tasks">,
-    timestamp: number,
-  ): { patched: boolean; errors: string[]; dispatchScheduled: boolean } {
-    if ((!input.groups || input.groups.length === 0) && (!input.tasks || input.tasks.length === 0)) {
-      return { patched: false, errors: ["Patch requires groups or tasks"], dispatchScheduled: false };
-    }
-
-    const errors: string[] = [];
-    const existingTaskIds = new Set(taskRun.tasks.map((task) => task.id));
-    const newTaskIds = new Set<string>();
-    for (const [index, task] of (input.tasks ?? []).entries()) {
-      const taskId = normalizeTargetId(task.id);
-      if (!taskId) {
-        errors.push(`Patch task ${index + 1} id is required`);
-        continue;
-      }
-      if (existingTaskIds.has(taskId)) errors.push(`Task ${taskId} already exists; use edit_task to modify existing tasks`);
-      if (newTaskIds.has(taskId)) errors.push(`Duplicate patch task id: ${taskId}`);
-      newTaskIds.add(taskId);
-    }
-    if (errors.length > 0) return { patched: false, errors, dispatchScheduled: false };
-
-    const candidate = taskRunToInput(taskRun);
-    candidate.groups ??= [];
-    for (const groupPatch of input.groups ?? []) {
-      const groupId = normalizeTargetId(groupPatch.id);
-      const existingIndex = groupId ? candidate.groups.findIndex((group) => group.id === groupId) : -1;
-      if (existingIndex >= 0) candidate.groups[existingIndex] = { ...candidate.groups[existingIndex], ...groupPatch, id: candidate.groups[existingIndex].id };
-      else candidate.groups.push(groupPatch);
-    }
-    candidate.tasks.push(...(input.tasks ?? []));
-
-    const validationErrors = validateTaskRunInput(candidate);
-    if (validationErrors.length > 0) return { patched: false, errors: validationErrors, dispatchScheduled: false };
-
-    const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
-    if (!normalized.taskRun) return { patched: false, errors: normalized.errors, dispatchScheduled: false };
-
-    const normalizedGroupsById = new Map(normalized.taskRun.groups.map((group) => [group.id, group]));
-    for (const normalizedGroup of normalized.taskRun.groups) {
-      const existing = taskRun.groups.find((group) => group.id === normalizedGroup.id);
-      if (existing) {
-        existing.title = normalizedGroup.title;
-        existing.dependsOn = normalizedGroup.dependsOn;
-        existing.maxConcurrency = normalizedGroup.maxConcurrency;
-        existing.agentHint = normalizedGroup.agentHint;
-        existing.filesHint = normalizedGroup.filesHint;
-        existing.updatedAt = timestamp;
-      } else taskRun.groups.push(normalizedGroup);
-    }
-    taskRun.groups = taskRun.groups.filter((group) => normalizedGroupsById.has(group.id));
-
-    for (const normalizedTask of normalized.taskRun.tasks) {
-      if (!newTaskIds.has(normalizedTask.id)) continue;
-      taskRun.tasks.push(normalizedTask);
-    }
-
-    if (newTaskIds.size > 0) {
-      taskRun.status = "running";
-      taskRun.completedAt = undefined;
-    }
-    taskRun.updatedAt = timestamp;
-    deriveTaskRunStatus(taskRun, timestamp);
-    return { patched: true, errors: [], dispatchScheduled: newTaskIds.size > 0 };
-  }
-
   private patchTaskRunMutable(input: PatchTaskRunInput, ctx?: ExtensionContext): PatchTaskRunResult {
     const taskRun = this.resolveTaskRunMutable(input.taskRunId);
     if (!taskRun) return { patched: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
-    const result = this.applyTaskRunPatchMutable(taskRun, input, Date.now());
+    const result = applyTaskRunPatchMutable(taskRun, input, Date.now());
     if (!result.patched) return { patched: false, taskRunId: taskRun.id, errors: result.errors, dispatchScheduled: false };
     this.persistState();
     this.updateUI(ctx ?? this.lastContext);
@@ -933,7 +819,7 @@ export class TaskedSubagentsController {
           expectedAssignmentId: assignment.id,
         });
         if (applied.applied && report.taskRunPatch) {
-          const patchResult = this.applyTaskRunPatchMutable(taskRun, report.taskRunPatch, timestamp);
+          const patchResult = applyTaskRunPatchMutable(taskRun, report.taskRunPatch, timestamp);
           if (!patchResult.patched) {
             const task = taskRun.tasks.find((candidate) => candidate.id === assignment.taskId);
             assignment.status = "attention";

@@ -354,6 +354,10 @@ function formatAssignmentDetail(taskRun: TaskRunRecord, assignment: TaskAssignme
   const lines = [`Assignment: ${assignment.id}`, `  status: ${statusLabel(assignment.status)}`, `  taskRun: ${taskRun.id} · ${taskRun.title}`, assignment.groupId ? `  group: ${assignment.groupId}` : undefined, `  task: ${assignment.taskId}`, `  agent: ${assignment.agent}`]
     .filter((line): line is string => Boolean(line));
   if (assignment.result?.summary) lines.push(`  result: ${assignment.result.summary}`);
+  if (assignment.result?.followUps.length) {
+    lines.push("", "Follow-ups:");
+    for (const followUp of assignment.result.followUps) lines.push(`- ${followUp}`);
+  }
   if (assignment.launchRef?.resultPath) lines.push(`  result path: ${assignment.launchRef.resultPath}`);
   return lines.join("\n");
 }

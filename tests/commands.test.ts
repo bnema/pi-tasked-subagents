@@ -121,6 +121,26 @@ describe("commands", () => {
     expect(formatResultReport(state, "task-run-1")).toContain("Assignment: a1");
   });
 
+  test("result report exposes assignment follow-ups", () => {
+    const withFollowUps = structuredClone(state);
+    withFollowUps.taskRuns[0].assignments[0].status = "attention";
+    withFollowUps.taskRuns[0].assignments[0].result = {
+      assignmentId: "a1",
+      status: "attention",
+      summary: "Patch rejected",
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: ["Patch task 1 id is required", "Retry with a valid task id"],
+      createdAt: 1,
+    };
+
+    const report = formatResultReport(withFollowUps, "a1");
+
+    expect(report).toContain("Follow-ups:");
+    expect(report).toContain("- Patch task 1 id is required");
+    expect(report).toContain("- Retry with a valid task id");
+  });
+
   test("result target resolution refuses ambiguous taskRun and group targets", () => {
     const multi = structuredClone(state);
     multi.taskRuns[0].tasks.push({
