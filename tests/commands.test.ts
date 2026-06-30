@@ -163,6 +163,7 @@ describe("commands", () => {
     expect(help).toContain("set_tasks");
     expect(help).toContain("edit_task");
     expect(help).toContain("edit_group");
+    expect(help).toContain("patch_task_run");
     expect(help).toContain("resolve");
     expect(help).not.toContain("replace_plan");
     expect(help).not.toContain("edit_plan");

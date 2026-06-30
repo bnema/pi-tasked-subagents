@@ -96,6 +96,13 @@ export interface SetTasksInput {
   wait?: boolean;
 }
 
+export interface PatchTaskRunInput {
+  taskRunId?: string;
+  groups?: TaskGroupInput[];
+  tasks?: TaskInput[];
+  wait?: boolean;
+}
+
 export type TaskPatchInput = Partial<Omit<TaskInput, "id">>;
 export type TaskGroupPatchInput = Partial<Omit<TaskGroupInput, "id">>;
 
@@ -132,6 +139,13 @@ export interface EditGroupResult {
   edited: boolean;
   taskRunId?: string;
   groupId?: string;
+  errors: string[];
+  dispatchScheduled: boolean;
+}
+
+export interface PatchTaskRunResult {
+  patched: boolean;
+  taskRunId?: string;
   errors: string[];
   dispatchScheduled: boolean;
 }

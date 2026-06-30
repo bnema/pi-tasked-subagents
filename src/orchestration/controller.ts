@@ -19,6 +19,8 @@ import type {
   EditGroupResult,
   EditTaskInput,
   EditTaskResult,
+  PatchTaskRunInput,
+  PatchTaskRunResult,
   RunProgressSnapshot,
   RunStatus,
   SetTasksInput,
@@ -50,7 +52,7 @@ import {
 import { applySubagentTaskReport, parseTaskReport } from "./task-result-reducer.js";
 import { formatAttachReport } from "./commands.js";
 
-export type { AttachResult, EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, SetTasksInput, SetTasksResult } from "../types.js";
+export type { AttachResult, EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, PatchTaskRunInput, PatchTaskRunResult, SetTasksInput, SetTasksResult } from "../types.js";
 
 export interface DispatchOptions {
   maxConcurrency?: number;
@@ -285,6 +287,7 @@ export class TaskedSubagentsController {
   private readonly runProgressSignatures = new Map<string, string>();
   private readonly liveRunIds = new Set<string>();
   private stateEpoch = 0;
+  private dispatchRunCounter = 0;
 
   constructor(pi: ExtensionAPI, options?: TaskedSubagentsControllerOptions) {
     this.pi = pi;
@@ -304,6 +307,7 @@ export class TaskedSubagentsController {
     this.scheduledDispatches.clear();
     this.lastDispatchWork = Promise.resolve();
     this.stateEpoch += 1;
+    this.dispatchRunCounter = 0;
   }
 
   async awaitLastWork(): Promise<void> {
@@ -384,6 +388,16 @@ export class TaskedSubagentsController {
     return result;
   }
 
+  async patchTaskRun(input: PatchTaskRunInput, ctx?: ExtensionContext): Promise<PatchTaskRunResult> {
+    if (ctx) this.lastContext = ctx;
+    const result = await this.lock.withLock(() => this.patchTaskRunMutable(input, ctx));
+    if (result.patched && result.dispatchScheduled && result.taskRunId) {
+      const work = this.scheduleDispatch(result.taskRunId, ctx);
+      if (input.wait) await work;
+    }
+    return result;
+  }
+
   async editGroup(input: EditGroupInput, ctx?: ExtensionContext): Promise<EditGroupResult> {
     if (ctx) this.lastContext = ctx;
     const result = await this.lock.withLock(() => this.editGroupMutable(input, ctx));
@@ -416,7 +430,7 @@ export class TaskedSubagentsController {
           this.updateUI(options.ctx ?? this.lastContext);
           return undefined;
         }
-        const runId = `${taskRun.id}-${Date.now()}`;
+        const runId = this.nextDispatchRunId(taskRun.id);
         return { taskRunId: taskRun.id, runId, title: taskRun.title, maxConcurrency: taskRun.maxConcurrency, assignments: scheduled.assignments };
       });
 
@@ -612,6 +626,11 @@ export class TaskedSubagentsController {
     }
   }
 
+  private nextDispatchRunId(taskRunId: string): string {
+    this.dispatchRunCounter += 1;
+    return `${taskRunId}-${Date.now()}-${this.dispatchRunCounter}`;
+  }
+
   private nextTaskRunId(): string {
     let counter = this.taskRunCounter;
     let candidate: string;
@@ -621,6 +640,75 @@ export class TaskedSubagentsController {
     } while (this.state.taskRuns.some((taskRun) => taskRun.id === candidate));
     this.taskRunCounter = counter;
     return candidate;
+  }
+
+  private patchTaskRunMutable(input: PatchTaskRunInput, ctx?: ExtensionContext): PatchTaskRunResult {
+    const taskRun = this.resolveTaskRunMutable(input.taskRunId);
+    if (!taskRun) return { patched: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
+    if ((!input.groups || input.groups.length === 0) && (!input.tasks || input.tasks.length === 0)) {
+      return { patched: false, taskRunId: taskRun.id, errors: ["Patch requires groups or tasks"], dispatchScheduled: false };
+    }
+
+    const errors: string[] = [];
+    const existingTaskIds = new Set(taskRun.tasks.map((task) => task.id));
+    const newTaskIds = new Set<string>();
+    for (const [index, task] of (input.tasks ?? []).entries()) {
+      const taskId = normalizeTargetId(task.id);
+      if (!taskId) {
+        errors.push(`Patch task ${index + 1} id is required`);
+        continue;
+      }
+      if (existingTaskIds.has(taskId)) errors.push(`Task ${taskId} already exists; use edit_task to modify existing tasks`);
+      if (newTaskIds.has(taskId)) errors.push(`Duplicate patch task id: ${taskId}`);
+      newTaskIds.add(taskId);
+    }
+    if (errors.length > 0) return { patched: false, taskRunId: taskRun.id, errors, dispatchScheduled: false };
+
+    const candidate = taskRunToInput(taskRun);
+    candidate.groups ??= [];
+    for (const groupPatch of input.groups ?? []) {
+      const groupId = normalizeTargetId(groupPatch.id);
+      const existingIndex = groupId ? candidate.groups.findIndex((group) => group.id === groupId) : -1;
+      if (existingIndex >= 0) candidate.groups[existingIndex] = { ...candidate.groups[existingIndex], ...groupPatch, id: candidate.groups[existingIndex].id };
+      else candidate.groups.push(groupPatch);
+    }
+    candidate.tasks.push(...(input.tasks ?? []));
+
+    const validationErrors = validateTaskRunInput(candidate);
+    if (validationErrors.length > 0) return { patched: false, taskRunId: taskRun.id, errors: validationErrors, dispatchScheduled: false };
+
+    const timestamp = Date.now();
+    const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
+    if (!normalized.taskRun) return { patched: false, taskRunId: taskRun.id, errors: normalized.errors, dispatchScheduled: false };
+
+    const normalizedGroupsById = new Map(normalized.taskRun.groups.map((group) => [group.id, group]));
+    for (const normalizedGroup of normalized.taskRun.groups) {
+      const existing = taskRun.groups.find((group) => group.id === normalizedGroup.id);
+      if (existing) {
+        existing.title = normalizedGroup.title;
+        existing.dependsOn = normalizedGroup.dependsOn;
+        existing.maxConcurrency = normalizedGroup.maxConcurrency;
+        existing.agentHint = normalizedGroup.agentHint;
+        existing.filesHint = normalizedGroup.filesHint;
+        existing.updatedAt = timestamp;
+      } else taskRun.groups.push(normalizedGroup);
+    }
+    taskRun.groups = taskRun.groups.filter((group) => normalizedGroupsById.has(group.id));
+
+    for (const normalizedTask of normalized.taskRun.tasks) {
+      if (!newTaskIds.has(normalizedTask.id)) continue;
+      taskRun.tasks.push(normalizedTask);
+    }
+
+    if (newTaskIds.size > 0) {
+      taskRun.status = "running";
+      taskRun.completedAt = undefined;
+    }
+    taskRun.updatedAt = timestamp;
+    deriveTaskRunStatus(taskRun, timestamp);
+    this.persistState();
+    this.updateUI(ctx ?? this.lastContext);
+    return { patched: true, taskRunId: taskRun.id, errors: [], dispatchScheduled: newTaskIds.size > 0 };
   }
 
   private editTaskMutable(input: EditTaskInput, ctx?: ExtensionContext): EditTaskResult {
@@ -758,7 +846,9 @@ export class TaskedSubagentsController {
   }
 
   private scheduleDispatch(taskRunId: string, ctx?: ExtensionContext): Promise<void> {
-    const work = this.dispatchReady({ taskRunId, ctx })
+    const previous = this.scheduledDispatches.get(taskRunId);
+    const work = (previous ? previous.catch(() => undefined) : Promise.resolve())
+      .then(() => this.dispatchReady({ taskRunId, ctx }))
       .then(() => undefined)
       .catch((error: unknown) => {
         console.error(`[${PACKAGE_NAME}] dispatch failed:`, error);

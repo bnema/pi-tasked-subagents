@@ -60,6 +60,7 @@ describe("tasked_subagents extension rendering", () => {
     expect(publicSurface).toContain("set_tasks");
     expect(publicSurface).toContain("edit_task");
     expect(publicSurface).toContain("edit_group");
+    expect(publicSurface).toContain("patch_task_run");
     expect(publicSurface).toContain("attach");
     expect(publicSurface).toContain("wait");
     expect(publicSurface).toContain("taskRunId");
@@ -80,6 +81,8 @@ describe("tasked_subagents extension rendering", () => {
       .toBe("tasked_subagents attach task-run-1");
     expect(renderCollapsedToolCall({ action: "set_tasks", title: "Task run", wait: true }))
       .toBe("tasked_subagents set_tasks Task run wait=true");
+    expect(renderCollapsedToolCall({ action: "patch_task_run", taskRunId: "task-run-1", wait: true }))
+      .toBe("tasked_subagents patch_task_run task-run-1 wait=true");
     expect(renderCollapsedToolCall({ action: "resolve", targetId: "task-run-1", prompt: "long fix summary that should not be shown" }))
       .toBe("tasked_subagents resolve task-run-1");
   });

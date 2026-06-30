@@ -468,12 +468,13 @@ export function buildHelpText(): string {
     "  tasked_subagents action=set_tasks context=<context> tasks=<tasks> [groups=<groups>]",
     "  tasked_subagents action=edit_task taskRunId=<taskRunId> targetId=<taskId> task=<patch>",
     "  tasked_subagents action=edit_group taskRunId=<taskRunId> targetId=<groupId> group=<patch>",
+    "  tasked_subagents action=patch_task_run taskRunId=<taskRunId> [groups=<groups>] [tasks=<tasks>] [wait=true]",
     "  tasked_subagents action=dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>] [wait=true]", 
     "  tasked_subagents action=status [targetId=<id>]",
     "  tasked_subagents action=inspect targetId=<id>",
     "  tasked_subagents action=result assignmentId=<assignmentId>",
     "  tasked_subagents action=attach [targetId=<taskRunId|groupId|taskId|assignmentId>]",
-    "  Add wait=true to set_tasks/edit_task/edit_group/dispatch when the main agent should remain locked until launched work finishes.",
+    "  Add wait=true to set_tasks/patch_task_run/edit_task/edit_group/dispatch when the main agent should remain locked until launched work finishes.",
     "  tasked_subagents action=continue targetId=<taskId|assignmentId|groupId> prompt=<prompt>",
     "  tasked_subagents action=resolve targetId=<taskId|assignmentId|groupId|taskRunId> prompt=<fix-summary>",
     "  tasked_subagents action=stop assignmentId=<assignmentId>",
@@ -483,5 +484,6 @@ export function buildHelpText(): string {
     "Model:",
     "  Task runs contain groups and tasks; every subagent assignment executes exactly one task.",
     "  One-off work is a one-task task run.",
+    "  Use patch_task_run to append newly discovered tasks to the same visible TaskRun without replacing completed task history.",
   ].join("\n");
 }

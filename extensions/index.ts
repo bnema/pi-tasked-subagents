@@ -163,6 +163,7 @@ const ToolParamsSchema = Type.Object({
     Type.Literal("set_tasks"),
     Type.Literal("edit_task"),
     Type.Literal("edit_group"),
+    Type.Literal("patch_task_run"),
     Type.Literal("dispatch"),
     Type.Literal("continue"),
     Type.Literal("resolve"),
@@ -230,10 +231,12 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
       "Let ordinary user messages stay in the main session context; do not rely on hidden interception.",
       "Use set_tasks after validation; every task contains concrete criteria and may belong to a group.",
       "Use a one-task task run for one-off delegation.",
+      "Use patch_task_run to append newly discovered visible groups or tasks to an existing TaskRun without replacing completed task history.",
       "Use dispatch to schedule ready task assignments for an existing task run.",
-      "Use wait=true on set_tasks, edit_task, edit_group, or dispatch when launching work should lock the main agent until the scheduled assignments finish.",
+      "Use wait=true on set_tasks, patch_task_run, edit_task, edit_group, or dispatch when launching work should lock the main agent until the scheduled assignments finish.",
       "Use attach later when work was already launched in background mode and the main agent should re-join it before using results.",
       "Use edit_task or edit_group with targetId plus a patch for targeted validated changes.",
+      "Use patch_task_run instead of set_tasks when triage or planning discovers additional tasks for the same visible TaskRun.",
       "After set_tasks, edit_task, or dispatch schedules background work without wait=true, either call attach to wait later or wait for the automatic completion/attention/failure follow-up signal. edit_group may only update scheduling metadata when no work is launched.",
       "Use status for human-requested health checks, suspected stalls, or after about 60s with no signal.",
       "Use result with an assignmentId, or with a taskRunId/groupId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",
@@ -306,6 +309,26 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
               ? `Accepted task run ${accepted.taskRunId}; waited for task assignments to finish.\n\n${(await controller.attachTarget(accepted.taskRunId, ctx)).report}`
               : `Accepted task run ${accepted.taskRunId}; task assignments are running in the background. Call attach to wait later, or wait for the automatic completion/attention/failure follow-up signal.`
             : `Task run rejected:\n${accepted.errors.join("\n")}`;
+          break;
+        }
+        case "patch_task_run": {
+          if (!params.groups && !params.tasks) {
+            text = "patch_task_run requires groups or tasks.";
+            break;
+          }
+          const patched = await controller.patchTaskRun({
+            taskRunId: params.taskRunId,
+            groups: params.groups,
+            tasks: params.tasks,
+            wait: params.wait,
+          }, ctx);
+          text = patched.patched
+            ? params.wait && patched.dispatchScheduled
+              ? `Patched task run ${patched.taskRunId}; waited for new task assignments to finish.\n\n${(await controller.attachTarget(patched.taskRunId, ctx)).report}`
+              : patched.dispatchScheduled
+                ? `Patched task run ${patched.taskRunId}; new task assignments are running in the background. Call attach to wait later, or wait for the automatic completion/attention/failure follow-up signal.`
+                : `Patched task run ${patched.taskRunId}.`
+            : `Task run patch rejected:\n${patched.errors.join("\n")}`;
           break;
         }
         case "edit_task": {

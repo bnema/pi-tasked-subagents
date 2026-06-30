@@ -24,6 +24,7 @@ interface TaskRunControllerApi {
   setTasks(input: SetTasksInput, ctx?: unknown): Promise<SetTasksResult>;
   editTask(input: EditTaskInput, ctx?: unknown): Promise<EditTaskResult>;
   editGroup(input: EditGroupInput, ctx?: unknown): Promise<EditGroupResult>;
+  patchTaskRun(input: { taskRunId?: string; groups?: SetTasksInput["groups"]; tasks?: SetTasksInput["tasks"]; wait?: boolean }, ctx?: unknown): Promise<{ patched: boolean; taskRunId?: string; errors: string[]; dispatchScheduled: boolean }>;
   dispatchReady(options?: { taskRunId?: string; ctx?: unknown }): Promise<{ launched: number; skipped: number; errors: string[]; hasBlockingIssue: boolean }>;
   attachTarget(targetId?: string, ctx?: unknown): Promise<AttachResult>;
   continueTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
@@ -169,6 +170,30 @@ class ResultControlledRuntime extends CompletingRuntime {
 
   releaseResult(): void {
     this.resultResolve?.();
+  }
+}
+
+class FirstResultControlledRuntime extends CompletingRuntime {
+  private resultStartedResolve!: () => void;
+  private resultReleaseResolve: (() => void) | undefined;
+  private blocked = false;
+  readonly resultStarted = new Promise<void>((resolve) => {
+    this.resultStartedResolve = resolve;
+  });
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    if (!this.blocked) {
+      this.blocked = true;
+      this.resultStartedResolve();
+      await new Promise<void>((resolve) => {
+        this.resultReleaseResolve = resolve;
+      });
+    }
+    return super.getRunResult(handle);
+  }
+
+  releaseResult(): void {
+    this.resultReleaseResolve?.();
   }
 }
 
@@ -484,6 +509,66 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(state.taskRuns[0].title).toBe("Replacement");
     expect(state.taskRuns[0].tasks.map((task) => task.id)).toEqual(["replacement"]);
     expect(state.taskRuns[0].assignments.some((assignment) => assignment.taskId === "task")).toBe(false);
+  });
+
+  test("patchTaskRun appends visible tasks without replacing completed task history", async () => {
+    const runtime = new CompletingRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await controller.awaitLastWork();
+    const beforePatch = controller.getState().taskRuns[0];
+    const originalAssignmentId = beforePatch.assignments[0].id;
+    expect(beforePatch.status).toBe("completed");
+
+    await expect(controller.patchTaskRun({
+      taskRunId: "task-run-1",
+      tasks: [{ id: "review", group: "main", text: "Review generated follow-up", criteria: ["Reviewed"], dependsOn: ["task"] }],
+      wait: true,
+    })).resolves.toMatchObject({ patched: true, taskRunId: "task-run-1", dispatchScheduled: true });
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.tasks.map((task) => task.id)).toEqual(["task", "review"]);
+    expect(taskRun.assignments.some((assignment) => assignment.id === originalAssignmentId)).toBe(true);
+    expect(taskRun.tasks[0]).toMatchObject({ id: "task", status: "completed", assignmentIds: [originalAssignmentId] });
+    expect(taskRun.tasks[1]).toMatchObject({ id: "review", status: "completed" });
+    expect(runtime.requests.at(-1)?.tasks.map((task) => task.taskId)).toEqual(["review"]);
+  });
+
+  test("patchTaskRun rejects duplicate task ids instead of replacing existing tasks", async () => {
+    const { controller } = controllerWith(new CompletingRuntime());
+
+    await controller.setTasks(baseSetTasks);
+    await controller.awaitLastWork();
+    const beforePatch = controller.getState().taskRuns[0];
+
+    await expect(controller.patchTaskRun({
+      taskRunId: "task-run-1",
+      tasks: [{ id: "task", group: "main", text: "Replace task", criteria: ["Replaced"] }],
+    })).resolves.toMatchObject({ patched: false, dispatchScheduled: false, errors: ["Task task already exists; use edit_task to modify existing tasks"] });
+
+    expect(controller.getState().taskRuns[0]).toEqual(beforePatch);
+  });
+
+  test("patchTaskRun does not invalidate an active dispatch result", async () => {
+    const runtime = new FirstResultControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await runtime.resultStarted;
+
+    await expect(controller.patchTaskRun({
+      taskRunId: "task-run-1",
+      tasks: [{ id: "review", group: "main", text: "Review after task", criteria: ["Reviewed"], dependsOn: ["task"] }],
+    })).resolves.toMatchObject({ patched: true, taskRunId: "task-run-1", dispatchScheduled: true });
+
+    runtime.releaseResult();
+    await controller.awaitLastWork();
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.tasks.find((task) => task.id === "task")?.status).toBe("completed");
+    expect(taskRun.assignments.find((assignment) => assignment.taskId === "task")?.result?.summary).toBe("task done");
+    expect(taskRun.tasks.find((task) => task.id === "review")?.status).toBe("completed");
   });
 
   test("editTask patches one task and reschedules only that task", async () => {
