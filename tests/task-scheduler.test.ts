@@ -188,8 +188,10 @@ describe("task scheduler", () => {
 
     const prompt = buildTaskAssignmentPrompt(taskRun, undefined, task(taskRun, "triage"));
 
-    expect(prompt).toContain("taskRunPatch");
+    expect(prompt).toContain("taskRunPatch is optional");
     expect(prompt).toContain("new-task-id");
+    expect(prompt).toContain("new-group-id");
+    expect(prompt).toContain("taskRunPatch.groups may add new groups or update existing group metadata");
     expect(prompt).not.toContain('"tasks": []');
     expect(prompt).not.toContain('"groups": []');
   });

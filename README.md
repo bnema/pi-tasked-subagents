@@ -60,14 +60,14 @@ Common tool actions:
 
 ```text
 tasked_subagents action=set_tasks tasks=[...] groups=[...]
-tasked_subagents action=patch_task_run taskRunId=<id> tasks=[...]
+tasked_subagents action=patch_task_run taskRunId=<id> groups=[...] tasks=[...]
 tasked_subagents action=inspect taskRunId=<id>
 tasked_subagents action=attach taskRunId=<id>
 ```
 
-Use `patch_task_run` when triage or planning discovers additional tasks for the same visible TaskRun. This appends new task ids without replacing completed tasks or assignment history.
+Use `patch_task_run` when triage or planning discovers additional groups or tasks for the same visible TaskRun. This appends new task ids and new or updated groups without replacing completed tasks or assignment history.
 
-Planner tasks may opt into expansion with `expansionMode: "append_tasks"`. Those tasks can return `taskRunPatch` in their final JSON report, and the controller appends the patch as visible TaskRun tasks before dispatch continues.
+Planner tasks may opt into expansion with `expansionMode: "append_tasks"`. Those tasks can return `taskRunPatch` in their final JSON report, and the controller appends groups and tasks as visible TaskRun records before dispatch continues.
 
 ## Model
 

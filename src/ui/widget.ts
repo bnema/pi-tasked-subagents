@@ -161,12 +161,14 @@ function statusProgressLabel(
   return `${statusGlyphValue} ${muted(`${progress.done}/${progress.total}`, theme)}`;
 }
 
+function assignmentsForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord[] {
+  return task.assignmentIds
+    .map((assignmentId) => taskRun.assignments.find((candidate) => candidate.id === assignmentId))
+    .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
+}
+
 function assignmentForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
-  for (let index = task.assignmentIds.length - 1; index >= 0; index -= 1) {
-    const assignment = taskRun.assignments.find((candidate) => candidate.id === task.assignmentIds[index]);
-    if (assignment) return assignment;
-  }
-  return undefined;
+  return assignmentsForTask(taskRun, task).at(-1);
 }
 
 function tasksForGroup(taskRun: TaskRunRecord, groupId: string | undefined): TaskRecord[] {
@@ -374,9 +376,9 @@ function checklistTaskLine(taskRun: TaskRunRecord, task: TaskRecord, groupLast: 
   return `${childPrefix(groupLast)}${linePrefix(taskLast)}${statusGlyph(task.status)} ${shortTitle(task.text, TASK_TITLE_WIDTH)}${details ? ` ${details}` : ""}`;
 }
 
-function checklistAssignmentLine(assignment: TaskAssignmentRecord, groupLast: boolean, taskLast: boolean): string {
+function checklistAssignmentLine(assignment: TaskAssignmentRecord, groupLast: boolean, taskLast: boolean, assignmentLast: boolean): string {
   const taskChildPrefix = `${childPrefix(groupLast)}${childPrefix(taskLast)}`;
-  return `${taskChildPrefix}${linePrefix(true)}${statusGlyph(assignment.status)} ${assignment.agent} ${shortAssignmentId(assignment.id)}`;
+  return `${taskChildPrefix}${linePrefix(assignmentLast)}${statusGlyph(assignment.status)} ${assignment.agent} ${shortAssignmentId(assignment.id)}`;
 }
 
 export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100): string[] {
@@ -390,20 +392,24 @@ export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100):
   for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
     const group = groups[groupIndex];
     const groupLast = groupIndex === groups.length - 1;
-    if (!append(`${linePrefix(groupLast)}${GLYPH_GROUP} ${shortTitle(group.title, GROUP_TITLE_WIDTH)} ${statusGlyph(group.status)} ${groupProgress(taskRun, group).done}/${groupProgress(taskRun, group).total}`)) break;
+    const progressForGroup = groupProgress(taskRun, group);
+    if (!append(`${linePrefix(groupLast)}${GLYPH_GROUP} ${shortTitle(group.title, GROUP_TITLE_WIDTH)} ${statusGlyph(group.status)} ${progressForGroup.done}/${progressForGroup.total}`)) break;
     const groupTasks = tasksForGroup(taskRun, group.id);
     for (let taskIndex = 0; taskIndex < groupTasks.length; taskIndex += 1) {
       const task = groupTasks[taskIndex];
       const taskLast = taskIndex === groupTasks.length - 1;
       if (!append(checklistTaskLine(taskRun, task, groupLast, taskLast))) break;
-      const assignment = assignmentForTask(taskRun, task);
-      if (assignment && !append(checklistAssignmentLine(assignment, groupLast, taskLast))) break;
+      const assignments = assignmentsForTask(taskRun, task);
+      for (const [assignmentIndex, assignment] of assignments.entries()) {
+        const assignmentLast = assignmentIndex === assignments.length - 1;
+        if (!append(checklistAssignmentLine(assignment, groupLast, taskLast, assignmentLast))) break;
+      }
     }
   }
 
   const totalLineCount = 1 + groups.reduce((count, group) => {
     const groupTasks = tasksForGroup(taskRun, group.id);
-    const assignmentCount = groupTasks.filter((task) => assignmentForTask(taskRun, task)).length;
+    const assignmentCount = groupTasks.reduce((sum, task) => sum + assignmentsForTask(taskRun, task).length, 0);
     return count + 1 + groupTasks.length + assignmentCount;
   }, 0);
   if (rawLines.length < totalLineCount && rawLines.length > 0) {

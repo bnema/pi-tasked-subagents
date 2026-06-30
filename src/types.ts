@@ -297,10 +297,7 @@ export interface SubagentTaskReport {
   }>;
   artifacts?: Array<{ label: string; path: string }>;
   followUps?: string[];
-  taskRunPatch?: {
-    groups?: TaskGroupInput[];
-    tasks?: TaskInput[];
-  };
+  taskRunPatch?: Pick<PatchTaskRunInput, "groups" | "tasks">;
 }
 
 // ──────────────────────────────────────────────

@@ -174,7 +174,8 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     followUps: ["optional blocker or follow-up"],
     ...(task.expansionMode === "append_tasks" ? {
       taskRunPatch: {
-        tasks: [{ id: "new-task-id", text: "new visible task", criteria: ["specific completion criterion"] }],
+        groups: [{ id: "new-group-id", title: "New visible group" }],
+        tasks: [{ id: "new-task-id", group: "new-group-id", text: "new visible task", criteria: ["specific completion criterion"] }],
       },
     } : {}),
   };
@@ -192,7 +193,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     group ? `Group title: ${group.title}` : undefined,
     group?.filesHint?.length ? `Group files: ${group.filesHint.join(", ")}` : undefined,
     task.filesHint?.length ? `Task files: ${task.filesHint.join(", ")}` : undefined,
-    task.expansionMode === "append_tasks" ? "Task expansion: this task may append newly discovered visible groups/tasks by returning taskRunPatch." : undefined,
+    task.expansionMode === "append_tasks" ? "Task expansion: this task may append newly discovered visible groups/tasks with an optional taskRunPatch." : undefined,
     "",
     `Task id: ${task.id}`,
     `Task: ${task.text}`,
@@ -203,7 +204,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     upstreamOutputs.length > 0 ? "Upstream task outputs:" : undefined,
     ...upstreamOutputs,
     "",
-    "Required JSON:",
+    task.expansionMode === "append_tasks" ? "Required JSON, with optional taskRunPatch example for newly discovered visible groups/tasks:" : "Required JSON:",
     JSON.stringify(requiredReport, null, 2),
     "",
     "Rules:",
@@ -213,7 +214,9 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
     "- Evidence must be concrete and non-empty.",
     "- Use status=attention when blocked or evidence is insufficient.",
     "- Use status=failed only for unrecoverable failure.",
-    task.expansionMode === "append_tasks" ? "- taskRunPatch may only add new task ids. Do not include existing task ids." : undefined,
+    task.expansionMode === "append_tasks" ? "- taskRunPatch is optional; include it only when you discovered new visible groups or tasks." : undefined,
+    task.expansionMode === "append_tasks" ? "- taskRunPatch.tasks may only add new task ids. Do not include existing task ids." : undefined,
+    task.expansionMode === "append_tasks" ? "- taskRunPatch.groups may add new groups or update existing group metadata." : undefined,
   ].filter((line): line is string => typeof line === "string").join("\n");
 }
 

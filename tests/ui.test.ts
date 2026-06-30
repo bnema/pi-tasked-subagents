@@ -298,6 +298,32 @@ describe("ui", () => {
     expect(rendered).toContain("depends on: triage");
   });
 
+  test("full checklist renders every assignment for a task", () => {
+    const retried = cloneState(state);
+    retried.taskRuns[0].tasks[0].assignmentIds = ["task-a1", "task-a2"];
+    retried.taskRuns[0].assignments = [
+      {
+        ...retried.taskRuns[0].assignments[0],
+        id: "task-a1",
+        taskId: "task",
+        status: "attention",
+        agent: "reviewer",
+      },
+      {
+        ...retried.taskRuns[0].assignments[0],
+        id: "task-a2",
+        taskId: "task",
+        status: "running",
+        agent: "verifier",
+      },
+    ];
+
+    const rendered = buildTaskRunChecklistLines(retried.taskRuns[0], 20).join("\n");
+
+    expect(rendered).toContain("reviewer task-a1");
+    expect(rendered).toContain("verifier task-a2");
+  });
+
   test("full checklist preserves declaration order across completed running and pending tasks", () => {
     const mixed = cloneState(state);
     mixed.taskRuns[0].tasks = [
