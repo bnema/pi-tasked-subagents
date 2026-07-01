@@ -324,6 +324,7 @@ describe("ui", () => {
     const workflow = cloneState(state);
     workflow.taskRuns[0].tasks = [
       { ...workflow.taskRuns[0].tasks[0], id: "pending", text: "Pending task", status: "pending", assignmentIds: [] },
+      { ...workflow.taskRuns[0].tasks[0], id: "blocked", text: "Blocked task", status: "blocked", assignmentIds: [] },
       { ...workflow.taskRuns[0].tasks[0], id: "ready", text: "Ready task", status: "ready", assignmentIds: [] },
       { ...workflow.taskRuns[0].tasks[0], id: "queued", text: "Queued task", status: "ready", assignmentIds: ["queued-a1"] },
       { ...workflow.taskRuns[0].tasks[0], id: "running", text: "Running task", status: "running", assignmentIds: [] },
@@ -338,9 +339,14 @@ describe("ui", () => {
 
     const lines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
     expect(lines.find((line) => line.includes("Failed task"))).toContain("→");
-    expect(lines.find((line) => line.includes("Running task"))).not.toContain("→");
+    expect(lines.find((line) => line.includes("Blocked task"))).not.toContain("→");
 
     workflow.taskRuns[0].tasks.find((task) => task.id === "failed")!.status = "completed";
+    const blockedLines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
+    expect(blockedLines.find((line) => line.includes("Blocked task"))).toContain("→");
+    expect(blockedLines.find((line) => line.includes("Queued task"))).not.toContain("→");
+
+    workflow.taskRuns[0].tasks.find((task) => task.id === "blocked")!.status = "completed";
     const runningLines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
     expect(runningLines.find((line) => line.includes("Queued task"))).toContain("→");
     expect(runningLines.find((line) => line.includes("Ready task"))).not.toContain("→");
@@ -353,6 +359,23 @@ describe("ui", () => {
     workflow.taskRuns[0].tasks.find((task) => task.id === "ready")!.status = "completed";
     const pendingLines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
     expect(pendingLines.find((line) => line.includes("Pending task"))).toContain("→");
+  });
+
+  test("full checklist current task ignores stale historical assignment blockers", () => {
+    const workflow = cloneState(state);
+    workflow.taskRuns[0].tasks = [
+      { ...workflow.taskRuns[0].tasks[0], id: "retried", text: "Retried task", status: "ready", assignmentIds: ["old-failed", "latest-completed"] },
+      { ...workflow.taskRuns[0].tasks[0], id: "attention", text: "Attention task", status: "attention", assignmentIds: [] },
+    ];
+    workflow.taskRuns[0].assignments = [
+      { ...workflow.taskRuns[0].assignments[0], id: "old-failed", taskId: "retried", status: "failed" },
+      { ...workflow.taskRuns[0].assignments[0], id: "latest-completed", taskId: "retried", status: "completed" },
+    ];
+
+    const lines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
+
+    expect(lines.find((line) => line.includes("Attention task"))).toContain("→");
+    expect(lines.find((line) => line.includes("Retried task"))).not.toContain("→");
   });
 
   test("full checklist task lines include assignment agent id and status", () => {

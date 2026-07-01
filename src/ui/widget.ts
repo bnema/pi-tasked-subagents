@@ -383,11 +383,12 @@ function checklistTaskLine(taskRun: TaskRunRecord, task: TaskRecord, groupLast: 
 
 function checklistTaskPriority(taskRun: TaskRunRecord, task: TaskRecord): number | undefined {
   if (task.status === "cancelled" || taskDisplaysDone(taskRun, task)) return undefined;
-  const assignments = assignmentsForTask(taskRun, task);
-  if (task.status === "attention" || task.status === "failed" || assignments.some((assignment) => assignment.status === "attention" || assignment.status === "failed")) return 0;
-  if (task.status === "running" || assignments.some((assignment) => assignment.status === "running" || assignment.status === "queued")) return 1;
-  if (task.status === "ready") return 2;
-  if (task.status === "pending") return 3;
+  const assignment = assignmentForTask(taskRun, task);
+  if (task.status === "attention" || task.status === "failed" || assignment?.status === "attention" || assignment?.status === "failed") return 0;
+  if (task.status === "blocked") return 1;
+  if (task.status === "running" || assignment?.status === "running" || assignment?.status === "queued") return 2;
+  if (task.status === "ready") return 3;
+  if (task.status === "pending") return 4;
   return 4;
 }
 
