@@ -48,8 +48,9 @@ describe("tasked_subagents extension rendering", () => {
     expect(captureExtension().command.description).toContain("resolve");
   });
 
-  test("tool schema and guidance expose TaskRun actions without plan or phase ids", () => {
+  test("tool schema and guidance expose TaskRun actions and upfront flat workflow planning without plan or phase ids", () => {
     const tool = captureExtension().tool;
+    const guidance = [tool.promptSnippet, ...tool.promptGuidelines].join("\n");
     const publicSurface = JSON.stringify({
       description: tool.description,
       promptSnippet: tool.promptSnippet,
@@ -67,6 +68,11 @@ describe("tasked_subagents extension rendering", () => {
     expect(publicSurface).toContain("wait");
     expect(publicSurface).toContain("taskRunId");
     expect(publicSurface).toContain("groupId");
+    expect(guidance).toContain("complete plan");
+    expect(guidance).toContain("upfront");
+    expect(guidance).toContain("groups plus flat tasks");
+    expect(guidance).toContain("group references");
+    expect(guidance).toContain("not hidden steps");
     expect(publicSurface).not.toContain("replace_plan");
     expect(publicSurface).not.toContain("edit_plan");
     expect(publicSurface).not.toContain("planId");

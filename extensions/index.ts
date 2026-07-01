@@ -228,10 +228,10 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     name: TOOL_NAME,
     label: "Tasked subagents",
     description: "Store validated task runs as groups and tasks, then dispatch ready task assignments to background subagents.",
-    promptSnippet: "Use tasked_subagents for validated subagent delegation. After decomposing work, call set_tasks with tasks and optional groups. Every subagent assignment executes exactly one task.",
+    promptSnippet: "Use tasked_subagents for validated subagent delegation. Materialize the complete plan upfront as groups plus flat tasks with group references; do not keep executable work as hidden steps. Every subagent assignment executes exactly one task.",
     promptGuidelines: [
       "Let ordinary user messages stay in the main session context; do not rely on hidden interception.",
-      "Use set_tasks after validation; every task contains concrete criteria and may belong to a group.",
+      "Use set_tasks after validation; materialize the complete plan upfront as groups plus flat tasks with group references, not hidden steps.",
       "Use a one-task task run for one-off delegation.",
       "Use patch_task_run to append newly discovered visible groups or tasks to an existing TaskRun without replacing completed task history.",
       "Use dispatch to schedule ready task assignments for an existing task run.",

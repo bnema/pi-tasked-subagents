@@ -365,15 +365,40 @@ function pushLimited(lines: string[], line: string, limit: number): boolean {
   return true;
 }
 
-function checklistTaskLine(taskRun: TaskRunRecord, task: TaskRecord, groupLast: boolean, taskLast: boolean): string {
+function checklistAssignmentSummary(assignment: TaskAssignmentRecord | undefined): string | undefined {
+  return assignment ? `${assignment.agent} ${shortAssignmentId(assignment.id)} ${assignment.status}` : undefined;
+}
+
+function checklistTaskLine(taskRun: TaskRunRecord, task: TaskRecord, groupLast: boolean, taskLast: boolean, current: boolean): string {
   const assignment = assignmentForTask(taskRun, task);
   const criteria = taskCriteriaProgress(task);
+  const currentMarker = current ? "→ " : "  ";
   const details = [
     `${criteria.done}/${criteria.total} criteria`,
     task.dependsOn.length > 0 ? `depends on: ${task.dependsOn.join(", ")}` : undefined,
-    assignment?.agent,
+    checklistAssignmentSummary(assignment),
   ].filter(Boolean).join(" · ");
-  return `${childPrefix(groupLast)}${linePrefix(taskLast)}${statusGlyph(task.status)} ${shortTitle(task.text, TASK_TITLE_WIDTH)}${details ? ` ${details}` : ""}`;
+  return `${childPrefix(groupLast)}${linePrefix(taskLast)}${currentMarker}${statusGlyph(task.status)} ${shortTitle(task.text, TASK_TITLE_WIDTH)}${details ? ` ${details}` : ""}`;
+}
+
+function checklistTaskPriority(taskRun: TaskRunRecord, task: TaskRecord): number | undefined {
+  if (task.status === "cancelled" || taskDisplaysDone(taskRun, task)) return undefined;
+  const assignments = assignmentsForTask(taskRun, task);
+  if (task.status === "attention" || task.status === "failed" || assignments.some((assignment) => assignment.status === "attention" || assignment.status === "failed")) return 0;
+  if (task.status === "running" || assignments.some((assignment) => assignment.status === "running" || assignment.status === "queued")) return 1;
+  if (task.status === "ready") return 2;
+  if (task.status === "pending") return 3;
+  return 4;
+}
+
+function currentChecklistTaskId(taskRun: TaskRunRecord): string | undefined {
+  let current: { id: string; priority: number } | undefined;
+  for (const task of taskRun.tasks) {
+    const priority = checklistTaskPriority(taskRun, task);
+    if (priority === undefined) continue;
+    if (!current || priority < current.priority) current = { id: task.id, priority };
+  }
+  return current?.id;
 }
 
 function checklistAssignmentLine(assignment: TaskAssignmentRecord, groupLast: boolean, taskLast: boolean, assignmentLast: boolean): string {
@@ -389,6 +414,7 @@ export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100):
   const progress = taskRunTaskProgress(taskRun);
   append(`${GLYPH_TASKED_SUBAGENTS} TaskRun ${taskRun.id} ${statusGlyph(taskRun.status)} ${progress.done}/${progress.total} ${shortTitle(taskRun.title || taskRun.request, SUMMARY_TITLE_WIDTH)}`);
 
+  const currentTaskId = currentChecklistTaskId(taskRun);
   const groups = widgetGroups(taskRun);
   for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
     const group = groups[groupIndex];
@@ -401,7 +427,7 @@ export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100):
       const task = groupTasks[taskIndex];
       const taskLast = taskIndex === groupTasks.length - 1;
       totalLineCount += 1;
-      append(checklistTaskLine(taskRun, task, groupLast, taskLast));
+      append(checklistTaskLine(taskRun, task, groupLast, taskLast, task.id === currentTaskId));
       const assignments = assignmentsForTask(taskRun, task);
       for (const [assignmentIndex, assignment] of assignments.entries()) {
         const assignmentLast = assignmentIndex === assignments.length - 1;

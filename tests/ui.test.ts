@@ -238,6 +238,15 @@ describe("ui", () => {
     planned.taskRuns[0].title = "Review workflow";
     planned.taskRuns[0].groups[0].title = "Review plan";
     planned.taskRuns[0].groups[0].status = "running";
+    planned.taskRuns[0].groups.push({
+      id: "implementation",
+      title: "Implementation plan",
+      status: "pending",
+      dependsOn: ["main"],
+      maxConcurrency: 1,
+      createdAt: 2,
+      updatedAt: 2,
+    });
     planned.taskRuns[0].tasks = [
       {
         id: "triage",
@@ -273,6 +282,17 @@ describe("ui", () => {
         createdAt: 2,
         updatedAt: 2,
       },
+      {
+        id: "implement-fixes",
+        groupId: "implementation",
+        text: "Implement review fixes",
+        status: "pending",
+        criteria: [{ id: "C1", text: "Fixes implemented", satisfied: false, evidence: [] }],
+        dependsOn: ["review-tests"],
+        assignmentIds: [],
+        createdAt: 2,
+        updatedAt: 2,
+      },
     ];
     planned.taskRuns[0].assignments = [{
       id: "triage-a1",
@@ -291,11 +311,58 @@ describe("ui", () => {
 
     expect(rendered).toContain("Review workflow");
     expect(rendered).toContain("Review plan");
+    expect(rendered).toContain("Implementation plan");
     expect(rendered).toContain("Decide needed reviewers");
     expect(rendered).toContain("Review security risks");
     expect(rendered).toContain("Review test coverage");
+    expect(rendered).toContain("Implement review fixes");
     expect(rendered).toContain("triage-a1");
     expect(rendered).toContain("depends on: triage");
+  });
+
+  test("full checklist marks current task by precedence", () => {
+    const workflow = cloneState(state);
+    workflow.taskRuns[0].tasks = [
+      { ...workflow.taskRuns[0].tasks[0], id: "pending", text: "Pending task", status: "pending", assignmentIds: [] },
+      { ...workflow.taskRuns[0].tasks[0], id: "ready", text: "Ready task", status: "ready", assignmentIds: [] },
+      { ...workflow.taskRuns[0].tasks[0], id: "queued", text: "Queued task", status: "ready", assignmentIds: ["queued-a1"] },
+      { ...workflow.taskRuns[0].tasks[0], id: "running", text: "Running task", status: "running", assignmentIds: [] },
+      { ...workflow.taskRuns[0].tasks[0], id: "failed", text: "Failed task", status: "failed", assignmentIds: [] },
+    ];
+    workflow.taskRuns[0].assignments = [{
+      ...workflow.taskRuns[0].assignments[0],
+      id: "queued-a1",
+      taskId: "queued",
+      status: "queued",
+    }];
+
+    const lines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
+    expect(lines.find((line) => line.includes("Failed task"))).toContain("→");
+    expect(lines.find((line) => line.includes("Running task"))).not.toContain("→");
+
+    workflow.taskRuns[0].tasks.find((task) => task.id === "failed")!.status = "completed";
+    const runningLines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
+    expect(runningLines.find((line) => line.includes("Queued task"))).toContain("→");
+    expect(runningLines.find((line) => line.includes("Ready task"))).not.toContain("→");
+
+    workflow.taskRuns[0].assignments[0].status = "completed";
+    workflow.taskRuns[0].tasks.find((task) => task.id === "running")!.status = "completed";
+    const readyLines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
+    expect(readyLines.find((line) => line.includes("Ready task"))).toContain("→");
+
+    workflow.taskRuns[0].tasks.find((task) => task.id === "ready")!.status = "completed";
+    const pendingLines = buildTaskRunChecklistLines(workflow.taskRuns[0], 20);
+    expect(pendingLines.find((line) => line.includes("Pending task"))).toContain("→");
+  });
+
+  test("full checklist task lines include assignment agent id and status", () => {
+    const assigned = cloneState(state);
+
+    const line = buildTaskRunChecklistLines(assigned.taskRuns[0], 20).find((candidate) => candidate.includes("Do task"));
+
+    expect(line).toContain("delegate");
+    expect(line).toContain("a1");
+    expect(line).toContain("running");
   });
 
   test("full checklist renders every assignment for a task", () => {
