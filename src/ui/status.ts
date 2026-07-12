@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 
 import type { TaskedSubagentsState } from "../types.js";
+import { isSupersededAssignment } from "../orchestration/assignment-attempts.js";
 import { GLYPH_TASKED_SUBAGENTS } from "./glyphs.js";
 
 export interface StatusThemeLike {
@@ -31,7 +32,9 @@ export function buildFooterStatus(state: TaskedSubagentsState, theme?: StatusThe
   if (state.taskRuns.length === 0) return undefined;
   const activeTaskRuns = state.taskRuns.filter((taskRun) => taskRun.status === "running" || taskRun.status === "pending").length;
   const attentionTaskRuns = state.taskRuns.filter((taskRun) => taskRun.status === "attention" || taskRun.status === "failed").length;
-  const runningAssignments = state.taskRuns.flatMap((taskRun) => taskRun.assignments).filter((assignment) => assignment.status === "queued" || assignment.status === "running").length;
+  const runningAssignments = state.taskRuns
+    .flatMap((taskRun) => taskRun.assignments)
+    .filter((assignment) => !isSupersededAssignment(assignment) && (assignment.status === "queued" || assignment.status === "running")).length;
   const completedTaskRuns = state.taskRuns.filter((taskRun) => taskRun.status === "completed").length;
 
   const parts = [`${colorize(GLYPH_TASKED_SUBAGENTS, "accent", theme)} ${bold("tasked", theme)}`];

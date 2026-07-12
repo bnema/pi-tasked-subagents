@@ -2,6 +2,7 @@
 // Task scheduler: derive ready task assignments from task-run state
 // ──────────────────────────────────────────────
 
+import { authoritativeAssignment, isSupersededAssignment } from "./assignment-attempts.js";
 import {
   ASSIGNMENT_STATUSES,
   type AssignmentStatus,
@@ -64,14 +65,6 @@ function isActiveAssignmentStatus(status: AssignmentStatus): boolean {
   return status === "queued" || status === "running";
 }
 
-function latestAssignment(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
-  for (let index = task.assignmentIds.length - 1; index >= 0; index -= 1) {
-    const assignment = taskRun.assignments.find((candidate) => candidate.id === task.assignmentIds[index]);
-    if (assignment) return assignment;
-  }
-  return undefined;
-}
-
 function dependencyIdsForTask(taskRun: TaskRunRecord, task: TaskRecord): string[] {
   const dependencyIds = [...task.dependsOn];
   const addImplicitDependency = (taskId: string): void => {
@@ -120,18 +113,18 @@ function taskDependenciesBlocked(taskRun: TaskRunRecord, task: TaskRecord): bool
 }
 
 function activeCountForTaskRun(taskRun: TaskRunRecord): number {
-  return taskRun.assignments.filter((assignment) => isActiveAssignmentStatus(assignment.status)).length;
+  return taskRun.assignments.filter((assignment) => !isSupersededAssignment(assignment) && isActiveAssignmentStatus(assignment.status)).length;
 }
 
 function activeCountForGroup(taskRun: TaskRunRecord, group: TaskGroupRecord): number {
   const ids = new Set(tasksForGroup(taskRun, group.id).flatMap((task) => task.assignmentIds));
-  return taskRun.assignments.filter((assignment) => ids.has(assignment.id) && isActiveAssignmentStatus(assignment.status)).length;
+  return taskRun.assignments.filter((assignment) => ids.has(assignment.id) && !isSupersededAssignment(assignment) && isActiveAssignmentStatus(assignment.status)).length;
 }
 
 function taskHasActiveAssignment(taskRun: TaskRunRecord, task: TaskRecord): boolean {
   return task.assignmentIds
     .map((assignmentId) => taskRun.assignments.find((assignment) => assignment.id === assignmentId))
-    .some((assignment) => assignment && isActiveAssignmentStatus(assignment.status));
+    .some((assignment) => assignment && !isSupersededAssignment(assignment) && isActiveAssignmentStatus(assignment.status));
 }
 
 function groupCanDispatchReadyTasks(taskRun: TaskRunRecord, group: TaskGroupRecord): boolean {
@@ -157,7 +150,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
   const upstreamOutputs = dependencyIdsForTask(taskRun, task)
     .map((taskId) => {
       const dependency = taskById(taskRun).get(taskId);
-      const assignment = dependency ? latestAssignment(taskRun, dependency) : undefined;
+      const assignment = dependency ? authoritativeAssignment(taskRun, dependency) : undefined;
       const summary = assignment?.result?.summary;
       return summary ? `Task ${taskId}: ${summary}` : undefined;
     })
@@ -221,7 +214,7 @@ export function buildTaskAssignmentPrompt(taskRun: TaskRunRecord, group: TaskGro
 }
 
 function deriveTaskStatus(taskRun: TaskRunRecord, task: TaskRecord, group: TaskGroupRecord | undefined, timestamp: number): void {
-  const assignment = latestAssignment(taskRun, task);
+  const assignment = authoritativeAssignment(taskRun, task);
   const hasContinuation = Boolean(task.continuation?.trim());
   if (!hasContinuation && taskComplete(task, assignment)) {
     task.status = "completed";
@@ -313,6 +306,23 @@ export function deriveTaskRunStatus(taskRun: TaskRunRecord, timestamp = Date.now
 
 function createAssignment(taskRun: TaskRunRecord, group: TaskGroupRecord | undefined, task: TaskRecord, options: SchedulerOptions, timestamp: number): TaskAssignmentRecord {
   const assignmentId = buildAssignmentId(taskRun, group, task);
+  const supersededAssignmentIds = new Set<string>();
+  for (const priorAssignmentId of task.assignmentIds) {
+    const priorAssignment = taskRun.assignments.find((candidate) => candidate.id === priorAssignmentId);
+    if (!priorAssignment || priorAssignment.supersededAt !== undefined) continue;
+    priorAssignment.supersededAt = timestamp;
+    priorAssignment.supersededByAssignmentId = assignmentId;
+    priorAssignment.updatedAt = timestamp;
+    supersededAssignmentIds.add(priorAssignment.id);
+  }
+  if (supersededAssignmentIds.size > 0) {
+    for (const criterion of task.criteria) {
+      criterion.evidence = criterion.evidence.filter((evidence) => !supersededAssignmentIds.has(evidence.assignmentId));
+      criterion.satisfied = false;
+    }
+    taskRun.artifacts = taskRun.artifacts.filter((artifact) => !supersededAssignmentIds.has(artifact.assignmentId));
+  }
+
   const prompt = buildTaskAssignmentPrompt(taskRun, group, task).replace("ASSIGNMENT_ID", assignmentId);
   const assignment: TaskAssignmentWithLaunchDefaults = {
     id: assignmentId,
@@ -375,7 +385,9 @@ export function createReadyAssignments(taskRun: TaskRunRecord, options: Schedule
 export function toLaunchTaskEntries(assignments: TaskAssignmentRecord[], taskRun: TaskRunRecord, options: { defaultCwd?: string } = {}): LaunchTaskEntry[] {
   const assignmentIdsInLaunch = new Set(assignments.map((assignment) => assignment.id));
   const latestAssignmentIdByTaskId = new Map<string, string>();
-  for (const assignment of taskRun.assignments) latestAssignmentIdByTaskId.set(assignment.taskId, assignment.id);
+  for (const assignment of taskRun.assignments) {
+    if (!isSupersededAssignment(assignment)) latestAssignmentIdByTaskId.set(assignment.taskId, assignment.id);
+  }
 
   return assignments.map((assignment) => {
     const task = taskRun.tasks.find((candidate) => candidate.id === assignment.taskId);
@@ -405,7 +417,7 @@ export function applyAssignmentProgress(taskRun: TaskRunRecord, snapshot: RunPro
   for (const step of snapshot.steps) {
     if (!step.id) continue;
     const assignment = taskRun.assignments.find((candidate) => candidate.id === step.id);
-    if (!assignment) continue;
+    if (!assignment || isSupersededAssignment(assignment)) continue;
     if (assignment.runId !== snapshot.runId) continue;
     if (isAssignmentStatus(step.status)) assignment.status = step.status;
     assignment.currentTool = step.currentTool;

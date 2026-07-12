@@ -275,6 +275,8 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
     lastActionAt: optionalTimestamp(input.lastActionAt),
     lastActionSummary: optionalString(input.lastActionSummary),
     ...(recentActivity.length > 0 ? { recentActivity } : {}),
+    supersededAt: optionalTimestamp(input.supersededAt),
+    supersededByAssignmentId: optionalString(input.supersededByAssignmentId),
     createdAt: numberValue(input.createdAt, timestamp),
     updatedAt: numberValue(input.updatedAt, timestamp),
     completedAt: optionalTimestamp(input.completedAt),
@@ -313,6 +315,27 @@ function normalizeTaskRun(raw: unknown, _index: number): TaskRunRecord | undefin
     ...task,
     assignmentIds: task.assignmentIds.filter((assignmentId) => assignmentIds.has(assignmentId)),
   }));
+  for (const task of reconciledTasks) {
+    const taskAssignments = task.assignmentIds
+      .map((assignmentId) => assignments.find((assignment) => assignment.id === assignmentId))
+      .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
+    for (let index = 0; index < taskAssignments.length - 1; index += 1) {
+      const assignment = taskAssignments[index];
+      const replacement = taskAssignments[index + 1];
+      assignment.supersededAt ??= replacement.createdAt;
+      assignment.supersededByAssignmentId ??= replacement.id;
+    }
+  }
+  const supersededAssignmentIds = new Set(assignments
+    .filter((assignment) => assignment.supersededAt !== undefined || assignment.supersededByAssignmentId !== undefined)
+    .map((assignment) => assignment.id));
+  for (const task of reconciledTasks) {
+    for (const criterion of task.criteria) {
+      const priorEvidenceCount = criterion.evidence.length;
+      criterion.evidence = criterion.evidence.filter((evidence) => !supersededAssignmentIds.has(evidence.assignmentId));
+      if (criterion.evidence.length < priorEvidenceCount && criterion.evidence.length === 0) criterion.satisfied = false;
+    }
+  }
   return {
     id,
     title,
@@ -326,7 +349,7 @@ function normalizeTaskRun(raw: unknown, _index: number): TaskRunRecord | undefin
       ? input.artifacts
         .map((artifact) => normalizeArtifact(artifact, { taskRunId: id }))
         .filter((entry): entry is ArtifactRef => Boolean(entry))
-        .filter((entry) => taskIds.has(entry.taskId) && assignmentIds.has(entry.assignmentId))
+        .filter((entry) => taskIds.has(entry.taskId) && assignmentIds.has(entry.assignmentId) && !supersededAssignmentIds.has(entry.assignmentId))
       : [],
     maxConcurrency: optionalPositiveInteger(input.maxConcurrency),
     createdAt: numberValue(input.createdAt, timestamp),

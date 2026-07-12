@@ -10,7 +10,8 @@ This document describes the current target architecture for the unreleased v0 pa
 - A group is an optional scheduling section for dependencies, display, and concurrency.
 - A task is the only unit of work assigned to a subagent.
 - An assignment represents one launched subagent attempt for one task.
-- Evidence maps assignment output back to task criteria.
+- A replacement assignment atomically supersedes prior attempts for that task. Superseded attempts remain directly inspectable as audit history but do not affect current scheduling, evidence, artifacts, status, or default UI rows.
+- Evidence maps the authoritative assignment output back to task criteria.
 
 **Rationale.** Main-agent coordination should stay simple and flat. Groups provide enough structure for dependency and concurrency control without exposing recursive subtasks or executable phases.
 
@@ -123,7 +124,7 @@ Public target ids are `taskRunId`, `groupId`, `taskId`, and `assignmentId`.
 
 ## UI and messages
 
-**Decision.** UI surfaces show task runs, groups, tasks, assignments, and criteria progress. Completion/attention/failure messages identify the task run and assignment run rather than presenting generic background execution. The compact widget prioritizes active progress, while `inspect` includes a full checklist view for the selected TaskRun.
+**Decision.** UI surfaces show task runs, groups, tasks, authoritative assignments, and criteria progress. Superseded attempts are collapsed into a history count in aggregate views and remain available by direct assignment id. Completion/attention/failure messages identify the task run and assignment run rather than presenting generic background execution. The compact widget prioritizes active progress, while `inspect` includes a full checklist view for the selected TaskRun.
 
 **Rationale.** Status output should reinforce the product model and make recovery actions obvious.
 

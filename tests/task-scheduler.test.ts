@@ -212,6 +212,43 @@ describe("task scheduler", () => {
     expect(task(taskRun, "two").status).toBe("pending");
   });
 
+  test("superseded running attempts do not consume task-run concurrency", () => {
+    const taskRun = makeTaskRun({
+      maxConcurrency: 1,
+      tasks: [
+        { id: "one", text: "Do one", criteria: ["One done"] },
+        { id: "two", text: "Do two", criteria: ["Two done"] },
+      ],
+    });
+    const first = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 }).assignments[0];
+    first.supersededAt = 3;
+    first.supersededByAssignmentId = "one-replacement";
+    const replacement: TaskAssignmentRecord = {
+      ...first,
+      id: "one-replacement",
+      status: "completed",
+      result: {
+        assignmentId: "one-replacement",
+        status: "completed",
+        summary: "done",
+        criteriaEvidence: [{ criteriaIndex: 0, criterionId: "C1", evidence: "done" }],
+        artifacts: [],
+        followUps: [],
+        createdAt: 3,
+      },
+      supersededAt: undefined,
+      supersededByAssignmentId: undefined,
+    };
+    taskRun.assignments.push(replacement);
+    task(taskRun, "one").assignmentIds.push(replacement.id);
+    task(taskRun, "one").criteria[0].satisfied = true;
+    task(taskRun, "one").status = "completed";
+
+    const result = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 4 });
+
+    expect(result.assignments.map((assignment) => assignment.taskId)).toEqual(["two"]);
+  });
+
   test("surfaces skipped assignments as blocked group recovery", () => {
     const taskRun = makeTaskRun({
       groups: [{ id: "main", title: "Main" }],
@@ -317,6 +354,25 @@ describe("task scheduler", () => {
 
     expect(result.assignments[0].prompt).toContain("Retry with the missing evidence.");
     expect(assignedTask.continuation).toBeUndefined();
+  });
+
+  test("atomically supersedes prior attempts when creating a replacement", () => {
+    const taskRun = makeTaskRun();
+    const assignedTask = task(taskRun, "one");
+    const first = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 }).assignments[0];
+    first.status = "attention";
+    assignedTask.status = "ready";
+    assignedTask.continuation = "Verify the fix.";
+    assignedTask.criteria[0].evidence = [{ criterionId: "C1", assignmentId: first.id, summary: "partial", createdAt: 3 }];
+    taskRun.artifacts = [{ label: "old", path: "old.txt", assignmentId: first.id, taskRunId: taskRun.id, taskId: assignedTask.id }];
+
+    const replacement = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 4 }).assignments[0];
+
+    expect(first.supersededAt).toBe(4);
+    expect(first.supersededByAssignmentId).toBe(replacement.id);
+    expect(assignedTask.criteria[0]).toMatchObject({ satisfied: false, evidence: [] });
+    expect(taskRun.artifacts).toEqual([]);
+    expect(assignedTask.assignmentIds).toEqual([first.id, replacement.id]);
   });
 
   test("does not relaunch a task whose assignment completed before evidence was reduced", () => {

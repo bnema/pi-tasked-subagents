@@ -166,7 +166,7 @@ export function applySubagentTaskReport(
     const found = findTask(taskRun, assignment.taskId);
     const latestAssignmentId = found?.task.assignmentIds.at(-1);
     if (latestAssignmentId && latestAssignmentId !== assignment.id) {
-      putAssignmentAttention(assignment, timestamp);
+      if (assignment.supersededAt === undefined) putAssignmentAttention(assignment, timestamp);
       return {
         applied: false,
         errors: [`Report assignmentId ${assignment.id} is stale; latest assignment is ${latestAssignmentId}`],

@@ -116,6 +116,36 @@ describe("task-run state store", () => {
     expect(restored.taskRuns[0].tasks[0].expansionMode).toBe("append_tasks");
   });
 
+  test("preserves assignment supersession metadata when restoring state", () => {
+    const supersededState: TaskedSubagentsState = structuredClone(currentState);
+    supersededState.taskRuns[0].assignments[0].supersededAt = 2;
+    supersededState.taskRuns[0].assignments[0].supersededByAssignmentId = "assignment-2";
+
+    const restored = deserializeState(serializeState(supersededState));
+
+    expect(restored.taskRuns[0].assignments[0]).toMatchObject({
+      supersededAt: 2,
+      supersededByAssignmentId: "assignment-2",
+    });
+  });
+
+  test("infers supersession for historical attempts restored without metadata", () => {
+    const historicalState: TaskedSubagentsState = structuredClone(currentState);
+    const old = historicalState.taskRuns[0].assignments[0];
+    old.status = "failed";
+    const replacement = { ...old, id: "assignment-2", status: "completed" as const, createdAt: 2, updatedAt: 2 };
+    historicalState.taskRuns[0].assignments.push(replacement);
+    historicalState.taskRuns[0].tasks[0].assignmentIds.push(replacement.id);
+
+    const restored = deserializeState(serializeState(historicalState));
+
+    expect(restored.taskRuns[0].assignments[0]).toMatchObject({
+      supersededAt: 2,
+      supersededByAssignmentId: "assignment-2",
+    });
+    expect(restored.taskRuns[0].assignments[1].supersededAt).toBeUndefined();
+  });
+
   test("resets serialized v3 state to empty current-version state", () => {
     const serialized = JSON.stringify({ version: 3, plans: [{ id: "plan-1" }], currentPlanId: "plan-1", updatedAt: 1 });
 

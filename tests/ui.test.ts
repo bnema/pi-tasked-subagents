@@ -1,5 +1,5 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import type { TaskedSubagentsState } from "../src/types.js";
 import { buildFooterStatus } from "../src/ui/status.js";
@@ -70,6 +70,47 @@ describe("ui", () => {
     const footer = buildFooterStatus(state);
     expect(footer).toContain("active task run");
     expect(footer).toContain("running task");
+  });
+
+  test("footer excludes superseded running attempts", () => {
+    const retried = cloneState(state);
+    retried.taskRuns[0].assignments[0].supersededAt = 2;
+    retried.taskRuns[0].assignments[0].supersededByAssignmentId = "a2";
+    retried.taskRuns[0].assignments.push({
+      ...retried.taskRuns[0].assignments[0],
+      id: "a2",
+      status: "completed",
+      supersededAt: undefined,
+      supersededByAssignmentId: undefined,
+    });
+
+    expect(buildFooterStatus(retried)).not.toContain("running task");
+  });
+
+  test("widget animation ignores superseded running attempts", () => {
+    vi.useFakeTimers();
+    try {
+      const retried = cloneState(state);
+      retried.taskRuns[0].assignments[0].supersededAt = 2;
+      retried.taskRuns[0].assignments[0].supersededByAssignmentId = "a2";
+      retried.taskRuns[0].assignments.push({
+        ...retried.taskRuns[0].assignments[0],
+        id: "a2",
+        status: "completed",
+        supersededAt: undefined,
+        supersededByAssignmentId: undefined,
+      });
+      const requestRender = vi.fn();
+      const factory = createWidgetContent(retried, 10);
+      const component = factory?.({ requestRender }, { fg: (_color, text) => text });
+
+      vi.advanceTimersByTime(500);
+
+      expect(requestRender).not.toHaveBeenCalled();
+      component?.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("widget renders task run, group, task, and assignment activity", () => {
@@ -388,7 +429,7 @@ describe("ui", () => {
     expect(line).toContain("running");
   });
 
-  test("full checklist renders every assignment for a task", () => {
+  test("full checklist collapses superseded attempts behind a history count", () => {
     const retried = cloneState(state);
     retried.taskRuns[0].tasks[0].assignmentIds = ["task-a1", "task-a2"];
     retried.taskRuns[0].assignments = [
@@ -398,6 +439,8 @@ describe("ui", () => {
         taskId: "task",
         status: "attention",
         agent: "reviewer",
+        supersededAt: 2,
+        supersededByAssignmentId: "task-a2",
       },
       {
         ...retried.taskRuns[0].assignments[0],
@@ -410,8 +453,9 @@ describe("ui", () => {
 
     const rendered = buildTaskRunChecklistLines(retried.taskRuns[0], 20).join("\n");
 
-    expect(rendered).toContain("reviewer task-a1");
+    expect(rendered).not.toContain("reviewer task-a1");
     expect(rendered).toContain("verifier task-a2");
+    expect(rendered).toContain("1 previous attempt");
   });
 
   test("full checklist preserves declaration order across completed running and pending tasks", () => {

@@ -121,6 +121,37 @@ describe("commands", () => {
     expect(formatResultReport(state, "task-run-1")).toContain("Assignment: a1");
   });
 
+  test("aggregate reports use the authoritative attempt while direct inspect preserves history", () => {
+    const retried = structuredClone(state);
+    retried.taskRuns[0].tasks[0].assignmentIds = ["a1", "a2"];
+    retried.taskRuns[0].assignments[0].status = "running";
+    retried.taskRuns[0].assignments[0].supersededAt = 2;
+    retried.taskRuns[0].assignments[0].supersededByAssignmentId = "a2";
+    retried.taskRuns[0].assignments.push({
+      ...retried.taskRuns[0].assignments[0],
+      id: "a2",
+      status: "completed",
+      supersededAt: undefined,
+      supersededByAssignmentId: undefined,
+    });
+
+    expect(resolveResultAssignmentId(retried, "task")).toBe("a2");
+    expect(formatResultReport(retried, "task")).toContain("Assignment: a2");
+    expect(formatInspectReport(retried, "task-run-1")).toContain("1 historical attempt");
+    expect(formatInspectReport(retried, "task-run-1")).not.toContain("a1 · RUNNING");
+    expect(formatInspectReport(retried, "a1")).toContain("historical: superseded by a2");
+    expect(formatStatusReport(retried, "task-run-1")).not.toContain("assignments: 1 active");
+  });
+
+  test("a task with only superseded history has no authoritative result", () => {
+    const historical = structuredClone(state);
+    historical.taskRuns[0].assignments[0].supersededAt = 2;
+    historical.taskRuns[0].assignments[0].supersededByAssignmentId = "missing-replacement";
+
+    expect(resolveResultAssignmentId(historical, "task")).toBeUndefined();
+    expect(formatResultReport(historical, "task")).toContain("No assignments for result target");
+  });
+
   test("result report exposes assignment follow-ups", () => {
     const withFollowUps = structuredClone(state);
     withFollowUps.taskRuns[0].assignments[0].status = "attention";

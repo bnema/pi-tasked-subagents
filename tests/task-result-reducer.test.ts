@@ -258,6 +258,8 @@ describe("task result reducer", () => {
 
     expect(result.applied).toBe(false);
     expect(result.errors).toContain(`Report assignmentId ${assignment.id} is stale; latest assignment is ${retry.id}`);
+    expect(assignment.status).toBe("paused");
+    expect(assignment.supersededByAssignmentId).toBe(retry.id);
     expect(task.status).toBe("running");
     expect(task.criteria.every((criterion) => criterion.satisfied)).toBe(false);
     expect(retry.status).toBe("queued");

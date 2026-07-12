@@ -950,6 +950,25 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(runtime.requests.at(-1)?.tasks[0].prompt).toContain("Fixed in commit abc123");
   });
 
+  test("successful resolution supersedes historical failures and completes the run", async () => {
+    const runtime = new CompletingRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState());
+
+    await expect(controller.resolveTarget("task-run-1", "Fixed in commit abc123")).resolves.toBe(true);
+    await controller.awaitLastWork();
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.status).toBe("completed");
+    expect(taskRun.groups[0].status).toBe("completed");
+    expect(taskRun.tasks.map((task) => task.status)).toEqual(["completed", "completed", "completed"]);
+    expect(taskRun.assignments
+      .filter((assignment) => assignment.id === "a1" || assignment.id === "a2")
+      .every((assignment) => Boolean(assignment.supersededByAssignmentId))).toBe(true);
+    expect(taskRun.assignments.filter((assignment) => !assignment.supersededAt).map((assignment) => assignment.status))
+      .toEqual(["completed", "completed"]);
+  });
+
   test("stopRun uses the assignment launch handle without plan ids", async () => {
     const runtime = new StopSpyRuntime();
     const { controller } = controllerWith(runtime);

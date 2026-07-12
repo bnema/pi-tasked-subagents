@@ -6,6 +6,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 
 import { DEFAULT_WIDGET_LINES } from "../defaults.js";
 import type { TaskAssignmentRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
+import { assignmentsForTask, authoritativeAssignment, isSupersededAssignment } from "../orchestration/assignment-attempts.js";
 import { shortTitle } from "../utils/text.js";
 import {
   GLYPH_ATTENTION,
@@ -161,14 +162,8 @@ function statusProgressLabel(
   return `${statusGlyphValue} ${muted(`${progress.done}/${progress.total}`, theme)}`;
 }
 
-function assignmentsForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord[] {
-  return task.assignmentIds
-    .map((assignmentId) => taskRun.assignments.find((candidate) => candidate.id === assignmentId))
-    .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
-}
-
 function assignmentForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
-  return assignmentsForTask(taskRun, task).at(-1);
+  return authoritativeAssignment(taskRun, task);
 }
 
 function tasksForGroup(taskRun: TaskRunRecord, groupId: string | undefined): TaskRecord[] {
@@ -407,6 +402,11 @@ function checklistAssignmentLine(assignment: TaskAssignmentRecord, groupLast: bo
   return `${taskChildPrefix}${linePrefix(assignmentLast)}${statusGlyph(assignment.status)} ${assignment.agent} ${shortAssignmentId(assignment.id)}`;
 }
 
+function checklistHistoryLine(count: number, groupLast: boolean, taskLast: boolean): string {
+  const taskChildPrefix = `${childPrefix(groupLast)}${childPrefix(taskLast)}`;
+  return `${taskChildPrefix}${linePrefix(true)}${count} previous ${count === 1 ? "attempt" : "attempts"}`;
+}
+
 export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100): string[] {
   if (limit <= 0) return [];
   const rawLines: string[] = [];
@@ -430,10 +430,15 @@ export function buildTaskRunChecklistLines(taskRun: TaskRunRecord, limit = 100):
       totalLineCount += 1;
       append(checklistTaskLine(taskRun, task, groupLast, taskLast, task.id === currentTaskId));
       const assignments = assignmentsForTask(taskRun, task);
-      for (const [assignmentIndex, assignment] of assignments.entries()) {
-        const assignmentLast = assignmentIndex === assignments.length - 1;
+      const assignment = authoritativeAssignment(taskRun, task);
+      const historicalCount = assignments.filter(isSupersededAssignment).length;
+      if (assignment) {
         totalLineCount += 1;
-        append(checklistAssignmentLine(assignment, groupLast, taskLast, assignmentLast));
+        append(checklistAssignmentLine(assignment, groupLast, taskLast, historicalCount === 0));
+      }
+      if (historicalCount > 0) {
+        totalLineCount += 1;
+        append(checklistHistoryLine(historicalCount, groupLast, taskLast));
       }
     }
   }
@@ -494,7 +499,9 @@ export function buildWidgetLines(
 }
 
 function hasActiveAssignment(state: TaskedSubagentsState): boolean {
-  return state.taskRuns.some((taskRun) => taskRun.assignments.some((assignment) => assignment.status === "queued" || assignment.status === "running"));
+  return state.taskRuns.some((taskRun) => taskRun.assignments.some(
+    (assignment) => !isSupersededAssignment(assignment) && (assignment.status === "queued" || assignment.status === "running"),
+  ));
 }
 
 export function createWidgetContent(

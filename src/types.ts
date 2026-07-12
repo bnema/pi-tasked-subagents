@@ -254,6 +254,8 @@ export interface TaskAssignmentRecord {
   lastActionAt?: number;
   lastActionSummary?: string;
   recentActivity?: string[];
+  supersededAt?: number;
+  supersededByAssignmentId?: string;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;

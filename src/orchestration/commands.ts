@@ -4,6 +4,7 @@
 
 import type { AgentProfile } from "../launcher/agent-profiles.js";
 import type { TaskAssignmentRecord, TaskGroupRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
+import { assignmentsForTask, authoritativeAssignment, authoritativeAssignments, isSupersededAssignment } from "./assignment-attempts.js";
 import { statusLabel } from "../ui/messages.js";
 import { buildTaskRunChecklistLines } from "../ui/widget.js";
 import { shortTitle } from "../utils/text.js";
@@ -202,12 +203,6 @@ function findAssignment(state: TaskedSubagentsState, id: string): { taskRun: Tas
   return undefined;
 }
 
-function assignmentsForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord[] {
-  return task.assignmentIds
-    .map((assignmentId) => taskRun.assignments.find((assignment) => assignment.id === assignmentId))
-    .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
-}
-
 function assignmentSummaryLine(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): string {
   const task = taskRun.tasks.find((candidate) => candidate.id === assignment.taskId);
   const summary = assignment.result?.summary ? ` · ${shortTitle(assignment.result.summary, 80)}` : "";
@@ -215,22 +210,31 @@ function assignmentSummaryLine(taskRun: TaskRunRecord, assignment: TaskAssignmen
 }
 
 function taskAssignmentSummary(taskRun: TaskRunRecord, task: TaskRecord): string {
-  const assignmentIds = assignmentsForTask(taskRun, task).map((assignment) => assignment.id);
-  return assignmentIds.length > 0 ? assignmentIds.join(", ") : "no assignment";
+  const assignment = authoritativeAssignment(taskRun, task);
+  const historicalCount = assignmentsForTask(taskRun, task).filter(isSupersededAssignment).length;
+  if (!assignment) return "no assignment";
+  return historicalCount > 0
+    ? `${assignment.id} · ${historicalCount} historical ${historicalCount === 1 ? "attempt" : "attempts"}`
+    : assignment.id;
 }
 
 function assignmentsForTarget(state: TaskedSubagentsState, targetId: string): TaskAssignmentRecord[] | undefined {
   const assignment = findAssignment(state, targetId);
   if (assignment) return [assignment.assignment];
   const task = findTask(state, targetId);
-  if (task) return assignmentsForTask(task.taskRun, task.task);
+  if (task) {
+    const authoritative = authoritativeAssignment(task.taskRun, task.task);
+    return authoritative ? [authoritative] : [];
+  }
   const group = findGroup(state, targetId);
   if (group) {
-    const ids = new Set(group.taskRun.tasks.filter((taskRecord) => taskRecord.groupId === group.group.id).flatMap((taskRecord) => taskRecord.assignmentIds));
-    return group.taskRun.assignments.filter((candidate) => ids.has(candidate.id));
+    return group.taskRun.tasks
+      .filter((taskRecord) => taskRecord.groupId === group.group.id)
+      .map((taskRecord) => authoritativeAssignment(group.taskRun, taskRecord))
+      .filter((candidate): candidate is TaskAssignmentRecord => Boolean(candidate));
   }
   const taskRun = findTaskRun(state, targetId);
-  if (taskRun) return taskRun.assignments;
+  if (taskRun) return authoritativeAssignments(taskRun);
   return undefined;
 }
 
@@ -267,7 +271,7 @@ export function formatStatusReport(state: TaskedSubagentsState, targetId?: strin
 
 function formatTaskRunStatusLines(taskRun: TaskRunRecord): string[] {
   const completedTasks = taskRun.tasks.filter((task) => task.status === "completed").length;
-  const runningAssignments = taskRun.assignments.filter((assignment) => assignment.status === "running" || assignment.status === "queued").length;
+  const runningAssignments = taskRun.assignments.filter((assignment) => !isSupersededAssignment(assignment) && (assignment.status === "running" || assignment.status === "queued")).length;
   const attentionTasks = taskRun.tasks.filter((task) => task.status === "attention" || task.status === "failed" || task.status === "blocked").length;
   return [
     `${taskRun.id} · ${statusLabel(taskRun.status)} · ${taskRun.title}`,
@@ -315,10 +319,13 @@ function formatTaskRunDetail(taskRun: TaskRunRecord): string {
   for (const group of taskRun.groups) lines.push(`  ${group.id} · ${statusLabel(group.status)} · ${group.title}`);
   lines.push("", `Tasks (${taskRun.tasks.length}):`);
   for (const task of taskRun.tasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(taskRun, task)} · ${task.text}`);
-  if (taskRun.assignments.length > 0) {
-    lines.push("", `Assignments (${taskRun.assignments.length}):`);
-    for (const assignment of taskRun.assignments) lines.push(`  ${assignmentSummaryLine(taskRun, assignment)}`);
+  const currentAssignments = authoritativeAssignments(taskRun);
+  const historicalCount = taskRun.assignments.filter(isSupersededAssignment).length;
+  if (currentAssignments.length > 0) {
+    lines.push("", `Assignments (${currentAssignments.length} current):`);
+    for (const assignment of currentAssignments) lines.push(`  ${assignmentSummaryLine(taskRun, assignment)}`);
   }
+  if (historicalCount > 0) lines.push(`  ${historicalCount} historical ${historicalCount === 1 ? "attempt" : "attempts"}`);
   if (taskRun.artifacts.length > 0) lines.push(`Artifacts: ${taskRun.artifacts.length}`);
   return lines.join("\n");
 }
@@ -329,12 +336,16 @@ function formatGroupDetail(taskRun: TaskRunRecord, group: TaskGroupRecord): stri
   if (group.dependsOn.length) lines.push(`  depends on: ${group.dependsOn.join(", ")}`);
   lines.push("", `Tasks (${groupTasks.length}):`);
   for (const task of groupTasks) lines.push(`  ${task.id} · ${statusLabel(task.status)} · ${taskAssignmentSummary(taskRun, task)} · ${task.text}`);
-  const ids = new Set(groupTasks.flatMap((task) => task.assignmentIds));
-  const assignments = taskRun.assignments.filter((assignment) => ids.has(assignment.id));
+  const taskAssignments = groupTasks.flatMap((task) => assignmentsForTask(taskRun, task));
+  const assignments = groupTasks
+    .map((task) => authoritativeAssignment(taskRun, task))
+    .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
+  const historicalCount = taskAssignments.filter(isSupersededAssignment).length;
   if (assignments.length > 0) {
-    lines.push("", `Assignments (${assignments.length}):`);
+    lines.push("", `Assignments (${assignments.length} current):`);
     for (const assignment of assignments) lines.push(`  ${assignmentSummaryLine(taskRun, assignment)}`);
   }
+  if (historicalCount > 0) lines.push(`  ${historicalCount} historical ${historicalCount === 1 ? "attempt" : "attempts"}`);
   return lines.join("\n");
 }
 
@@ -351,7 +362,7 @@ function formatTaskDetail(taskRun: TaskRunRecord, group: TaskGroupRecord | undef
 }
 
 function formatAssignmentDetail(taskRun: TaskRunRecord, assignment: TaskAssignmentRecord): string {
-  const lines = [`Assignment: ${assignment.id}`, `  status: ${statusLabel(assignment.status)}`, `  taskRun: ${taskRun.id} · ${taskRun.title}`, assignment.groupId ? `  group: ${assignment.groupId}` : undefined, `  task: ${assignment.taskId}`, `  agent: ${assignment.agent}`]
+  const lines = [`Assignment: ${assignment.id}`, `  status: ${statusLabel(assignment.status)}`, assignment.supersededByAssignmentId ? `  historical: superseded by ${assignment.supersededByAssignmentId}` : undefined, `  taskRun: ${taskRun.id} · ${taskRun.title}`, assignment.groupId ? `  group: ${assignment.groupId}` : undefined, `  task: ${assignment.taskId}`, `  agent: ${assignment.agent}`]
     .filter((line): line is string => Boolean(line));
   if (assignment.result?.summary) lines.push(`  result: ${assignment.result.summary}`);
   if (assignment.result?.followUps.length) {
