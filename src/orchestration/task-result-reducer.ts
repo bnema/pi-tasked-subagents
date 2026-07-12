@@ -158,10 +158,6 @@ export function applySubagentTaskReport(
 ): ApplyTaskReportResult {
   const timestamp = options.now ?? Date.now();
   const assignment = taskRun.assignments.find((candidate) => candidate.id === (options.expectedAssignmentId ?? report.assignmentId));
-  if (options.expectedAssignmentId && report.assignmentId !== options.expectedAssignmentId) {
-    putTaskAttention(taskRun, assignment, timestamp);
-    return { applied: false, errors: [`Report assignmentId ${report.assignmentId} does not match launched assignment ${options.expectedAssignmentId}`], warnings: [] };
-  }
   if (assignment) {
     const found = findTask(taskRun, assignment.taskId);
     const latestAssignmentId = found?.task.assignmentIds.at(-1);
@@ -173,6 +169,10 @@ export function applySubagentTaskReport(
         warnings: ["Ignored stale task report without mutating task evidence or status"],
       };
     }
+  }
+  if (options.expectedAssignmentId && report.assignmentId !== options.expectedAssignmentId) {
+    putTaskAttention(taskRun, assignment, timestamp);
+    return { applied: false, errors: [`Report assignmentId ${report.assignmentId} does not match launched assignment ${options.expectedAssignmentId}`], warnings: [] };
   }
 
   const validation = validateReport(taskRun, assignment, report);

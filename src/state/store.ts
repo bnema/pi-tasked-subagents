@@ -319,11 +319,15 @@ function normalizeTaskRun(raw: unknown, _index: number): TaskRunRecord | undefin
     const taskAssignments = task.assignmentIds
       .map((assignmentId) => assignments.find((assignment) => assignment.id === assignmentId))
       .filter((assignment): assignment is TaskAssignmentRecord => Boolean(assignment));
-    for (let index = 0; index < taskAssignments.length - 1; index += 1) {
-      const assignment = taskAssignments[index];
+    for (const [index, assignment] of taskAssignments.entries()) {
       const replacement = taskAssignments[index + 1];
-      assignment.supersededAt ??= replacement.createdAt;
-      assignment.supersededByAssignmentId ??= replacement.id;
+      if (replacement) {
+        assignment.supersededAt = replacement.createdAt;
+        assignment.supersededByAssignmentId = replacement.id;
+      } else {
+        delete assignment.supersededAt;
+        delete assignment.supersededByAssignmentId;
+      }
     }
   }
   const supersededAssignmentIds = new Set(assignments

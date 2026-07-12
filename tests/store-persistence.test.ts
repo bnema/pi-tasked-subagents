@@ -116,10 +116,16 @@ describe("task-run state store", () => {
     expect(restored.taskRuns[0].tasks[0].expansionMode).toBe("append_tasks");
   });
 
-  test("preserves assignment supersession metadata when restoring state", () => {
+  test("preserves valid assignment supersession metadata when restoring state", () => {
     const supersededState: TaskedSubagentsState = structuredClone(currentState);
-    supersededState.taskRuns[0].assignments[0].supersededAt = 2;
-    supersededState.taskRuns[0].assignments[0].supersededByAssignmentId = "assignment-2";
+    const old = supersededState.taskRuns[0].assignments[0];
+    old.supersededAt = 2;
+    old.supersededByAssignmentId = "assignment-2";
+    const replacement = { ...old, id: "assignment-2", status: "completed" as const, createdAt: 2, updatedAt: 2 };
+    delete replacement.supersededAt;
+    delete replacement.supersededByAssignmentId;
+    supersededState.taskRuns[0].assignments.push(replacement);
+    supersededState.taskRuns[0].tasks[0].assignmentIds.push(replacement.id);
 
     const restored = deserializeState(serializeState(supersededState));
 
@@ -127,6 +133,27 @@ describe("task-run state store", () => {
       supersededAt: 2,
       supersededByAssignmentId: "assignment-2",
     });
+  });
+
+  test("repairs contradictory assignment supersession metadata when restoring state", () => {
+    const supersededState: TaskedSubagentsState = structuredClone(currentState);
+    const old = supersededState.taskRuns[0].assignments[0];
+    old.supersededAt = 99;
+    old.supersededByAssignmentId = "missing";
+    const replacement = { ...old, id: "assignment-2", status: "completed" as const, createdAt: 2, updatedAt: 2 };
+    replacement.supersededAt = 100;
+    replacement.supersededByAssignmentId = replacement.id;
+    supersededState.taskRuns[0].assignments.push(replacement);
+    supersededState.taskRuns[0].tasks[0].assignmentIds.push(replacement.id);
+
+    const restored = deserializeState(serializeState(supersededState));
+
+    expect(restored.taskRuns[0].assignments[0]).toMatchObject({
+      supersededAt: 2,
+      supersededByAssignmentId: "assignment-2",
+    });
+    expect(restored.taskRuns[0].assignments[1].supersededAt).toBeUndefined();
+    expect(restored.taskRuns[0].assignments[1].supersededByAssignmentId).toBeUndefined();
   });
 
   test("infers supersession for historical attempts restored without metadata", () => {

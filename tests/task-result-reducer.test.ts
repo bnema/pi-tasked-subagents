@@ -246,6 +246,28 @@ describe("task result reducer", () => {
     expect(taskRun.status).toBe("attention");
   });
 
+  test("ignores mismatched reports from superseded assignments without disrupting the replacement", () => {
+    const fixture = setup();
+    const { taskRun, assignment, task } = fixture;
+    assignment.status = "paused";
+    task.status = "ready";
+    task.continuation = "Retry";
+    const retry = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 4 }).assignments[0];
+
+    const result = applySubagentTaskReport(taskRun, {
+      ...completeReport(fixture),
+      assignmentId: "wrong",
+    }, { now: 5, expectedAssignmentId: assignment.id });
+
+    expect(result.applied).toBe(false);
+    expect(result.errors).toContain(`Report assignmentId ${assignment.id} is stale; latest assignment is ${retry.id}`);
+    expect(result.warnings).toContain("Ignored stale task report without mutating task evidence or status");
+    expect(assignment.status).toBe("paused");
+    expect(task.status).toBe("running");
+    expect(taskRun.status).toBe("running");
+    expect(retry.status).toBe("queued");
+  });
+
   test("rejects stale reports for non-latest assignments without completing the task", () => {
     const fixture = setup();
     const { taskRun, assignment, task } = fixture;
