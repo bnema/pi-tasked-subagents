@@ -31,6 +31,7 @@ interface TaskRunControllerApi {
   resolveTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
   stopRun(assignmentId: string): Promise<boolean>;
   cancelRun(assignmentId: string): Promise<boolean>;
+  cancelActiveRuns(): Promise<number>;
   clear(scope?: "completed" | "all"): Promise<number>;
   handleUserAsk(prompt: string, ctx?: unknown): Promise<unknown>;
   awaitLastWork(): Promise<void>;
@@ -439,6 +440,16 @@ class CancelSpyRuntime extends CompletingRuntime {
   cancelled: SubagentRunHandle[] = [];
   async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
     this.cancelled.push(handle);
+    return true;
+  }
+}
+
+class PartialCancelRuntime extends CompletingRuntime {
+  attempted: string[] = [];
+
+  async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.attempted.push(handle.runId);
+    if (handle.runId === "run-1") throw new Error("cancel run-1 failed");
     return true;
   }
 }
@@ -1114,6 +1125,126 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     const assignments = controller.getState().taskRuns[0].assignments;
     expect(assignments.find((assignment) => assignment.id === "a1")?.status).toBe("cancelled");
     expect(assignments.find((assignment) => assignment.id === "a2")?.status).toBe("failed");
+  });
+
+  test("cancelActiveRuns cancels each live subagent run", async () => {
+    const runtime = new CancelSpyRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("running"));
+    markRunLive(controller, "run-1");
+
+    await expect(controller.cancelActiveRuns()).resolves.toBe(1);
+
+    expect(runtime.cancelled).toEqual([launchRef()]);
+    expect(controller.getState().taskRuns[0].assignments.every((assignment) => assignment.status === "cancelled" || assignment.status === "failed")).toBe(true);
+  });
+
+  test("cancelActiveRuns catches dispatch scheduling before launchTaskGraph starts", async () => {
+    const runtime = new LaunchControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    const state = recoverableState();
+    state.taskRuns[0].status = "running";
+    state.taskRuns[0].groups[0].status = "ready";
+    state.taskRuns[0].tasks = [
+      { id: "ready", groupId: "main", text: "Ready task", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+    ];
+    state.taskRuns[0].assignments = [];
+    controller.restoreState(state);
+
+    const dispatch = controller.dispatchReady({ taskRunId: "task-run-1" });
+    await expect(controller.cancelActiveRuns()).resolves.toBe(1);
+    await dispatch;
+
+    expect(runtime.requests).toHaveLength(0);
+    expect(controller.getState().taskRuns[0].assignments[0]?.status).toBe("cancelled");
+  });
+
+  test("cancelActiveRuns cancels a launch that is still being committed", async () => {
+    const runtime = new LaunchControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    const setTasks = controller.setTasks({ ...baseSetTasks, wait: true });
+    await runtime.launchStarted;
+
+    await expect(controller.cancelActiveRuns()).resolves.toBe(1);
+    runtime.releaseLaunch();
+    await setTasks;
+
+    expect(runtime.cancelled).toHaveLength(1);
+    expect(controller.getState().taskRuns[0].assignments[0]?.status).toBe("cancelled");
+  });
+
+  test("cancelActiveRuns catches a resolved launch before assignment commit", async () => {
+    const runtime = new LaunchControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    const setTasks = controller.setTasks({ ...baseSetTasks, wait: true });
+    await runtime.launchStarted;
+
+    let lockStarted!: () => void;
+    let releaseLock!: () => void;
+    const started = new Promise<void>((resolve) => { lockStarted = resolve; });
+    const lock = (controller as unknown as { lock: { withLock<T>(operation: () => Promise<T>): Promise<T> } }).lock;
+    const blocker = lock.withLock(() => {
+      lockStarted();
+      return new Promise<void>((resolve) => { releaseLock = resolve; });
+    });
+    await started;
+
+    const cancellation = controller.cancelActiveRuns();
+    runtime.releaseLaunch();
+    releaseLock();
+    await blocker;
+    await expect(cancellation).resolves.toBe(1);
+    await setTasks;
+
+    expect(runtime.cancelled).toHaveLength(1);
+    expect(controller.getState().taskRuns[0].assignments[0]?.status).toBe("cancelled");
+  });
+
+  test("restoreState clears launch cancellation bookkeeping", async () => {
+    const runtime = new LaunchControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    const setTasks = controller.setTasks({ ...baseSetTasks, wait: true });
+    await runtime.launchStarted;
+
+    controller.restoreState({ version: 4, taskRuns: [], updatedAt: 2 });
+    await expect(controller.cancelActiveRuns()).resolves.toBe(0);
+    runtime.releaseLaunch();
+    await setTasks;
+
+    expect(runtime.cancelled).toHaveLength(1);
+    expect(controller.getState().taskRuns).toEqual([]);
+  });
+
+  test("cancelActiveRuns continues after one live run fails to cancel", async () => {
+    const runtime = new PartialCancelRuntime();
+    const { controller } = controllerWith(runtime);
+    const state = recoverableState("running");
+    const secondRun = structuredClone(state.taskRuns[0]);
+    secondRun.id = "task-run-2";
+    secondRun.tasks[0].id = "attention-2";
+    secondRun.tasks[0].assignmentIds = ["b1"];
+    secondRun.tasks[1].id = "failed-2";
+    secondRun.tasks[1].assignmentIds = ["b2"];
+    const secondRef: SubagentRunHandle = {
+      runId: "run-2",
+      asyncId: "async-run-2",
+      resultPath: "/tmp/run-2.json",
+      assignments: [
+        { assignmentId: "b1", runId: "run-2", resultPath: "/tmp/run-2.json" },
+        { assignmentId: "b2", runId: "run-2", resultPath: "/tmp/run-2.json" },
+      ],
+    };
+    secondRun.assignments[0] = { ...secondRun.assignments[0], id: "b1", taskRunId: "task-run-2", taskId: "attention-2", runId: "run-2", launchRef: secondRef };
+    secondRun.assignments[1] = { ...secondRun.assignments[1], id: "b2", taskRunId: "task-run-2", taskId: "failed-2", runId: "run-2", launchRef: secondRef };
+    state.taskRuns.push(secondRun);
+    controller.restoreState(state);
+    markRunLive(controller, "run-1");
+    markRunLive(controller, "run-2");
+
+    await expect(controller.cancelActiveRuns()).rejects.toThrow("cancel run-1 failed");
+
+    expect(runtime.attempted).toEqual(["run-1", "run-2"]);
+    expect(controller.getState().taskRuns[1].assignments[0].status).toBe("cancelled");
   });
 
   test("cancelRun marks an attention assignment without signalling stale pids", async () => {

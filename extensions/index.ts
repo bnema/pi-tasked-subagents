@@ -7,7 +7,7 @@ import type {
   ExtensionCommandContext,
   InputSource,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { COMMAND_NAME, TOOL_NAME } from "../src/defaults.js";
@@ -203,6 +203,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    let escapeCancellation: Promise<number> | undefined;
     const entries = ctx.sessionManager.getBranch();
     const restored = restoreStateFromSessionEntries(entries.map((entry) => ({
       type: entry.type,
@@ -212,6 +213,24 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     controller.restoreState(restored);
     controller.updateUI(ctx);
     controller.reconcileRestoredRuns(ctx);
+    if (ctx.mode === "tui") {
+      ctx.ui.onTerminalInput((data) => {
+        if (!matchesKey(data, "escape") || escapeCancellation) return;
+        escapeCancellation = controller.cancelActiveRuns();
+        void escapeCancellation
+          .then((count) => {
+            if (count > 0) ctx.ui.notify(`Cancelled ${count} active subagent run${count === 1 ? "" : "s"}.`, "info");
+          })
+          .catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            ctx.ui.notify(`Could not cancel active subagent runs: ${message}`, "error");
+          })
+          .finally(() => {
+            escapeCancellation = undefined;
+          });
+        return undefined;
+      });
+    }
   });
 
   pi.on("session_tree", async (_event, ctx) => {

@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
 import taskedSubagentsExtension from "../extensions/index.js";
+import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 
 interface CapturedTool {
   description: string;
@@ -44,6 +45,70 @@ function renderCollapsedToolResult(text: string): string {
 }
 
 describe("tasked_subagents extension rendering", () => {
+  test("Escape cancels active subagent runs without consuming Pi's interrupt", async () => {
+    let sessionStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+    const terminalInputs: Array<(data: string) => { consume?: boolean } | undefined> = [];
+    let resolveFirstCancellation: ((count: number) => void) | undefined;
+    const firstCancellation = new Promise<number>((resolve) => {
+      resolveFirstCancellation = resolve;
+    });
+    const cancelActiveRuns = vi.spyOn(TaskedSubagentsController.prototype, "cancelActiveRuns")
+      .mockReturnValueOnce(firstCancellation)
+      .mockResolvedValue(1);
+    const notify = vi.fn();
+
+    taskedSubagentsExtension({
+      on: vi.fn((event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => {
+        if (event === "session_start") sessionStart = handler;
+      }),
+      registerMessageRenderer: vi.fn(),
+      registerTool: vi.fn(),
+      registerCommand: vi.fn(),
+      appendEntry: vi.fn(),
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(sessionStart).toBeDefined();
+    await sessionStart?.({}, {
+      cwd: "/tmp/project",
+      mode: "tui",
+      sessionManager: { getBranch: () => [], getSessionId: () => "session-1" },
+      ui: {
+        theme: { fg: (_color: string, value: string) => value },
+        notify,
+        onTerminalInput: (handler: (data: string) => { consume?: boolean } | undefined) => {
+          terminalInputs.push(handler);
+          return vi.fn();
+        },
+        setStatus: vi.fn(),
+        setWidget: vi.fn(),
+        requestRender: vi.fn(),
+      },
+    });
+
+    expect(terminalInputs[0]?.("\u001b")).toBeUndefined();
+    await sessionStart?.({}, {
+      cwd: "/tmp/project",
+      mode: "tui",
+      sessionManager: { getBranch: () => [], getSessionId: () => "session-2" },
+      ui: {
+        theme: { fg: (_color: string, value: string) => value },
+        notify,
+        onTerminalInput: (handler: (data: string) => { consume?: boolean } | undefined) => {
+          terminalInputs.push(handler);
+          return vi.fn();
+        },
+        setStatus: vi.fn(),
+        setWidget: vi.fn(),
+        requestRender: vi.fn(),
+      },
+    });
+    expect(terminalInputs[1]?.("\u001b")).toBeUndefined();
+    await vi.waitFor(() => expect(cancelActiveRuns).toHaveBeenCalledTimes(2));
+    resolveFirstCancellation?.(1);
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith("Cancelled 1 active subagent run.", "info"));
+  });
+
   test("slash command description includes resolve", () => {
     expect(captureExtension().command.description).toContain("resolve");
   });

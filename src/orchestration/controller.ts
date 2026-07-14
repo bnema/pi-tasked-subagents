@@ -239,6 +239,8 @@ export class TaskedSubagentsController {
   private readonly scheduledDispatches = new Map<string, Promise<void>>();
   private readonly runProgressSignatures = new Map<string, string>();
   private readonly liveRunIds = new Map<string, number>();
+  private readonly launchingRuns = new Map<string, string[]>();
+  private readonly cancellationRequestedRunIds = new Set<string>();
   private stateEpoch = 0;
   private dispatchRunCounter = 0;
 
@@ -257,6 +259,8 @@ export class TaskedSubagentsController {
     this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
     this.runProgressSignatures.clear();
     this.liveRunIds.clear();
+    this.launchingRuns.clear();
+    this.cancellationRequestedRunIds.clear();
     this.scheduledDispatches.clear();
     this.lastDispatchWork = Promise.resolve();
     this.stateEpoch += 1;
@@ -428,6 +432,7 @@ export class TaskedSubagentsController {
           return undefined;
         }
         const runId = this.nextDispatchRunId(taskRun.id);
+        this.launchingRuns.set(runId, scheduled.assignments.map((assignment) => assignment.id));
         return { taskRunId: taskRun.id, runId, title: taskRun.title, maxConcurrency: taskRun.maxConcurrency, assignments: scheduled.assignments };
       });
 
@@ -437,6 +442,7 @@ export class TaskedSubagentsController {
       try {
         const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
         if (!taskRun) return aggregate;
+        if (this.cancellationRequestedRunIds.delete(launch.runId)) return aggregate;
         const launchedRef = launchRefForAssignments(await this.runtime.launchTaskGraph({
           runId: launch.runId,
           title: `TaskRun ${taskRun.id}: ${taskRun.title}`,
@@ -446,6 +452,11 @@ export class TaskedSubagentsController {
           cwd: options.defaultCwd ?? runtimeCtx.cwd,
         }, runtimeCtx), launch.assignments);
         ref = launchedRef;
+        if (this.cancellationRequestedRunIds.delete(launchedRef.runId)) {
+          const cancelled = await this.runtime.cancelRun(launchedRef, runtimeCtx);
+          if (!cancelled) throw new Error(`Could not cancel launching subagent run ${launchedRef.runId}`);
+          return aggregate;
+        }
         this.liveRunIds.set(launchedRef.runId, dispatchEpoch);
         if (this.stateEpoch !== dispatchEpoch) {
           await this.runtime.cancelRun(launchedRef, runtimeCtx).catch((cancelError: unknown) => {
@@ -455,10 +466,11 @@ export class TaskedSubagentsController {
           return aggregate;
         }
 
-        await this.lock.withLock(() => {
-          if (this.stateEpoch !== dispatchEpoch) return;
+        const commit = await this.lock.withLock(() => {
+          if (this.cancellationRequestedRunIds.delete(launchedRef.runId)) return "cancelled" as const;
+          if (this.stateEpoch !== dispatchEpoch) return "stale" as const;
           const current = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
-          if (!current) return;
+          if (!current) return "stale" as const;
           for (const assignment of launch.assignments) {
             const stored = current.assignments.find((candidate) => candidate.id === assignment.id);
             if (!stored) continue;
@@ -470,7 +482,17 @@ export class TaskedSubagentsController {
           deriveTaskRunStatus(current);
           this.persistState();
           this.updateUI(options.ctx ?? this.lastContext);
+          return "committed" as const;
         });
+        if (commit !== "committed") {
+          const cancelled = await this.runtime.cancelRun(launchedRef, runtimeCtx).catch((cancelError: unknown) => {
+            console.error(`[${PACKAGE_NAME}] failed to cancel ${commit} dispatch:`, cancelError);
+            return false;
+          });
+          if (commit === "cancelled" && !cancelled) throw new Error(`Could not cancel launching subagent run ${launchedRef.runId}`);
+          if (commit === "stale") await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext);
+          return aggregate;
+        }
         aggregate.launched += launch.assignments.length;
 
         const status = await this.waitForRunOutcome(launchedRef, dispatchEpoch, runtimeCtx, launch.taskRunId, options.ctx ?? this.lastContext);
@@ -507,6 +529,8 @@ export class TaskedSubagentsController {
           this.updateUI(options.ctx ?? this.lastContext);
         });
       } finally {
+        this.launchingRuns.delete(launch.runId);
+        this.cancellationRequestedRunIds.delete(launch.runId);
         if (ref) this.releaseLiveRun(ref.runId, dispatchEpoch);
       }
       if (this.stateEpoch !== dispatchEpoch) return aggregate;
@@ -602,6 +626,59 @@ export class TaskedSubagentsController {
     if (!ok) return false;
     await this.markRunStatus(target.handle.runId, "cancelled");
     return true;
+  }
+
+  async cancelActiveRuns(): Promise<number> {
+    const { assignmentIds, launchingRunIds } = await this.lock.withLock(() => {
+      const assignmentIds: string[] = [];
+      const runIds = new Set<string>();
+      for (const taskRun of this.state.taskRuns) {
+        for (const assignment of taskRun.assignments) {
+          if ((assignment.status !== "queued" && assignment.status !== "running") || !assignment.runId) continue;
+          if (!this.liveRunIds.has(assignment.runId) || runIds.has(assignment.runId)) continue;
+          if (!this.resolveHandleForAssignment(assignment.id)) continue;
+          runIds.add(assignment.runId);
+          assignmentIds.push(assignment.id);
+        }
+      }
+
+      const launchingRunIds = [...this.launchingRuns.keys()];
+      if (launchingRunIds.length > 0) {
+        const launchingAssignmentIds = new Set([...this.launchingRuns.values()].flat());
+        const timestamp = Date.now();
+        for (const taskRun of this.state.taskRuns) {
+          let changed = false;
+          for (const assignment of taskRun.assignments) {
+            if (!launchingAssignmentIds.has(assignment.id) || assignment.status !== "queued") continue;
+            assignment.status = "cancelled";
+            assignment.updatedAt = timestamp;
+            assignment.completedAt = timestamp;
+            changed = true;
+          }
+          if (changed) deriveTaskRunStatus(taskRun, timestamp);
+        }
+        for (const runId of launchingRunIds) this.cancellationRequestedRunIds.add(runId);
+        this.persistState();
+        this.updateUI(this.lastContext);
+      }
+      return { assignmentIds, launchingRunIds };
+    });
+
+    let cancelled = launchingRunIds.length;
+    const errors: unknown[] = [];
+    for (const assignmentId of assignmentIds) {
+      try {
+        if (await this.cancelRun(assignmentId)) cancelled += 1;
+        else errors.push(new Error(`Could not cancel active assignment ${assignmentId}`));
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      const messages = errors.map((error) => error instanceof Error ? error.message : String(error));
+      throw new AggregateError(errors, `Failed to cancel ${errors.length} active subagent run${errors.length === 1 ? "" : "s"}: ${messages.join("; ")}`);
+    }
+    return cancelled;
   }
 
   async getRunResult(assignmentId: string): Promise<string | undefined> {
