@@ -391,5 +391,6 @@ export interface SubagentRuntime<Context = unknown> {
     },
   ): Promise<RunStatus>;
   getRunResult(handle: SubagentRunHandle): Promise<string | undefined>;
+  isRunAlive?(handle: SubagentRunHandle): Promise<boolean>;
   getSnapshot(): { assignments: TaskAssignmentRecord[]; counts: RunCounts };
 }

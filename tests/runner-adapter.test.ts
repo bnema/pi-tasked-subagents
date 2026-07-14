@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -432,6 +433,43 @@ describe("PiRunnerAdapter task graph boundary", () => {
         expect.objectContaining({ id: "active", status: expectedState }),
       ]);
       expect(result).toMatchObject({ runId: "run-restored", state: expectedState, success: false, summary: expectedSummary });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("isRunAlive reflects recorded pid liveness", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    try {
+      const asyncRoot = path.join(root, "async");
+      const resultsRoot = path.join(root, "results");
+      const runDir = path.join(asyncRoot, "run-alive");
+      await mkdir(runDir, { recursive: true });
+      await mkdir(resultsRoot, { recursive: true });
+
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100000)"], { stdio: "ignore" });
+      const deadPid = child.pid ?? -1;
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.on("exit", resolve));
+
+      const adapter = new PiRunnerAdapter({ piBin: "true", asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
+      const statusPath = path.join(runDir, "status.json");
+      const handle: SubagentRunHandle = {
+        runId: "run-alive",
+        asyncId: "run-alive",
+        asyncDir: runDir,
+        resultPath: path.join(resultsRoot, "run-alive.json"),
+        assignments: [],
+      };
+
+      await writeFile(statusPath, JSON.stringify({ runId: "run-alive", state: "running", steps: [{ id: "a1", status: "running", pid: process.pid }] }), "utf8");
+      await expect(adapter.isRunAlive(handle)).resolves.toBe(true);
+
+      await writeFile(statusPath, JSON.stringify({ runId: "run-alive", state: "running", pid: deadPid, steps: [{ id: "a1", status: "running", pid: deadPid }] }), "utf8");
+      await expect(adapter.isRunAlive(handle)).resolves.toBe(false);
+
+      await rm(statusPath);
+      await expect(adapter.isRunAlive(handle)).resolves.toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

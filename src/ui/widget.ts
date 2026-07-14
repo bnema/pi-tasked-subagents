@@ -162,6 +162,12 @@ function statusProgressLabel(
   return `${statusGlyphValue} ${muted(`${progress.done}/${progress.total}`, theme)}`;
 }
 
+function criteriaProgressCounter(task: TaskRecord, theme?: WidgetThemeLike): string | undefined {
+  const progress = taskCriteriaProgress(task);
+  if (progress.total === 0 || progress.done === 0 || progress.done === progress.total) return undefined;
+  return muted(`${progress.done}/${progress.total}`, theme);
+}
+
 function assignmentForTask(taskRun: TaskRunRecord, task: TaskRecord): TaskAssignmentRecord | undefined {
   return authoritativeAssignment(taskRun, task);
 }
@@ -286,22 +292,24 @@ function assignmentActivityItems(assignment: TaskAssignmentRecord): string[] {
 
 function taskActivityLines(
   assignment: TaskAssignmentRecord | undefined,
+  task: TaskRecord,
   parentLast: boolean,
   taskLast: boolean,
   theme?: WidgetThemeLike,
   options: WidgetBuildOptions = {},
 ): string[] {
   if (!assignment || (assignment.status !== "running" && assignment.status !== "queued")) return [];
-  const taskChildPrefix = `${childPrefix(parentLast, theme)}${childPrefix(taskLast, theme)}`;
-  const activityChildPrefix = `${taskChildPrefix}${childPrefix(true, theme)}`;
+  const assignmentPrefix = `${childPrefix(parentLast, theme)}${linePrefix(taskLast, theme)}`;
+  const activityChildPrefix = `${childPrefix(parentLast, theme)}${childPrefix(taskLast, theme)}`;
   const currentTime = options.now ?? Date.now();
   const elapsed = formatElapsed(assignment.createdAt, currentTime);
   const activityItems = assignmentActivityItems(assignment);
-  const assignmentLine = `${taskChildPrefix}${linePrefix(true, theme)}${joinParts([
+  const assignmentLine = `${assignmentPrefix}${joinParts([
     colorStatus(assignment.status, theme),
     muted(assignment.agent, theme),
     muted(shortAssignmentId(assignment.id), theme),
     elapsed ? muted(elapsed, theme) : undefined,
+    criteriaProgressCounter(task, theme),
   ])}`;
 
   return [
@@ -478,10 +486,16 @@ export function buildWidgetLines(
       const reserveCompletedSummary = hasCompletedSummary && isLastVisibleTask && lines.length + 1 < limit;
       const taskIsLast = isLastVisibleTask && !reserveCompletedSummary;
       const activityLimit = reserveCompletedSummary ? limit - 1 : limit;
-      lines.push(buildTaskLine(taskRun, group, task, groupIsLast, taskIsLast, theme));
-      for (const activityLine of taskActivityLines(assignmentForTask(taskRun, task), groupIsLast, taskIsLast, theme, options)) {
-        if (lines.length >= activityLimit) break;
-        lines.push(activityLine);
+      const assignment = assignmentForTask(taskRun, task);
+      const isActive = assignment !== undefined && (assignment.status === "running" || assignment.status === "queued");
+      if (isActive) {
+        const activeLines = taskActivityLines(assignment, task, groupIsLast, taskIsLast, theme, options);
+        lines.push(activeLines[0]);
+        for (let index = 1; index < activeLines.length && lines.length < activityLimit; index += 1) {
+          lines.push(activeLines[index]);
+        }
+      } else {
+        lines.push(buildTaskLine(taskRun, group, task, groupIsLast, taskIsLast, theme));
       }
     }
     if (lines.length < limit) {

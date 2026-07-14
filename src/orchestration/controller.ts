@@ -49,6 +49,7 @@ import {
   toLaunchTaskEntries,
 } from "./task-scheduler.js";
 import { applySubagentTaskReport, parseTaskReport } from "./task-result-reducer.js";
+import { isSupersededAssignment } from "./assignment-attempts.js";
 import { formatAttachReport } from "./commands.js";
 import { normalizeTargetId } from "./ids.js";
 import { maxDispatchRunCounter, maxTaskRunCounter } from "./run-counters.js";
@@ -81,6 +82,8 @@ const DEFAULT_OPTIONS = {
   runtime: new PiRunnerAdapter(),
   defaultAgent: "delegate",
 } satisfies { runtime: SubagentRuntime<RunnerRuntimeContext>; defaultAgent: string };
+
+const DEAD_RUN_RESULT_GRACE_MS = 5_000;
 
 function terminalStatus(status: RunStatus): boolean {
   return status !== "queued" && status !== "running";
@@ -235,7 +238,7 @@ export class TaskedSubagentsController {
   private lastDispatchWork: Promise<void> = Promise.resolve();
   private readonly scheduledDispatches = new Map<string, Promise<void>>();
   private readonly runProgressSignatures = new Map<string, string>();
-  private readonly liveRunIds = new Set<string>();
+  private readonly liveRunIds = new Map<string, number>();
   private stateEpoch = 0;
   private dispatchRunCounter = 0;
 
@@ -258,6 +261,50 @@ export class TaskedSubagentsController {
     this.lastDispatchWork = Promise.resolve();
     this.stateEpoch += 1;
     this.dispatchRunCounter = Math.max(this.dispatchRunCounter, maxDispatchRunCounter(this.state.taskRuns));
+  }
+
+  reconcileRestoredRuns(ctx?: ExtensionContext): void {
+    if (ctx) this.lastContext = ctx;
+    const expectedEpoch = this.stateEpoch;
+    const runtimeCtx = this.runtimeContext(ctx ?? this.lastContext);
+    const reconciledRunIds = new Set<string>();
+    const watchersByTaskRun = new Map<string, Array<Promise<void>>>();
+    for (const taskRun of this.state.taskRuns) {
+      for (const assignment of taskRun.assignments) {
+        if (isSupersededAssignment(assignment)) continue;
+        if (assignment.status !== "queued" && assignment.status !== "running") continue;
+        const handle = assignment.launchRef;
+        if (!handle?.runId || !handle.asyncId || !Array.isArray(handle.assignments) || handle.assignments.length === 0) continue;
+        if (!assignment.runId || assignment.runId !== handle.runId) continue;
+        if (this.liveRunIds.has(handle.runId) || reconciledRunIds.has(handle.runId)) continue;
+        reconciledRunIds.add(handle.runId);
+        const watcher = this.watchRestoredRun(taskRun.id, handle, expectedEpoch, runtimeCtx, ctx ?? this.lastContext);
+        const grouped = watchersByTaskRun.get(taskRun.id) ?? [];
+        grouped.push(watcher);
+        watchersByTaskRun.set(taskRun.id, grouped);
+      }
+    }
+    if (watchersByTaskRun.size === 0) return;
+    const allWatchers: Array<Promise<void>> = [];
+    for (const [taskRunId, watchers] of watchersByTaskRun) {
+      this.registerReconcileWork(taskRunId, watchers);
+      allWatchers.push(...watchers);
+    }
+    this.lastDispatchWork = Promise.all([this.lastDispatchWork.catch(() => undefined), ...allWatchers]).then(() => undefined);
+  }
+
+  private registerReconcileWork(taskRunId: string, watchers: Array<Promise<void>>): void {
+    const previous = this.scheduledDispatches.get(taskRunId);
+    const work = (previous ? previous.catch(() => undefined) : Promise.resolve())
+      .then(() => Promise.all(watchers))
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        console.error(`[${PACKAGE_NAME}] reconcile failed:`, error);
+      });
+    this.scheduledDispatches.set(taskRunId, work);
+    void work.finally(() => {
+      if (this.scheduledDispatches.get(taskRunId) === work) this.scheduledDispatches.delete(taskRunId);
+    });
   }
 
   async awaitLastWork(): Promise<void> {
@@ -399,7 +446,7 @@ export class TaskedSubagentsController {
           cwd: options.defaultCwd ?? runtimeCtx.cwd,
         }, runtimeCtx), launch.assignments);
         ref = launchedRef;
-        this.liveRunIds.add(launchedRef.runId);
+        this.liveRunIds.set(launchedRef.runId, dispatchEpoch);
         if (this.stateEpoch !== dispatchEpoch) {
           await this.runtime.cancelRun(launchedRef, runtimeCtx).catch((cancelError: unknown) => {
             console.error(`[${PACKAGE_NAME}] failed to cancel stale dispatch:`, cancelError);
@@ -426,10 +473,7 @@ export class TaskedSubagentsController {
         });
         aggregate.launched += launch.assignments.length;
 
-        const status = finalWaitStatus(await this.runtime.waitForRunSignal(launchedRef, {
-          ctx: runtimeCtx,
-          onUpdate: (snapshot) => this.applyRunProgressUpdate(launch.taskRunId, snapshot, dispatchEpoch, options.ctx ?? this.lastContext),
-        }));
+        const status = await this.waitForRunOutcome(launchedRef, dispatchEpoch, runtimeCtx, launch.taskRunId, options.ctx ?? this.lastContext);
         if (this.stateEpoch !== dispatchEpoch) return aggregate;
         const raw = await this.runtime.getRunResult(launchedRef);
         if (this.stateEpoch !== dispatchEpoch) return aggregate;
@@ -463,13 +507,60 @@ export class TaskedSubagentsController {
           this.updateUI(options.ctx ?? this.lastContext);
         });
       } finally {
-        if (ref) this.liveRunIds.delete(ref.runId);
+        if (ref) this.releaseLiveRun(ref.runId, dispatchEpoch);
       }
       if (this.stateEpoch !== dispatchEpoch) return aggregate;
       const shouldContinue = this.state.taskRuns
         .find((candidate) => candidate.id === launch.taskRunId)
         ?.tasks.some((task) => task.status === "ready");
       if (!shouldContinue) return aggregate;
+    }
+  }
+
+  private async watchRestoredRun(
+    taskRunId: string,
+    handle: SubagentRunHandle,
+    expectedEpoch: number,
+    runtimeCtx: RunnerRuntimeContext,
+    ctx: ExtensionContext | undefined,
+  ): Promise<void> {
+    if (this.stateEpoch !== expectedEpoch) return;
+    this.liveRunIds.set(handle.runId, expectedEpoch);
+    try {
+      const status = await this.waitForRunOutcome(handle, expectedEpoch, runtimeCtx, taskRunId, ctx);
+      if (this.stateEpoch !== expectedEpoch) return;
+      const raw = await this.runtime.getRunResult(handle);
+      if (this.stateEpoch !== expectedEpoch) return;
+      await this.applyRunOutcome(taskRunId, handle.runId, status, raw, expectedEpoch, ctx);
+    } catch (error) {
+      console.error(`[${PACKAGE_NAME}] failed to reconcile restored run ${handle.runId}:`, error);
+    } finally {
+      this.releaseLiveRun(handle.runId, expectedEpoch);
+    }
+  }
+
+  private releaseLiveRun(runId: string, ownerEpoch: number): void {
+    if (this.liveRunIds.get(runId) === ownerEpoch) this.liveRunIds.delete(runId);
+  }
+
+  private async waitForRunOutcome(
+    handle: SubagentRunHandle,
+    expectedEpoch: number,
+    runtimeCtx: RunnerRuntimeContext,
+    taskRunId: string,
+    ctx: ExtensionContext | undefined,
+  ): Promise<RunStatus> {
+    while (true) {
+      const aliveBeforeWait = this.runtime.isRunAlive ? await this.runtime.isRunAlive(handle) : undefined;
+      const status = finalWaitStatus(await this.runtime.waitForRunSignal(handle, {
+        ctx: runtimeCtx,
+        onUpdate: (snapshot) => this.applyRunProgressUpdate(taskRunId, snapshot, expectedEpoch, ctx),
+        ...(aliveBeforeWait === false ? { timeoutMs: DEAD_RUN_RESULT_GRACE_MS } : {}),
+      }));
+      if (this.stateEpoch !== expectedEpoch) return status;
+      if (status !== "attention") return status;
+      if (!this.runtime.isRunAlive) return status;
+      if (!(await this.runtime.isRunAlive(handle))) return status;
     }
   }
 

@@ -113,18 +113,17 @@ describe("ui", () => {
     }
   });
 
-  test("widget renders task run, group, task, and assignment activity", () => {
+  test("widget renders task run, group, and active assignment in place of the task text", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
-    const taskLine = lines.find((line) => line.includes("Do task"));
+    const assignmentLine = lines.find((line) => line.includes("delegate"));
     expect(rendered).toContain("Task run");
     expect(rendered).toContain("Main group");
-    expect(rendered).toContain("Do task");
+    expect(rendered).not.toContain("Do task");
     expect(rendered).not.toContain(" · ");
-    expect(taskLine).not.toContain("delegate");
-    expect(taskLine).not.toContain("0/1");
-    expect(rendered).toContain("a1");
-    expect(rendered).toContain("delegate");
+    expect(assignmentLine).not.toContain("0/1");
+    expect(assignmentLine).toContain("a1");
+    expect(assignmentLine).toContain("delegate");
     expect(rendered).toContain("tool: bash");
     expect(rendered).toContain("last: reading src/orchestration/controller.ts");
     expect(rendered).toContain("tool start: rg");
@@ -140,8 +139,55 @@ describe("ui", () => {
     const rendered = buildWidgetLines(oneOff, 10, undefined, { now: 61_000 }).join("\n");
 
     expect(rendered).toContain("Ungrouped");
-    expect(rendered).toContain("Do task");
+    expect(rendered).not.toContain("Do task");
+    expect(rendered).toContain("delegate");
     expect(rendered).toContain("tool: bash");
+  });
+
+  test("widget hides the task text and renders the active assignment line at task depth", () => {
+    const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+    const assignmentLine = lines.find((line) => line.includes("delegate"));
+
+    expect(rendered).not.toContain("Do task");
+    expect(assignmentLine).toBeDefined();
+    expect(assignmentLine).toContain("delegate");
+    expect(assignmentLine).toContain("a1");
+    expect(assignmentLine?.startsWith("   └ ")).toBe(true);
+  });
+
+  test("widget keeps the criteria progress counter on the active assignment line", () => {
+    const partial = cloneState(state);
+    partial.taskRuns[0].tasks[0].criteria = [
+      { id: "C1", text: "First", satisfied: true, evidence: [] },
+      { id: "C2", text: "Second", satisfied: false, evidence: [] },
+    ];
+
+    const lines = buildWidgetLines(partial, 10, undefined, { now: 61_000 });
+    const assignmentLine = lines.find((line) => line.includes("delegate"));
+
+    expect(assignmentLine).toContain("1/2");
+    expect(lines.join("\n")).not.toContain("Do task");
+  });
+
+  test("widget still renders the task text when there is no active assignment", () => {
+    const ready = cloneState(state);
+    ready.taskRuns[0].tasks[0].status = "ready";
+    ready.taskRuns[0].tasks[0].assignmentIds = [];
+    ready.taskRuns[0].assignments = [];
+
+    const rendered = buildWidgetLines(ready, 10, undefined, { now: 61_000 }).join("\n");
+
+    expect(rendered).toContain("Do task");
+  });
+
+  test("widget indents activity lines exactly one level under the active assignment line", () => {
+    const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
+    const assignmentLine = lines.find((line) => line.includes("delegate"));
+    const activityLine = lines.find((line) => line.includes("tool: bash"));
+
+    expect(assignmentLine?.startsWith("   └ ")).toBe(true);
+    expect(activityLine?.startsWith("      ├ ")).toBe(true);
   });
 
   test("widget keeps full assignment labels when they fit", () => {
@@ -268,7 +314,7 @@ describe("ui", () => {
     expect(rendered).toContain("8 completed");
     expect(rendered).toContain("5 completed");
     expect(rendered).toContain("Needs attention after smoke run");
-    expect(rendered).toContain("Still running smoke task");
+    expect(rendered).not.toContain("Still running smoke task");
     expect(rendered).toContain("tool: bash");
     expect(rendered).not.toContain("Completed task 1");
     expect(rendered).not.toContain("Active completed task 1");

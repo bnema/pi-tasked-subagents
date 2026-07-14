@@ -211,6 +211,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     })));
     controller.restoreState(restored);
     controller.updateUI(ctx);
+    controller.reconcileRestoredRuns(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -222,6 +223,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     })));
     controller.restoreState(restored);
     controller.updateUI(ctx);
+    controller.reconcileRestoredRuns(ctx);
   });
 
   pi.registerTool({

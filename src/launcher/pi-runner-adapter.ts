@@ -174,6 +174,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = typeof error === "object" && error !== null ? (error as { code?: string }).code : undefined;
+    return code === "EPERM";
+  }
+}
+
 export interface PiRunnerAdapterOptions {
   piBin?: string;
   asyncDirRootOverride?: string;
@@ -291,6 +301,20 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     }
     const first = result.results?.[0];
     return first?.rawOutput || first?.output || result.summary;
+  }
+
+  async isRunAlive(handle: SubagentRunHandle): Promise<boolean> {
+    const resolved = this.resolveRunHandle(handle);
+    if (!resolved) return false;
+    const statusFile = await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath);
+    const pids = new Set<number>();
+    const trackedPid = this.trackedRuns.get(handle.runId)?.pid;
+    if (trackedPid) pids.add(trackedPid);
+    if (statusFile?.pid) pids.add(statusFile.pid);
+    for (const step of statusFile?.steps ?? []) if (step.pid) pids.add(step.pid);
+    if (pids.size === 0) return false;
+    for (const pid of pids) if (isPidAlive(pid)) return true;
+    return false;
   }
 
   getSnapshot(): { assignments: TaskAssignmentRecord[]; counts: RunCounts } {

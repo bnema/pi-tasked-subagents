@@ -35,6 +35,7 @@ interface TaskRunControllerApi {
   handleUserAsk(prompt: string, ctx?: unknown): Promise<unknown>;
   awaitLastWork(): Promise<void>;
   restoreState(state: TaskedSubagentsState): void;
+  reconcileRestoredRuns(ctx?: unknown): void;
   getState(): TaskedSubagentsState;
 }
 
@@ -456,13 +457,131 @@ class SignalRuntime extends CompletingRuntime {
   }
 }
 
+function reconciledReport(): string {
+  return JSON.stringify({
+    taskRunId: "task-run-1",
+    groupId: "main",
+    taskId: "attention",
+    assignmentId: "a1",
+    status: "completed",
+    summary: "reconciled done",
+    criteriaEvidence: [{ criteriaIndex: 0, evidence: "reconciled evidence" }],
+    artifacts: [],
+    followUps: [],
+  });
+}
+
+class RestoredCompletingRuntime extends CompletingRuntime {
+  async waitForRunSignal(handle: SubagentRunHandle | undefined): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    return "completed";
+  }
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    return reconciledReport();
+  }
+}
+
+class DeadAttentionRuntime extends CompletingRuntime {
+  timeouts: Array<number | undefined> = [];
+
+  async waitForRunSignal(handle: SubagentRunHandle | undefined, options?: { timeoutMs?: number; onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void> }): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    this.timeouts.push(options?.timeoutMs);
+    return "attention";
+  }
+
+  async isRunAlive(): Promise<boolean> {
+    return false;
+  }
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    return undefined;
+  }
+}
+
+class RestoredControlledRuntime extends CompletingRuntime {
+  private waitStartedResolve!: () => void;
+  private waitResolve: ((status: RunStatus) => void) | undefined;
+  readonly waitStarted = new Promise<void>((resolve) => {
+    this.waitStartedResolve = resolve;
+  });
+
+  async waitForRunSignal(handle: SubagentRunHandle | undefined): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    this.waitStartedResolve();
+    return new Promise<RunStatus>((resolve) => {
+      this.waitResolve = resolve;
+    });
+  }
+
+  complete(status: RunStatus = "completed"): void {
+    this.waitResolve?.(status);
+  }
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    return reconciledReport();
+  }
+}
+
+class AliveThenCompleteRuntime extends CompletingRuntime {
+  waitCalls = 0;
+  aliveCalls = 0;
+  resultCalls = 0;
+
+  async waitForRunSignal(handle: SubagentRunHandle | undefined): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    this.waitCalls += 1;
+    return this.waitCalls >= 3 ? "completed" : "attention";
+  }
+
+  async isRunAlive(): Promise<boolean> {
+    this.aliveCalls += 1;
+    return true;
+  }
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultHandles.push(handle);
+    this.resultCalls += 1;
+    return reconciledReport();
+  }
+}
+
+class MultiWaitControlledRuntime extends CompletingRuntime {
+  resultCalls = 0;
+  readonly waitResolvers: Array<(status: RunStatus) => void> = [];
+
+  async waitForRunSignal(handle: SubagentRunHandle | undefined): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    return new Promise<RunStatus>((resolve) => {
+      this.waitResolvers.push(resolve);
+    });
+  }
+
+  resolveWait(index: number, status: RunStatus = "completed"): void {
+    this.waitResolvers[index]?.(status);
+  }
+
+  async getRunResult(handle: SubagentRunHandle): Promise<string | undefined> {
+    this.resultCalls += 1;
+    return super.getRunResult(handle);
+  }
+}
+
+function liveRunIds(controller: TaskRunControllerApi): Map<string, number> {
+  return (controller as unknown as { liveRunIds: Map<string, number> }).liveRunIds;
+}
+
 function controllerWith(runtime: SubagentRuntime = new CompletingRuntime()): { controller: TaskRunControllerApi; runtime: SubagentRuntime } {
   const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
   return { controller: asTaskRunApi(controller), runtime };
 }
 
 function markRunLive(controller: TaskRunControllerApi, runId: string): void {
-  (controller as unknown as { liveRunIds: Set<string> }).liveRunIds.add(runId);
+  (controller as unknown as { liveRunIds: Map<string, number> }).liveRunIds.set(runId, 0);
 }
 
 const baseSetTasks = {
@@ -1399,5 +1518,131 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(controller.getState().taskRuns.map((taskRun) => taskRun.id)).toEqual(["task-run-active"]);
     expect(activeRun?.assignments).toHaveLength(1);
     expect(activeRun?.tasks[0].status).toBe("completed");
+  });
+
+  test("reconcileRestoredRuns re-attaches an orphaned running assignment and applies completion", async () => {
+    const runtime = new RestoredCompletingRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("running"));
+
+    controller.reconcileRestoredRuns();
+    await controller.awaitLastWork();
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.assignments.find((assignment) => assignment.id === "a1")?.status).toBe("completed");
+    expect(liveRunIds(controller).size).toBe(0);
+  });
+
+  test("reconcileRestoredRuns marks a dead orphaned run as attention instead of leaving it running", async () => {
+    const runtime = new DeadAttentionRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("running"));
+
+    controller.reconcileRestoredRuns();
+    await controller.awaitLastWork();
+
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("attention");
+    expect(liveRunIds(controller).size).toBe(0);
+  });
+
+  test("reconcileRestoredRuns keeps waiting while an alive run times out, then applies once", async () => {
+    const runtime = new AliveThenCompleteRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("running"));
+
+    controller.reconcileRestoredRuns();
+    await controller.awaitLastWork();
+
+    expect(runtime.waitCalls).toBe(3);
+    expect(runtime.aliveCalls).toBeGreaterThanOrEqual(2);
+    expect(runtime.resultCalls).toBe(1);
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("completed");
+  });
+
+  test("session_tree restore re-attaches an in-flight run and applies the outcome exactly once", async () => {
+    const runtime = new MultiWaitControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await vi.waitFor(() => expect(runtime.waitResolvers.length).toBe(1));
+    await vi.waitFor(() => expect(controller.getState().taskRuns[0].assignments[0]?.status).toBe("running"));
+
+    const restored = controller.getState();
+    controller.restoreState(restored);
+    controller.reconcileRestoredRuns();
+    await vi.waitFor(() => expect(runtime.waitResolvers.length).toBe(2));
+
+    runtime.resolveWait(1, "completed");
+    await controller.awaitLastWork();
+
+    runtime.resolveWait(0, "completed");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const taskRun = controller.getState().taskRuns[0];
+    expect(taskRun.assignments[0].status).toBe("completed");
+    expect(runtime.resultCalls).toBe(1);
+  });
+
+  test("an aborted prior-epoch dispatch does not clear the reconciled watcher's liveness", async () => {
+    const runtime = new MultiWaitControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await vi.waitFor(() => expect(runtime.waitResolvers.length).toBe(1));
+    await vi.waitFor(() => expect(controller.getState().taskRuns[0].assignments[0]?.status).toBe("running"));
+
+    const restored = controller.getState();
+    const runId = runtime.requests[0].runId;
+    controller.restoreState(restored);
+    controller.reconcileRestoredRuns();
+    await vi.waitFor(() => expect(runtime.waitResolvers.length).toBe(2));
+
+    expect(liveRunIds(controller).has(runId)).toBe(true);
+
+    runtime.resolveWait(0, "completed");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(liveRunIds(controller).has(runId)).toBe(true);
+
+    runtime.resolveWait(1, "completed");
+    await controller.awaitLastWork();
+
+    expect(liveRunIds(controller).has(runId)).toBe(false);
+    expect(controller.getState().taskRuns[0].assignments[0].status).toBe("completed");
+  });
+
+  test("reconcileRestoredRuns gives a dead run only a short result grace before resolving attention", async () => {
+    const runtime = new DeadAttentionRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("running"));
+
+    controller.reconcileRestoredRuns();
+    await controller.awaitLastWork();
+
+    expect(runtime.timeouts[0]).toBe(5_000);
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("attention");
+  });
+
+  test("attachTarget waits for reconciled restored watchers before reporting", async () => {
+    const runtime = new RestoredControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState(recoverableState("running"));
+    controller.reconcileRestoredRuns();
+    await runtime.waitStarted;
+
+    let settled = false;
+    const attached = controller.attachTarget("task-run-1").then((result) => {
+      settled = true;
+      return result;
+    });
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+
+    runtime.complete("completed");
+
+    await expect(attached).resolves.toMatchObject({ attached: true, targetId: "task-run-1" });
+    expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("completed");
   });
 });
