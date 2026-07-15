@@ -24,6 +24,7 @@
   "files": [
     "extensions",
     "src",
+    "scripts",
     "README.md",
     "LICENSE",
     "tsconfig.json"
@@ -32,6 +33,9 @@
     "extensions": [
       "./extensions/index.ts"
     ]
+  },
+  "dependencies": {
+    "typescript": "^5.9.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.78.0 <1",
@@ -47,7 +51,6 @@
     "@types/node": "^24.13.0",
     "eslint": "^10.5.0",
     "typebox": "^1.2.0",
-    "typescript": "^5.9.3",
     "typescript-eslint": "^8.61.1",
     "vitest": "^3.2.4"
   },
@@ -55,9 +58,10 @@
     "node": ">=22.6.0"
   },
   "scripts": {
-    "lint": "eslint \"{extensions,src,tests}/**/*.ts\" --max-warnings=0",
+    "lint": "eslint \"{extensions,src,tests}/**/*.ts\" \"scripts/**/*.mjs\" --max-warnings=0",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
+    "recover-session": "node scripts/recover-session.mjs",
     "verify": "npm run typecheck && npm test && npm run lint"
   }
 }
