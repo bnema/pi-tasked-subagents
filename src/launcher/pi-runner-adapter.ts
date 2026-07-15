@@ -10,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_WAIT_TIMEOUT_MS } from "../defaults.js";
-import { resolveStorageRoot, sessionStoragePaths } from "../state/storage-paths.js";
+import { isResultId, isSessionId, resolveStorageRoot, resultFilePath, resultReservationPath, runDirectoryPath, runFilePath, sessionStoragePaths } from "../state/storage-paths.js";
 import type {
   LaunchTaskEntry,
   LaunchTaskGraphRequest,
@@ -165,6 +165,7 @@ function toRunHandleBase(launch: LaunchResult): Omit<DurableSubagentRunHandle, "
   return {
     runId: launch.runId,
     asyncId: launch.asyncId,
+    sessionId: launch.sessionId,
     asyncDir: launch.asyncDir,
     resultId: launch.resultId,
     resultPath: launch.resultPath,
@@ -206,21 +207,18 @@ export interface PiRunnerAdapterOptions {
 
 export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   private readonly piBin: string;
-  private readonly dataRoot: string | undefined;
+  private readonly dataRoot: string;
   private readonly asyncRoot: string;
   private readonly resultsRoot: string;
   private readonly resultIdFactory: () => string;
-  /** Each launch is keyed by immutable identity, never by report-oriented runId. */
+  /** Each launch is keyed by session and immutable identity, never by report-oriented runId. */
   private readonly trackedLaunches = new Map<string, { launch: LaunchResult; pid?: number }>();
 
   constructor(options: PiRunnerAdapterOptions = {}) {
     this.piBin = options.piBin ?? "pi";
-    // Explicit legacy directory overrides are retained solely for old restored-handle tests.
-    this.dataRoot = options.dataRoot !== undefined
-      ? resolveStorageRoot({ dataRoot: options.dataRoot })
-      : options.asyncDirRootOverride === undefined && options.resultsDirOverride === undefined
-        ? resolveStorageRoot()
-        : undefined;
+    // Legacy directory overrides are used only by explicitly marked legacy
+    // handles. All new durable launches use the application-data root.
+    this.dataRoot = resolveStorageRoot({ dataRoot: options.dataRoot });
     this.asyncRoot = options.asyncDirRootOverride ?? defaultAsyncRoot();
     this.resultsRoot = options.resultsDirOverride ?? defaultResultsRoot();
     this.resultIdFactory = options.resultIdFactory ?? (() => randomBytes(16).toString("hex"));
@@ -343,7 +341,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     if (!resolved) return false;
     const statusFile = await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath);
     const pids = new Set<number>();
-    const trackedPid = handle.legacy ? undefined : this.trackedLaunches.get(handle.resultId)?.pid;
+    const trackedPid = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId))?.pid;
     if (trackedPid) pids.add(trackedPid);
     if (statusFile?.pid) pids.add(statusFile.pid);
     for (const step of statusFile?.steps ?? []) if (step.pid) pids.add(step.pid);
@@ -357,26 +355,23 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   }
 
   private requireResultsDir(sessionId: string): string {
-    if (!sessionId) throw new Error("Unsafe session ID");
-    const storage = sessionStoragePaths(this.dataRoot ?? resolveStorageRoot(), sessionId);
-    return this.dataRoot ? storage.resultsDir : this.resultsRoot;
+    if (!isSessionId(sessionId)) throw new Error("Unsafe session ID");
+    return sessionStoragePaths(this.dataRoot, sessionId).resultsDir;
   }
 
+  /** Derive, never trust, every durable path from its validated identities. */
   private runPaths(runId: string, sessionId: string, resultId: string): RunPaths | undefined {
-    if (!SAFE_RUN_ID_PATTERN.test(runId)) return undefined;
-    if (!/^[a-f0-9]{32}$/u.test(resultId)) return undefined;
-    const resultsDir = this.requireResultsDir(sessionId);
-    const asyncDir = this.dataRoot
-      ? safeJoin(sessionStoragePaths(this.dataRoot, sessionId).runsDir, resultId)
-      : safeJoin(this.asyncRoot, resultId);
-    const resultPath = safeJoin(resultsDir, `${resultId}.json`);
+    if (!SAFE_RUN_ID_PATTERN.test(runId) || !isSessionId(sessionId) || !isResultId(resultId)) return undefined;
+    const storage = sessionStoragePaths(this.dataRoot, sessionId);
+    const asyncDir = runDirectoryPath(storage, resultId);
+    const resultPath = resultFilePath(storage, resultId);
     return {
       asyncDir,
-      resultsDir,
+      resultsDir: storage.resultsDir,
       resultPath,
-      resultReservationPath: `${resultPath}.reservation`,
-      statusPath: safeJoin(asyncDir, "status.json"),
-      eventsPath: safeJoin(asyncDir, "events.jsonl"),
+      resultReservationPath: resultReservationPath(storage, resultId),
+      statusPath: runFilePath(storage, resultId, "status.json"),
+      eventsPath: runFilePath(storage, resultId, "events.jsonl"),
     };
   }
 
@@ -489,6 +484,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       runId: config.runId,
       asyncId: config.runId,
       asyncDir: config.asyncDir,
+      sessionId: config.sessionId,
       resultId: config.resultId,
       resultPath: config.resultPath,
       resultReservationPath: config.resultReservationPath,
@@ -501,7 +497,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       });
       child.once("error", reject);
       child.once("spawn", () => {
-        this.trackedLaunches.set(config.resultId, { launch, pid: child.pid ?? undefined });
+        this.trackedLaunches.set(this.launchKey(config.sessionId, config.resultId), { launch, pid: child.pid ?? undefined });
         child.unref();
         resolve();
       });
@@ -509,23 +505,29 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     return launch;
   }
 
+  private launchKey(sessionId: string, resultId: string): string {
+    return `${sessionId}:${resultId}`;
+  }
+
   private resolveRunHandle(handle: SubagentRunHandle): { paths: RunPaths; launch: { resultPath: string } } | undefined {
     if (!SAFE_RUN_ID_PATTERN.test(handle.runId)) return undefined;
-    const tracked = handle.legacy ? undefined : this.trackedLaunches.get(handle.resultId)?.launch;
-    let fallback: RunPaths | undefined;
-    if (handle.legacy && (!handle.asyncDir || !handle.resultPath) && !tracked) {
-      fallback = this.legacyRunPaths(handle.runId);
+    if (!handle.legacy) {
+      const paths = this.runPaths(handle.runId, handle.sessionId, handle.resultId);
+      // Persisted paths are evidence only: a mismatch fails before any file I/O
+      // or PID collection, rather than being used as an alternate location.
+      if (!paths || handle.asyncDir !== paths.asyncDir || handle.resultPath !== paths.resultPath ||
+        handle.resultReservationPath !== paths.resultReservationPath) return undefined;
+      return { paths, launch: { resultPath: paths.resultPath } };
     }
-    const asyncDir = handle.asyncDir ?? tracked?.asyncDir ?? fallback?.asyncDir;
-    const resultPath = handle.resultPath ?? tracked?.resultPath ?? fallback?.resultPath;
+    const fallback = !handle.asyncDir || !handle.resultPath ? this.legacyRunPaths(handle.runId) : undefined;
+    const asyncDir = handle.asyncDir ?? fallback?.asyncDir;
+    const resultPath = handle.resultPath ?? fallback?.resultPath;
     if (!asyncDir || !resultPath) return undefined;
     const paths: RunPaths = {
       asyncDir,
       resultsDir: path.dirname(resultPath),
       resultPath,
-      resultReservationPath: handle.legacy
-        ? `${resultPath}.reservation`
-        : handle.resultReservationPath,
+      resultReservationPath: `${resultPath}.reservation`,
       statusPath: safeJoin(asyncDir, "status.json"),
       eventsPath: safeJoin(asyncDir, "events.jsonl"),
     };
@@ -540,10 +542,11 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   ): Promise<boolean> {
     const { runId } = handle;
     const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : "";
+    if (!handle.legacy && sessionId !== handle.sessionId) return false;
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return false;
     const { paths, launch } = resolved;
-    const tracked = handle.legacy ? undefined : this.trackedLaunches.get(handle.resultId);
+    const tracked = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId));
     const existingStatus = await readJsonFile<RunnerStatusFile>(paths.statusPath);
     const resultPath = launch.resultPath ?? paths.resultPath;
 

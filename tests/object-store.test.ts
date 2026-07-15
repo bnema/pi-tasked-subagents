@@ -1,8 +1,9 @@
 import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   MAX_ASSIGNMENT_ARCHIVE_BYTES,
@@ -165,6 +166,28 @@ describe("bounded durable storage primitives", () => {
     expect(() => canonicalJsonBounded({ values }, 32)).toThrow(/limit/i);
     const accepted = { z: [true, { b: "β", a: 1 }], a: null };
     expect(canonicalJsonBounded(accepted, 1_024)).toBe(canonicalJson(accepted));
+  });
+
+  test("rejects an oversized regular object from fstat before allocating a read buffer", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const store = new DurableObjectStore(root);
+    const maxBytes = 1_024;
+    const bytes = "x".repeat(maxBytes + 1);
+    const id = sha256Hex(bytes);
+    const path = join(root, "objects", `${id}.json`);
+    mkdirSync(join(root, "objects"), { recursive: true });
+    writeFileSync(path, bytes);
+
+    const probe = await fs.open(path, "r");
+    const handlePrototype = Object.getPrototypeOf(probe) as fs.FileHandle;
+    await probe.close();
+    const readFile = vi.spyOn(handlePrototype, "readFile");
+    try {
+      await expect(store.get(id, "checkpoint", maxBytes)).rejects.toThrow(/limit/i);
+      expect(readFile).not.toHaveBeenCalled();
+    } finally {
+      readFile.mockRestore();
+    }
   });
 
   test("never overwrites a corrupt immutable destination and verifies digests and kinds on read", async () => {

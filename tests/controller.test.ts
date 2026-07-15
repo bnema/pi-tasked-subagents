@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -10,6 +10,8 @@ import { formatInspectReport, formatStatusReport } from "../src/orchestration/co
 import { DurableObjectStore } from "../src/state/object-store.js";
 import { sha256Hex } from "../src/state/canonical-json.js";
 import { projectAssignmentArchive, type ArchiveRef } from "../src/state/durable-projection.js";
+import { restoreBranchState } from "../src/state/restore.js";
+import { syntheticTaskRun } from "./persistence-fixtures.js";
 import type {
   AttachResult,
   EditGroupInput,
@@ -75,6 +77,7 @@ class CompletingRuntime implements SubagentRuntime {
     return {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
+      sessionId: "test-session",
       asyncDir: `/tmp/async-${request.runId}`,
       resultId: "a".repeat(32),
       resultPath: `/tmp/${request.runId}.json`,
@@ -343,6 +346,7 @@ class LaunchControlledRuntime extends CompletingRuntime {
     return {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
+      sessionId: "test-session",
       asyncDir: `/tmp/async-${request.runId}`,
       resultId: "b".repeat(32),
       resultPath: `/tmp/${request.runId}.json`,
@@ -393,6 +397,7 @@ class MultiLaunchControlledRuntime extends CompletingRuntime {
     return {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
+      sessionId: "test-session",
       asyncDir: `/tmp/async-${request.runId}`,
       resultId: "c".repeat(32),
       resultPath: `/tmp/${request.runId}.json`,
@@ -807,9 +812,12 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     await controller.setTasks({ ...baseSetTasks, taskRunId: "task-run-retained", wait: true }, context);
     await controller.flushPersistence();
 
-    expect(persistence.flushContexts).toEqual([
-      { sessionId: "session-retained", visiblePointers: [{ version: 5, checkpointId: "c".repeat(64), sequence: 1, writtenAt: 1 }] },
-    ]);
+    expect(persistence.flushContexts).toHaveLength(1);
+    expect(persistence.flushContexts[0]).toMatchObject({
+      sessionId: "session-retained",
+      visiblePointers: [{ version: 5, checkpointId: "c".repeat(64), sequence: 1, writtenAt: 1 }],
+      archiveRefs: [{ taskRunId: "task-run-retained", resultId: "a".repeat(32) }],
+    });
   });
 
   test("setTasks creates a TaskRun and dispatches assignments with taskRunId prompts", async () => {
@@ -843,6 +851,85 @@ describe("TaskedSubagentsController TaskRun public API", () => {
 
     expect(archives).toHaveLength(1);
     expect(archives[0].archive).toMatchObject({ assignmentId, resultId: runtime.resultId, runId: expect.any(String) });
+  });
+
+  test("flush retries a failed terminal archive checkpoint with its original branch-local result reference", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-dirty-terminal-"));
+    const sessionId = "pi-tasked-subagents";
+    const assignmentId = "assignment-001";
+    const selectedResultId = "a".repeat(32);
+    const competingResultId = "b".repeat(32);
+    let failAppend = true;
+    const pi = {
+      appendEntry: () => {
+        if (failAppend) throw new Error("append unavailable");
+      },
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    } as unknown as ExtensionAPI;
+    try {
+      const store = new DurableObjectStore(dataRoot);
+      const createArchive = async (runId: string, resultId: string) => {
+        const archive = projectAssignmentArchive({
+          assignmentId,
+          taskRunId: "task-run-001",
+          taskId: "task-001",
+          status: "completed",
+          summary: "terminal result",
+          criteriaEvidence: [],
+          artifacts: [],
+          followUps: [],
+          runId,
+          resultId,
+          completedAt: 1,
+        });
+        const archiveId = await store.put("assignment", archive, 256 * 1024);
+        await store.linkAssignmentArchive(sessionId, assignmentId, archiveId);
+        return { archive, archiveId };
+      };
+      const selected = await createArchive("selected-run", selectedResultId);
+      await createArchive("competing-run", competingResultId);
+      await mkdir(join(dataRoot, "results", sessionId), { recursive: true });
+      await writeFile(join(dataRoot, "results", sessionId, `${selectedResultId}.json`), "selected branch result");
+      await writeFile(join(dataRoot, "results", sessionId, `${competingResultId}.json`), "competing branch result");
+
+      const terminal = syntheticTaskRun(1, "completed");
+      const state: TaskedSubagentsState = { version: 4, taskRuns: [terminal], currentTaskRunId: terminal.id, updatedAt: terminal.updatedAt };
+      const archiveRef: ArchiveRef = {
+        assignmentId,
+        assignmentIdHash: sha256Hex(assignmentId),
+        archiveId: selected.archiveId,
+        resultId: selectedResultId,
+        taskRunId: terminal.id,
+        completedAt: terminal.completedAt ?? terminal.updatedAt,
+      };
+      const controller = asTaskRunApi(new TaskedSubagentsController(pi, { dataRoot }));
+      controller.restoreState(state, [archiveRef]);
+
+      await expect(controller.clear("completed")).rejects.toThrow("append unavailable");
+      // A later lifecycle can have no current archives; retry must use the
+      // immutable terminal snapshot rather than this empty live context.
+      (controller as unknown as { archiveRefs: ArchiveRef[] }).archiveRefs = [];
+      failAppend = false;
+      await controller.flushPersistence();
+
+      const refs = JSON.parse(await readFile(join(dataRoot, "sessions", sessionId, "refs.json"), "utf8")) as { checkpointIds: string[] };
+      const checkpointId = refs.checkpointIds.at(-1);
+      expect(checkpointId).toMatch(/^[a-f0-9]{64}$/);
+      const restored = await restoreBranchState(
+        [{ type: "custom", customType: "pi-tasked-subagents:state", data: { version: 5, checkpointId, sequence: 1, writtenAt: 1 } }],
+        store,
+        { sessionId, allEntries: [], appendMigratedPointer: () => undefined },
+      );
+      expect(restored).toMatchObject({ restored: true, archiveRefs: [{ archiveId: selected.archiveId, resultId: selectedResultId }] });
+      if (!restored.restored) throw new Error("terminal checkpoint should restore");
+
+      const restarted = asTaskRunApi(new TaskedSubagentsController(fakePi(), { dataRoot }));
+      restarted.restoreState(restored.state, restored.archiveRefs);
+      await expect(restarted.getRunResult(assignmentId)).resolves.toBe("selected branch result");
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true });
+    }
   });
 
   test("loads only the selected immutable result and never silently chooses an ambiguous archive", async () => {

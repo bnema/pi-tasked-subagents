@@ -973,10 +973,7 @@ export class TaskedSubagentsController {
     if (ctx) this.lastContext = ctx;
     const context = this.checkpointContext(ctx);
     if (!context.sessionId) throw new PersistenceError("Checkpoint context has no active session");
-    // A dirty checkpoint already captured its archive references. Flush only
-    // needs the live branch/session identity and must not rewrite its snapshot.
-    const { archiveRefs: _archiveRefs, ...flushContext } = context;
-    await this.persistence.flush(flushContext);
+    await this.persistence.flush(context);
   }
 
   private checkpointContext(ctx?: ExtensionContext): CheckpointContext {

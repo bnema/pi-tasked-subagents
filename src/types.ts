@@ -330,6 +330,8 @@ interface SubagentRunHandleBase {
 /** A v5 launch handle. New launches always have an immutable result identity. */
 export interface DurableSubagentRunHandle extends SubagentRunHandleBase {
   legacy?: never;
+  /** Validated session identity used to derive every durable filesystem path. */
+  sessionId: string;
   asyncDir: string;
   resultId: string;
   resultPath: string;

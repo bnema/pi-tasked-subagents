@@ -318,10 +318,13 @@ export class DurableObjectStore {
     let bytes: string;
     try {
       const opened = await handle.stat();
-      if (opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("Object identity changed before open");
+      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("Object identity changed before open");
+      if (opened.size > maxBytes) throw new Error("Object exceeds its byte limit");
       bytes = await handle.readFile({ encoding: "utf8" });
       const after = await handle.stat();
-      if (after.dev !== opened.dev || after.ino !== opened.ino) throw new Error("Object identity changed while reading");
+      if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size) {
+        throw new Error("Object identity changed while reading");
+      }
     } finally {
       await handle.close();
     }

@@ -60,9 +60,10 @@ export interface PersistenceCoordinatorOptions {
 }
 
 interface DirtyCheckpoint {
-  state: TaskedSubagentsState;
-  sessionId: string;
+  /** The complete originating context is immutable for the life of this retry. */
+  context: CheckpointContext;
   epoch: number;
+  state: TaskedSubagentsState;
 }
 
 function failure(code: PersistenceFailure["code"], message: string): PersistenceFailure {
@@ -137,16 +138,17 @@ export class PersistenceCoordinator {
   private readonly onRefsWritten?: () => void;
 
   checkpoint(state: TaskedSubagentsState, context: CheckpointContext): Promise<CheckpointResult> {
+    const contextSnapshot = this.snapshotContext(context);
     let snapshot: TaskedSubagentsState;
     try {
       snapshot = structuredClone(state);
     } catch {
-      return Promise.resolve(this.recordDirty(state, context.sessionId, this.epoch, failure("projection", "State cannot be safely cloned for durable persistence")));
+      return Promise.resolve(this.recordDirty(state, contextSnapshot, this.epoch, failure("projection", "State cannot be safely cloned for durable persistence")));
     }
-    const contextError = this.activateContext(context);
+    const contextError = this.activateContext(contextSnapshot);
     if (contextError) return Promise.resolve(this.rejected(contextError));
     const capturedEpoch = this.epoch;
-    return this.enqueue(() => this.write(snapshot, context, capturedEpoch));
+    return this.enqueue(() => this.write(snapshot, contextSnapshot, capturedEpoch));
   }
 
   retryDirty(context: CheckpointContext): Promise<CheckpointResult> {
@@ -160,14 +162,13 @@ export class PersistenceCoordinator {
       }
       return Promise.resolve({ committed: true, pointer: this.lastCommitted, deduplicated: true });
     }
-    if (dirty.sessionId !== context.sessionId || context.sessionId !== this.sessionId) {
+    if (dirty.context.sessionId !== context.sessionId || context.sessionId !== this.sessionId) {
       return Promise.resolve(this.rejected(failure("session_mismatch", "Dirty state belongs to a different session")));
     }
     if (dirty.epoch !== this.epoch) {
       return Promise.resolve(this.rejected(failure("stale_generation", "A newer session generation superseded this checkpoint")));
     }
-    const capturedEpoch = this.epoch;
-    return this.enqueue(() => this.write(dirty.state, context, capturedEpoch));
+    return this.enqueue(() => this.write(dirty.state, dirty.context, dirty.epoch));
   }
 
   async flush(context: CheckpointContext): Promise<void> {
@@ -202,11 +203,11 @@ export class PersistenceCoordinator {
 
   private async write(state: TaskedSubagentsState, context: CheckpointContext, capturedEpoch: number): Promise<CheckpointResult> {
     if (!this.currentContext(context, capturedEpoch)) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
+      return this.recordDirty(state, context, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
     }
 
     const projected = buildCheckpointProjection(state, context.archiveRefs ?? []);
-    if (!projected.ok) return this.recordDirty(state, context.sessionId, capturedEpoch, failure("projection", projected.error.message));
+    if (!projected.ok) return this.recordDirty(state, context, capturedEpoch, failure("projection", projected.error.message));
     const digest = sha256Hex(canonicalJson(projected.value));
     if (digest === this.projectionDigest && this.lastCommitted) {
       this.dirty = undefined;
@@ -225,7 +226,7 @@ export class PersistenceCoordinator {
       writtenAt: context.now ?? Date.now(),
     };
     if (utf8Bytes(pointer) > MAX_POINTER_BYTES) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("pointer_too_large", "Checkpoint pointer exceeds the 4 KiB limit"));
+      return this.recordDirty(state, context, capturedEpoch, failure("pointer_too_large", "Checkpoint pointer exceeds the 4 KiB limit"));
     }
 
     let manifestId: string;
@@ -247,35 +248,35 @@ export class PersistenceCoordinator {
           recentAssignmentRefs: projected.value.recentAssignmentRefs,
         },
       });
-      if (!manifest.ok) return this.recordDirty(state, context.sessionId, capturedEpoch, failure("projection", manifest.error.message));
+      if (!manifest.ok) return this.recordDirty(state, context, capturedEpoch, failure("projection", manifest.error.message));
       manifestId = await this.store.put("checkpoint", manifest.value, MAX_CHECKPOINT_BYTES);
     } catch (error) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("object_write", safeErrorMessage(error)));
+      return this.recordDirty(state, context, capturedEpoch, failure("object_write", safeErrorMessage(error)));
     }
 
     if (!this.currentContext(context, capturedEpoch)) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
+      return this.recordDirty(state, context, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
     }
 
     pointer.checkpointId = manifestId;
     // A real digest is fixed-width, so it cannot make the provisional pointer larger.
     if (utf8Bytes(pointer) > MAX_POINTER_BYTES) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("pointer_too_large", "Checkpoint pointer exceeds the 4 KiB limit"));
+      return this.recordDirty(state, context, capturedEpoch, failure("pointer_too_large", "Checkpoint pointer exceeds the 4 KiB limit"));
     }
 
     try {
       await this.writeRefs(context.sessionId, context.visiblePointers, manifestId);
     } catch (error) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("object_write", safeErrorMessage(error)));
+      return this.recordDirty(state, context, capturedEpoch, failure("object_write", safeErrorMessage(error)));
     }
     if (!this.currentContext(context, capturedEpoch)) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
+      return this.recordDirty(state, context, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
     }
 
     try {
       this.appender.append(pointer);
     } catch (error) {
-      return this.recordDirty(state, context.sessionId, capturedEpoch, failure("pointer_append", safeErrorMessage(error)));
+      return this.recordDirty(state, context, capturedEpoch, failure("pointer_append", safeErrorMessage(error)));
     }
 
     this.sequence = sequence;
@@ -286,9 +287,18 @@ export class PersistenceCoordinator {
     return { committed: true, pointer, deduplicated: false };
   }
 
-  private recordDirty(state: TaskedSubagentsState, sessionId: string, epoch: number, error: PersistenceFailure): CheckpointResult {
-    this.dirty = { state: structuredClone(state), sessionId, epoch };
+  private recordDirty(state: TaskedSubagentsState, context: CheckpointContext, epoch: number, error: PersistenceFailure): CheckpointResult {
+    this.dirty = { state: structuredClone(state), context: this.snapshotContext(context), epoch };
     return { committed: false, error, dirty: true };
+  }
+
+  private snapshotContext(context: CheckpointContext): CheckpointContext {
+    return {
+      sessionId: context.sessionId,
+      visiblePointers: structuredClone(context.visiblePointers),
+      ...(context.now === undefined ? {} : { now: context.now }),
+      ...(context.archiveRefs === undefined ? {} : { archiveRefs: structuredClone(context.archiveRefs) }),
+    };
   }
 
   private rejected(error: PersistenceFailure): CheckpointResult {

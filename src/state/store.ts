@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 
 import { STATE_VERSION } from "../defaults.js";
+import { isSessionId } from "./storage-paths.js";
 import type {
   ArtifactRef,
   AssignmentStatus,
@@ -206,6 +207,7 @@ function normalizeLaunchRef(raw: unknown, assignmentId: string, assignmentRunId?
   const resultId = optionalString(input.resultId);
   const resultReservationPath = optionalString(input.resultReservationPath);
   const asyncDir = optionalString(input.asyncDir);
+  const sessionId = optionalString(input.sessionId);
   const common = {
     runId,
     asyncId,
@@ -214,10 +216,15 @@ function normalizeLaunchRef(raw: unknown, assignmentId: string, assignmentRunId?
     ...(optionalString(input.artifactPath) ? { artifactPath: optionalString(input.artifactPath) } : {}),
     assignments,
   };
-  if (asyncDir && resultId && resultPath && resultReservationPath) {
-    return { ...common, asyncDir, resultId, resultPath, resultReservationPath };
+  if (input.legacy === true) {
+    return { ...common, legacy: true, ...(resultPath ? { resultPath } : {}) };
   }
-  return { ...common, legacy: true, ...(resultPath ? { resultPath } : {}) };
+  if (asyncDir && sessionId && isSessionId(sessionId) && resultId && resultPath && resultReservationPath) {
+    return { ...common, sessionId, asyncDir, resultId, resultPath, resultReservationPath };
+  }
+  // Compatibility is opt-in at the v4 migration boundary. Do not downgrade an
+  // incomplete durable record into a path-trusting legacy handle on restore.
+  return undefined;
 }
 
 function normalizeCriteriaEvidence(raw: unknown): TaskResultRecord["criteriaEvidence"][number] | undefined {

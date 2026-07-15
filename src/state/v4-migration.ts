@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 import {
   MAX_ASSIGNMENT_ARCHIVE_BYTES,
@@ -134,6 +134,104 @@ function legacyResultPath(assignment: TaskAssignmentRecord): string | undefined 
   return assignment.result?.rawResultPath ?? assignment.launchRef?.resultPath;
 }
 
+const SAFE_LEGACY_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const LIVE_LEGACY_STATES = new Set(["queued", "running"]);
+
+type MigratedLegacyHandle = Extract<NonNullable<TaskAssignmentRecord["launchRef"]>, { legacy: true }>;
+
+function isLivePid(value: unknown): boolean {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return false;
+  try {
+    process.kill(value, 0);
+    return true;
+  } catch (error) {
+    // A process we cannot signal is still live; all other failures mean this
+    // legacy status file cannot establish an actionable runner.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function explicitLegacyHandle(assignment: TaskAssignmentRecord): MigratedLegacyHandle | undefined {
+  const handle = assignment.launchRef;
+  if (!handle || !assignment.runId || !SAFE_LEGACY_RUN_ID.test(assignment.runId) ||
+    handle.runId !== assignment.runId || !SAFE_LEGACY_RUN_ID.test(handle.runId) ||
+    !handle.asyncId || !Array.isArray(handle.assignments) || !handle.asyncDir || !isAbsolute(handle.asyncDir)) return undefined;
+  const ownHandle = handle.assignments.find((candidate) => candidate.assignmentId === assignment.id);
+  if (!ownHandle || ownHandle.runId !== handle.runId ||
+    handle.assignments.some((candidate) => !candidate.assignmentId || candidate.runId !== handle.runId)) return undefined;
+  // Do not treat a v4 handle as a v5 identity just because it happened to
+  // contain similarly named fields. This is a narrowly scoped compatibility
+  // handle retained only so restored work can be reconciled; unrelated legacy
+  // session and artifact paths are deliberately not carried across.
+  return {
+    legacy: true,
+    runId: handle.runId,
+    asyncId: handle.asyncId,
+    asyncDir: handle.asyncDir,
+    ...(handle.resultPath === undefined ? {} : { resultPath: handle.resultPath }),
+    assignments: handle.assignments.map((candidate) => ({
+      assignmentId: candidate.assignmentId,
+      runId: candidate.runId,
+    })),
+  };
+}
+
+async function hasLiveLegacyStatus(handle: MigratedLegacyHandle): Promise<boolean> {
+  const asyncDir = resolve(handle.asyncDir!);
+  const statusPath = resolve(asyncDir, "status.json");
+  // The locator is an explicit directory plus its direct status file. Reject
+  // traversal, symlinks, and arbitrary neighboring files before parsing data.
+  if (relative(asyncDir, statusPath) !== "status.json") return false;
+  try {
+    const directory = await fs.lstat(asyncDir);
+    if (!directory.isDirectory() || directory.isSymbolicLink()) return false;
+    const status = await fs.open(statusPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let raw: string;
+    try {
+      if (!(await status.stat()).isFile()) return false;
+      raw = await status.readFile({ encoding: "utf8" });
+    } finally {
+      await status.close();
+    }
+    // realpath establishes that status.json remains directly contained after
+    // resolving any existing path components.
+    if (dirname(await fs.realpath(statusPath)) !== await fs.realpath(asyncDir)) return false;
+    const parsed = JSON.parse(raw) as { runId?: unknown; state?: unknown; pid?: unknown; steps?: unknown };
+    if (parsed.runId !== handle.runId || !LIVE_LEGACY_STATES.has(String(parsed.state))) return false;
+    const stepPids = Array.isArray(parsed.steps)
+      ? parsed.steps.filter((step): step is { id?: unknown; status?: unknown; pid?: unknown } => typeof step === "object" && step !== null)
+        .filter((step) => handle.assignments.some((assignment) => assignment.assignmentId === step.id) && LIVE_LEGACY_STATES.has(String(step.status)))
+        .map((step) => step.pid)
+      : [];
+    return [parsed.pid, ...stepPids].some(isLivePid);
+  } catch {
+    return false;
+  }
+}
+
+async function hasTerminalLegacyResult(handle: MigratedLegacyHandle): Promise<boolean> {
+  if (!handle.resultPath || !isAbsolute(handle.resultPath)) return false;
+  try {
+    const result = await fs.open(handle.resultPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      return (await result.stat()).isFile();
+    } finally {
+      await result.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function activeHandleIsAvailable(assignment: TaskAssignmentRecord): Promise<MigratedLegacyHandle | undefined> {
+  const handle = explicitLegacyHandle(assignment);
+  if (!handle) return undefined;
+  // A published terminal result is independently reconcilable. Live runners,
+  // however, must establish liveness from their contained status locator; a
+  // not-yet-published result must never turn a live run into attention.
+  return await hasLiveLegacyStatus(handle) || await hasTerminalLegacyResult(handle) ? handle : undefined;
+}
+
 function moveMissingActiveHandleToAttention(run: TaskRunRecord, assignment: TaskAssignmentRecord, now: number): void {
   assignment.status = "attention";
   assignment.updatedAt = now;
@@ -162,17 +260,6 @@ function moveMissingActiveHandleToAttention(run: TaskRunRecord, assignment: Task
   run.status = "attention";
   run.updatedAt = now;
   delete run.completedAt;
-}
-
-async function activeHandleIsAvailable(assignment: TaskAssignmentRecord): Promise<boolean> {
-  const path = assignment.launchRef?.resultPath;
-  if (!assignment.launchRef || !assignment.runId || !path) return false;
-  try {
-    const stat = await fs.stat(path);
-    return stat.isFile();
-  } catch {
-    return false;
-  }
 }
 
 function compactCompletedRun(run: TaskRunRecord): TaskRunRecord {
@@ -248,8 +335,12 @@ export async function migrateV4State(
   const now = context.now ?? Date.now();
   for (const run of state.taskRuns) {
     for (const assignment of run.assignments) {
-      if (ACTIVE_HANDLE_STATUSES.has(assignment.status) && !(await activeHandleIsAvailable(assignment))) {
+      if (!ACTIVE_HANDLE_STATUSES.has(assignment.status)) continue;
+      const legacyHandle = await activeHandleIsAvailable(assignment);
+      if (!legacyHandle) {
         moveMissingActiveHandleToAttention(run, assignment, now);
+      } else {
+        assignment.launchRef = legacyHandle;
       }
     }
   }

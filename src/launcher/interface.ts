@@ -20,6 +20,7 @@ export type LauncherRuntimeContext = RunnerRuntimeContext;
 export interface LaunchResult {
   runId: string;
   asyncId: string;
+  sessionId: string;
   asyncDir: string;
   resultId: string;
   resultPath: string;

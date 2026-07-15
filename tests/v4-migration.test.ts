@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -173,6 +173,44 @@ describe("v4 bounded migration", () => {
     expect(refused).toMatchObject({ restored: false, hasV4Candidate: true });
   });
 
+  test("retains a live legacy runner without a terminal result as an actionable migration-only handle", async () => {
+    const dataRoot = await root();
+    const asyncDir = join(dataRoot, "legacy-async");
+    const resultPath = join(dataRoot, "legacy-results", "legacy-run.json");
+    await mkdir(asyncDir, { recursive: true });
+    await writeFile(join(asyncDir, "status.json"), JSON.stringify({
+      runId: "legacy-run",
+      state: "running",
+      pid: process.pid,
+      steps: [{ id: "assignment-1", status: "running", pid: process.pid }],
+    }));
+    const active = state("running");
+    active.taskRuns[0].assignments[0].launchRef = {
+      legacy: true,
+      runId: "legacy-run",
+      asyncId: "legacy-run",
+      asyncDir,
+      resultPath,
+      assignments: [{ assignmentId: "assignment-1", runId: "legacy-run", resultPath }],
+    };
+
+    const migrated = await migrateV4State(active, new DurableObjectStore(dataRoot), {
+      sessionId: "generic-session", appendMigratedPointer: () => undefined,
+    });
+
+    expect(migrated.migrated).toBe(true);
+    if (!migrated.migrated) return;
+    const assignment = migrated.state.taskRuns[0].assignments[0];
+    expect(migrated.state.taskRuns[0].status).toBe("running");
+    expect(assignment).toMatchObject({
+      status: "running",
+      launchRef: { legacy: true, runId: "legacy-run", asyncId: "legacy-run", asyncDir },
+    });
+    expect(assignment.result).toBeUndefined();
+    expect(JSON.stringify(migrated.pointer)).not.toContain(asyncDir);
+    expect(JSON.stringify(migrated.archiveRefs)).not.toContain(asyncDir);
+  });
+
   test("preserves actionable state, moves missing active handles to attention, and refuses oversized active data", async () => {
     const dataRoot = await root();
     const active = state("running");
@@ -188,6 +226,43 @@ describe("v4 bounded migration", () => {
       expect(migrated.state.taskRuns[0].status).toBe("attention");
       expect(assignment).toMatchObject({ status: "attention", result: { status: "attention" } });
     }
+
+    const invalidAsyncDir = join(dataRoot, "invalid-legacy-async");
+    await mkdir(invalidAsyncDir, { recursive: true });
+    await writeFile(join(invalidAsyncDir, "status.json"), JSON.stringify({
+      runId: "different-run", state: "running", pid: process.pid,
+    }));
+    const invalid = state("running");
+    invalid.taskRuns[0].assignments[0].launchRef = {
+      legacy: true, runId: "legacy-run", asyncId: "legacy-run", asyncDir: invalidAsyncDir,
+      assignments: [{ assignmentId: "assignment-1", runId: "legacy-run" }],
+    };
+    const invalidMigration = await migrateV4State(invalid, new DurableObjectStore(dataRoot), {
+      sessionId: "invalid-session", appendMigratedPointer: () => undefined,
+    });
+    expect(invalidMigration).toMatchObject({
+      migrated: true,
+      state: { taskRuns: [{ status: "attention", assignments: [{ status: "attention" }] }] },
+    });
+
+    const terminalAsyncDir = join(dataRoot, "terminal-legacy-async");
+    const terminalResultPath = join(dataRoot, "terminal-legacy-results", "legacy-run.json");
+    await mkdir(terminalAsyncDir, { recursive: true });
+    await mkdir(join(dataRoot, "terminal-legacy-results"), { recursive: true });
+    await writeFile(terminalResultPath, JSON.stringify({ state: "complete" }));
+    const terminal = state("running");
+    terminal.taskRuns[0].assignments[0].launchRef = {
+      legacy: true, runId: "legacy-run", asyncId: "legacy-run", asyncDir: terminalAsyncDir,
+      resultPath: terminalResultPath,
+      assignments: [{ assignmentId: "assignment-1", runId: "legacy-run", resultPath: terminalResultPath }],
+    };
+    const terminalMigration = await migrateV4State(terminal, new DurableObjectStore(dataRoot), {
+      sessionId: "terminal-session", appendMigratedPointer: () => undefined,
+    });
+    expect(terminalMigration).toMatchObject({
+      migrated: true,
+      state: { taskRuns: [{ status: "running", assignments: [{ status: "running", launchRef: { legacy: true } }] }] },
+    });
 
     const oversized = state("running");
     oversized.taskRuns[0].context = "x".repeat(MAX_TASK_RUN_OBJECT_BYTES);

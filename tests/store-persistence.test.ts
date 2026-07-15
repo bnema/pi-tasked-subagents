@@ -587,7 +587,7 @@ describe("task-run state store", () => {
     expect(restored.taskRuns[0].assignments[0].result?.artifacts).toHaveLength(1);
   });
 
-  test("restores partial persisted launchRef with assignment fallbacks", () => {
+  test("drops incomplete unmarked launchRefs instead of downgrading them to legacy", () => {
     const restored = ensureState({
       version: 4,
       currentTaskRunId: "task-run-1",
@@ -605,19 +605,47 @@ describe("task-run state store", () => {
       }],
     });
 
-    const assignment = restored.taskRuns[0].assignments[0];
+    expect(restored.taskRuns[0].assignments[0]).toMatchObject({ runId: "async-stored" });
+    expect(restored.taskRuns[0].assignments[0].launchRef).toBeUndefined();
+  });
 
-    expect(assignment.runId).toBe("async-stored");
-    expect(assignment.launchRef).toMatchObject({
-      runId: "async-stored",
-      asyncId: "async-stored",
-      resultPath: "local://results/assignment-1.json",
-      assignments: [{
-        assignmentId: "assignment-1",
-        runId: "async-stored",
-        resultPath: "local://results/assignment-1.json",
+  test("preserves only session-bound durable launch handles and explicit legacy handles", () => {
+    const durable = ensureState({
+      version: 4,
+      currentTaskRunId: "task-run-1",
+      updatedAt: 1,
+      taskRuns: [{
+        ...taskRun,
+        assignments: [{
+          ...taskRun.assignments[0],
+          launchRef: {
+            runId: "run-1",
+            asyncId: "run-1",
+            sessionId: "session-a",
+            asyncDir: "/untrusted/runs/session-a/0123456789abcdef0123456789abcdef",
+            resultId: "0123456789abcdef0123456789abcdef",
+            resultPath: "/untrusted/results/session-a/0123456789abcdef0123456789abcdef.json",
+            resultReservationPath: "/untrusted/results/session-a/0123456789abcdef0123456789abcdef.json.reservation",
+            assignments: [{ assignmentId: "assignment-1", runId: "run-1" }],
+          },
+        }],
       }],
     });
+    const legacy = ensureState({
+      version: 4,
+      currentTaskRunId: "task-run-1",
+      updatedAt: 1,
+      taskRuns: [{
+        ...taskRun,
+        assignments: [{
+          ...taskRun.assignments[0],
+          launchRef: { legacy: true, runId: "legacy-run", asyncId: "legacy-run", resultPath: "/legacy/result.json", assignments: [] },
+        }],
+      }],
+    });
+
+    expect(durable.taskRuns[0].assignments[0].launchRef).toMatchObject({ sessionId: "session-a", resultId: "0123456789abcdef0123456789abcdef" });
+    expect(legacy.taskRuns[0].assignments[0].launchRef).toMatchObject({ legacy: true, resultPath: "/legacy/result.json" });
   });
 
   test("restores the newest fully valid v5 checkpoint and falls back only to an earlier complete graph", async () => {
@@ -829,7 +857,7 @@ describe("task-run state store", () => {
     }
   });
 
-  test("synthesizes launchRef for runId-only persisted assignments", () => {
+  test("does not synthesize a path-trusting launchRef for runId-only persisted assignments", () => {
     const restored = ensureState({
       version: 4,
       currentTaskRunId: "task-run-1",
@@ -845,18 +873,7 @@ describe("task-run state store", () => {
       }],
     });
 
-    const assignment = restored.taskRuns[0].assignments[0];
-
-    expect(assignment.runId).toBe("run-stored");
-    expect(assignment.launchRef).toMatchObject({
-      runId: "run-stored",
-      asyncId: "run-stored",
-      resultPath: "local://results/assignment-1.json",
-      assignments: [{
-        assignmentId: "assignment-1",
-        runId: "run-stored",
-        resultPath: "local://results/assignment-1.json",
-      }],
-    });
+    expect(restored.taskRuns[0].assignments[0]).toMatchObject({ runId: "run-stored" });
+    expect(restored.taskRuns[0].assignments[0].launchRef).toBeUndefined();
   });
 });

@@ -14,7 +14,7 @@ async function withLaunchedAdapter(runId: string, result: unknown, testBody: (ad
   try {
     const asyncRoot = path.join(root, "async");
     const resultsRoot = path.join(root, "results");
-    const adapter = new PiRunnerAdapter({ piBin: "true", asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
+    const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root, asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
     const handle = await adapter.launchTaskGraph({
       runId,
       title: "Run",
@@ -347,13 +347,11 @@ describe("PiRunnerAdapter task graph boundary", () => {
     });
   });
 
-  test("handle result path overrides tracked launch result path", async () => {
+  test("rejects a durable result path override instead of reading it", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
     try {
-      const asyncRoot = path.join(root, "async");
-      const resultsRoot = path.join(root, "results");
       const overrideResultPath = path.join(root, "override-results", "run-override.json");
-      const adapter = new PiRunnerAdapter({ piBin: "true", asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
       const handle = await adapter.launchTaskGraph({
         runId: "run-override",
         title: "Run",
@@ -361,10 +359,11 @@ describe("PiRunnerAdapter task graph boundary", () => {
         tasks: [{ assignmentId: "a1", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
       }, { cwd: process.cwd(), sessionId: "test", pi: {} as never });
       await mkdir(path.dirname(overrideResultPath), { recursive: true });
-      await writeFile(path.join(resultsRoot, "run-override.json"), JSON.stringify({ rawOutput: "tracked path" }), "utf8");
+      await writeFile(handle.resultPath, JSON.stringify({ rawOutput: "durable path" }), "utf8");
       await writeFile(overrideResultPath, JSON.stringify({ rawOutput: "override path" }), "utf8");
 
-      await expect(adapter.getRunResult({ ...handle, resultPath: overrideResultPath })).resolves.toBe("override path");
+      await expect(adapter.getRunResult({ ...handle, resultPath: overrideResultPath })).resolves.toBeUndefined();
+      await expect(adapter.getRunResult(handle)).resolves.toBe("durable path");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -402,9 +401,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
   test("writes task_graph runner config", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
     try {
-      const asyncRoot = path.join(root, "async");
-      const resultsRoot = path.join(root, "results");
-      const adapter = new PiRunnerAdapter({ piBin: "true", asyncDirRootOverride: asyncRoot, resultsDirOverride: resultsRoot });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
       const ref = await adapter.launchTaskGraph({
         runId: "run-1",
         title: "Run",
@@ -415,9 +412,10 @@ describe("PiRunnerAdapter task graph boundary", () => {
       expect(ref).toMatchObject({
         runId: "run-1",
         asyncId: "run-1",
-        asyncDir: expect.stringMatching(new RegExp(`^${asyncRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[a-f0-9]{32}$`, "u")),
+        sessionId: "test",
+        asyncDir: expect.stringMatching(new RegExp(`^${path.join(root, "runs", "test").replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[a-f0-9]{32}$`, "u")),
         resultId: expect.stringMatching(/^[a-f0-9]{32}$/u),
-        resultPath: expect.stringMatching(new RegExp(`^${resultsRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[a-f0-9]{32}\\.json$`, "u")),
+        resultPath: expect.stringMatching(new RegExp(`^${path.join(root, "results", "test").replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[a-f0-9]{32}\\.json$`, "u")),
         resultReservationPath: expect.stringMatching(/\.reservation$/u),
         assignments: [{ assignmentId: "a1", runId: "run-1", resultPath: expect.any(String) }],
       });
@@ -425,6 +423,53 @@ describe("PiRunnerAdapter task graph boundary", () => {
       expect(config.mode).toBe("task_graph");
       expect(config.children[0].id).toBe("a1");
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for a restored durable handle with attacker-controlled external paths and PIDs", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100000)"], { stdio: "ignore" });
+    try {
+      const resultId = "0123456789abcdef0123456789abcdef";
+      const externalDir = path.join(root, "attacker-controlled");
+      const externalResultPath = path.join(externalDir, "result.json");
+      const externalReservationPath = `${externalResultPath}.reservation`;
+      await mkdir(externalDir, { recursive: true });
+      await writeFile(path.join(externalDir, "status.json"), JSON.stringify({
+        runId: "run-restored",
+        state: "running",
+        pid: child.pid,
+        steps: [{ id: "a1", status: "running", pid: child.pid }],
+      }), "utf8");
+      await writeFile(externalResultPath, JSON.stringify({ state: "complete", rawOutput: "attacker output" }), "utf8");
+      await writeFile(externalReservationPath, JSON.stringify({ sessionId: "session-a", runId: "run-restored", resultId }), "utf8");
+      const originalStatus = await readFile(path.join(externalDir, "status.json"), "utf8");
+      const originalResult = await readFile(externalResultPath, "utf8");
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: path.join(root, "application-data") });
+      const handle: SubagentRunHandle = {
+        runId: "run-restored",
+        asyncId: "run-restored",
+        sessionId: "session-a",
+        asyncDir: externalDir,
+        resultId,
+        resultPath: externalResultPath,
+        resultReservationPath: externalReservationPath,
+        assignments: [{ assignmentId: "a1", runId: "run-restored", resultPath: externalResultPath }],
+      };
+
+      await expect(adapter.waitForRunSignal(handle, { timeoutMs: 25 })).resolves.toBe("failed");
+      await expect(adapter.getRunResult(handle)).resolves.toBeUndefined();
+      await expect(adapter.isRunAlive(handle)).resolves.toBe(false);
+      await expect(adapter.stopRun(handle, { cwd: process.cwd(), sessionId: "session-a", pi: {} as never })).resolves.toBe(false);
+      await expect(adapter.cancelRun(handle, { cwd: process.cwd(), sessionId: "session-a", pi: {} as never })).resolves.toBe(false);
+      await expect(readFile(path.join(externalDir, "status.json"), "utf8")).resolves.toBe(originalStatus);
+      await expect(readFile(externalResultPath, "utf8")).resolves.toBe(originalResult);
+      await expect(readFile(externalReservationPath, "utf8")).resolves.toContain(resultId);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("exit", resolve));
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -503,9 +548,9 @@ describe("PiRunnerAdapter task graph boundary", () => {
   ] as const)("%s publishes terminal state through the adapter-owned reservation", async (method, expectedState, expectedSummary) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
     try {
-      const asyncDir = path.join(root, "restored-async");
-      const resultPath = path.join(root, "restored-results", `${method}.json`);
       const resultId = "0123456789abcdef0123456789abcdef";
+      const asyncDir = path.join(root, "runs", "test", resultId);
+      const resultPath = path.join(root, "results", "test", `${resultId}.json`);
       const resultReservationPath = `${resultPath}.reservation`;
       await mkdir(asyncDir, { recursive: true });
       await mkdir(path.dirname(resultPath), { recursive: true });
@@ -520,14 +565,11 @@ describe("PiRunnerAdapter task graph boundary", () => {
         ],
       }), "utf8");
 
-      const adapter = new PiRunnerAdapter({
-        piBin: "true",
-        asyncDirRootOverride: path.join(root, "unused-async-root"),
-        resultsDirOverride: path.join(root, "unused-results-root"),
-      });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
       const handle: SubagentRunHandle = {
         runId: "run-restored",
         asyncId: "run-restored",
+        sessionId: "test",
         asyncDir,
         resultId,
         resultPath,

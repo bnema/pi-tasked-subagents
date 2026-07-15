@@ -14,6 +14,11 @@ export function isResultId(value: unknown): value is string {
   return typeof value === "string" && RESULT_ID.test(value);
 }
 
+/** A session identity is safe to use as one application-data path component. */
+export function isSessionId(value: unknown): value is string {
+  return typeof value === "string" && SAFE_PATH_ID.test(value);
+}
+
 export interface StoragePathsOptions {
   /** An application-root override, used by tests and embedders. */
   dataRoot?: string;
@@ -103,6 +108,18 @@ export function resultFilePath(paths: SessionStoragePaths, resultId: string): st
 
 export function resultReservationPath(paths: SessionStoragePaths, resultId: string): string {
   return `${resultFilePath(paths, resultId)}.reservation`;
+}
+
+/** Return a contained, non-symlinked durable runner directory. */
+export function runDirectoryPath(paths: SessionStoragePaths, resultId: string): string {
+  if (!isResultId(resultId)) unsafeId("result ID");
+  return containedPath(paths.root, "runs", sessionIdFromPaths(paths), resultId);
+}
+
+/** Return a contained, non-symlinked file within one durable runner directory. */
+export function runFilePath(paths: SessionStoragePaths, resultId: string, fileName: string): string {
+  assertId(fileName, SAFE_PATH_ID, "runner file name");
+  return containedPath(runDirectoryPath(paths, resultId), fileName);
 }
 
 /** Assignment IDs are deliberately hashed before becoming path components. */
