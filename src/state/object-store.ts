@@ -7,6 +7,7 @@ import { MAX_ASSIGNMENT_ARCHIVE_BYTES, STORE_VERSION } from "../defaults.js";
 import { canonicalJson, canonicalJsonBounded, sha256Hex } from "./canonical-json.js";
 import type { StoredObject } from "./durable-types.js";
 import { assignmentArchiveDir, assignmentArchiveLinkPath, sessionStoragePaths } from "./storage-paths.js";
+import { pinExistingDirectory } from "./pinned-directory.mjs";
 
 const DIGEST_ID = /^[a-f0-9]{64}$/;
 type ObjectKind = StoredObject<unknown>["kind"];
@@ -454,32 +455,10 @@ export class DurableObjectStore {
    * the still-open directory even if an attacker replaces its pathname.
    */
   private async pinDirectory(directory: string, expected: PathIdentity): Promise<PinnedDirectory> {
-    const rootIdentity = await this.ensureRoot();
-    let handle: fs.FileHandle;
-    try {
-      handle = await fs.open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-    } catch (error) {
-      throw new Error("Unable to open pinned storage directory", { cause: error });
-    }
-    try {
-      const stat = await handle.stat();
-      if (!stat.isDirectory() || stat.dev !== expected.dev || stat.ino !== expected.ino) {
-        throw new Error("Storage directory identity changed before pinning");
-      }
-      const procPath = this.options.procDirectoryPath?.(handle.fd) ?? `/proc/self/fd/${handle.fd}`;
-      let realpath: string;
-      try {
-        realpath = await fs.realpath(procPath);
-      } catch (error) {
-        throw new Error("Procfs dirfd paths are unavailable; refusing storage mutation", { cause: error });
-      }
-      if (realpath !== expected.realpath) throw new Error("Pinned storage directory realpath changed during validation");
-      this.assertRealContained(rootIdentity.realpath, realpath);
-      return { handle, identity: expected, procPath };
-    } catch (error) {
-      await handle.close();
-      throw error;
-    }
+    const pinned = await pinExistingDirectory(this.root, directory, expected, {
+      procDirectoryPath: this.options.procDirectoryPath,
+    });
+    return { handle: pinned.handle, identity: expected, procPath: pinned.procDirectoryPath };
   }
 
   private pinnedPath(directory: PinnedDirectory, name: string): string {

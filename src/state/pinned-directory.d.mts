@@ -1,0 +1,19 @@
+import type { FileHandle } from "node:fs/promises";
+
+export interface DirectoryIdentity { dev: number; ino: number; }
+export interface PinnedDirectoryOptions { procDirectoryPath?: (fd: number) => string; }
+export declare class PinnedDirectory {
+  readonly handle: FileHandle;
+  readonly identity: DirectoryIdentity;
+  readonly procDirectoryPath: string;
+  path(name: string): string;
+  assert(): Promise<void>;
+  openFile(name: string, flags: number, mode?: number): Promise<FileHandle>;
+  link(name: string, destination: PinnedDirectory, destinationName: string): Promise<void>;
+  unlink(name: string): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
+export declare function safeBasename(name: string): string;
+export declare function openPinnedDirectory(root: string, directory: string, options?: PinnedDirectoryOptions): Promise<PinnedDirectory>;
+export declare function pinExistingDirectory(root: string, directory: string, expected: DirectoryIdentity, options?: PinnedDirectoryOptions): Promise<PinnedDirectory>;

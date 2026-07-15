@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -20,27 +20,31 @@ describe("immutable terminal result publication", () => {
     reservationPath: string;
     expected: { sessionId: string; runId: string; resultId: string };
   }) => Promise<void>) {
-    const directory = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-result-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-result-"));
     const expected = { sessionId: "session-test", runId: "run-test", resultId: "0123456789abcdef0123456789abcdef" };
+    const directory = path.join(root, "results", expected.sessionId);
+    await mkdir(directory, { recursive: true });
     const resultPath = path.join(directory, `${expected.resultId}.json`);
     const reservationPath = `${resultPath}.reservation`;
     try {
       await writeFile(reservationPath, JSON.stringify(expected), "utf8");
       await testBody({ directory, resultPath, reservationPath, expected });
     } finally {
-      await rm(directory, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
     }
   }
 
   test("requires the adapter-owned reservation and never creates one", async () => {
-    const directory = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-result-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-result-"));
     const expected = { sessionId: "session-test", runId: "run-test", resultId: "0123456789abcdef0123456789abcdef" };
-    const reservationPath = path.join(directory, "missing.reservation");
+    const directory = path.join(root, "results", expected.sessionId);
+    await mkdir(directory, { recursive: true });
+    const reservationPath = path.join(directory, `${expected.resultId}.json.reservation`);
     try {
       await expect(verifyResultReservation(reservationPath, expected)).rejects.toThrow("reservation");
       await expect(readFile(reservationPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      await rm(directory, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
     }
   });
 
@@ -72,6 +76,25 @@ describe("immutable terminal result publication", () => {
       expect([first.published, second.published].filter(Boolean)).toHaveLength(1);
       expect(["completion", "cancellation"]).toContain(result.summary);
       expect((await readdir(directory)).filter((name) => name.includes(".tmp-")).length).toBe(0);
+    });
+  });
+
+  test("keeps terminal publication in its pinned session directory after a symlink swap", async () => {
+    await withResultPaths(async ({ directory, resultPath, reservationPath, expected }) => {
+      const outside = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-outside-"));
+      try {
+        const published = await publishTerminalResult(resultPath, reservationPath, expected, { state: "complete" }, {
+          beforeMutation: async () => {
+            await rename(directory, `${directory}-real`);
+            await symlink(outside, directory);
+          },
+        });
+        expect(published.published).toBe(true);
+        expect(await readdir(outside)).toEqual([]);
+        await expect(readFile(path.join(`${directory}-real`, path.basename(resultPath)), "utf8")).resolves.toContain(expected.resultId);
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
     });
   });
 

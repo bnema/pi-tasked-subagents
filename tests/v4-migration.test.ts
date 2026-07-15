@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -54,6 +54,28 @@ describe("v4 bounded migration", () => {
 
     await rm(source);
     expect(await ingestLegacyResult(source, paths)).toEqual({ unavailable: "missing-legacy-result" });
+  });
+
+  test("keeps migrated result installation in its pinned session directory after a symlink swap", async () => {
+    const dataRoot = await root();
+    const outside = await root();
+    const source = join(dataRoot, "legacy-result.json");
+    const contents = "migrated pinned output";
+    await writeFile(source, contents);
+    const paths = sessionStoragePaths(dataRoot, "generic-session");
+    const realResults = `${paths.resultsDir}-real`;
+
+    const installed = await ingestLegacyResult(source, paths, {
+      beforeMutation: async (operation) => {
+        if (operation !== "install-legacy-result") return;
+        await rename(paths.resultsDir, realResults);
+        await symlink(outside, paths.resultsDir);
+      },
+    });
+
+    expect(installed).toEqual({ resultId: createHash("sha256").update(contents).digest("hex") });
+    expect(await readdir(outside)).toEqual([]);
+    if ("resultId" in installed) await expect(readFile(join(realResults, `${installed.resultId}.json`), "utf8")).resolves.toBe(contents);
   });
 
   test("converts terminal history once without retaining the legacy path and explicitly marks unavailable output", async () => {

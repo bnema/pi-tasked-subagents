@@ -24,7 +24,7 @@ import type {
 } from "../types.js";
 import { getAgentProfile, listAvailableAgentProfiles } from "./agent-profiles.js";
 import { ensureTaskGraphRequest, type LaunchResult, type RunnerRuntimeContext, type RunnerChildConfig, type RunnerConfig } from "./interface.js";
-import { publishTerminalResult } from "./result-files.mjs";
+import { publishTerminalResult, releaseResultReservation, reserveResultReservation } from "./result-files.mjs";
 
 function now(): number {
   return Date.now();
@@ -203,6 +203,10 @@ export interface PiRunnerAdapterOptions {
   resultsDirOverride?: string;
   /** Injectable only for deterministic tests; production uses cryptographic random bytes. */
   resultIdFactory?: () => string;
+  /** Injectable operation boundary for deterministic pinned-storage race tests. */
+  storageMutationHook?: (operation: "reserve-result" | "publish-terminal-result") => Promise<void> | void;
+  /** Injectable only for deterministic unavailable-procfs tests. */
+  procDirectoryPath?: (fd: number) => string;
 }
 
 export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
@@ -211,6 +215,8 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   private readonly asyncRoot: string;
   private readonly resultsRoot: string;
   private readonly resultIdFactory: () => string;
+  private readonly storageMutationHook: PiRunnerAdapterOptions["storageMutationHook"];
+  private readonly procDirectoryPath: PiRunnerAdapterOptions["procDirectoryPath"];
   /** Each launch is keyed by session and immutable identity, never by report-oriented runId. */
   private readonly trackedLaunches = new Map<string, { launch: LaunchResult; pid?: number }>();
 
@@ -222,6 +228,8 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     this.asyncRoot = options.asyncDirRootOverride ?? defaultAsyncRoot();
     this.resultsRoot = options.resultsDirOverride ?? defaultResultsRoot();
     this.resultIdFactory = options.resultIdFactory ?? (() => randomBytes(16).toString("hex"));
+    this.storageMutationHook = options.storageMutationHook;
+    this.procDirectoryPath = options.procDirectoryPath;
   }
 
   async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: RunnerRuntimeContext): Promise<DurableSubagentRunHandle> {
@@ -241,6 +249,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       mode: "task_graph",
       maxConcurrency: request.maxConcurrency,
       piBin: this.piBin,
+      storageRoot: this.dataRoot,
       asyncDir: paths.asyncDir,
       resultsDir: paths.resultsDir,
       resultId: reservation.resultId,
@@ -254,7 +263,11 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     try {
       launch = await this.buildAndLaunch(config);
     } catch (error) {
-      await fsp.unlink(reservation.resultReservationPath).catch(() => undefined);
+      await releaseResultReservation(this.dataRoot, resultsDir, {
+        sessionId,
+        runId: request.runId,
+        resultId: reservation.resultId,
+      }, { procDirectoryPath: this.procDirectoryPath }).catch(() => undefined);
       throw error;
     }
     return {
@@ -404,41 +417,15 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const resultId = this.resultIdFactory();
       if (!/^[a-f0-9]{32}$/u.test(resultId)) throw new Error("Result ID factory returned an invalid 128-bit identity");
-      const resultPath = safeJoin(resultsDir, `${resultId}.json`);
-      const reservationPath = `${resultPath}.reservation`;
       try {
-        await fsp.access(resultPath);
-        continue;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-      await fsp.mkdir(path.dirname(reservationPath), { recursive: true });
-      let reservation: Awaited<ReturnType<typeof fsp.open>> | undefined;
-      let created = false;
-      try {
-        reservation = await fsp.open(reservationPath, "wx");
-        created = true;
-        const identity = JSON.stringify({ sessionId, runId, resultId });
-        await reservation.writeFile(identity, "utf8");
-        await reservation.sync();
-        // An old published result may have outlived its reservation. Do not
-        // hand that identity to a new child even if random generation collides.
-        try {
-          await fsp.access(resultPath);
-          await reservation.close();
-          reservation = undefined;
-          await fsp.unlink(reservationPath);
-          continue;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-        return { resultId, resultPath, resultReservationPath: reservationPath };
+        const reservation = await reserveResultReservation(this.dataRoot, resultsDir, { sessionId, runId, resultId }, {
+          beforeMutation: this.storageMutationHook,
+          procDirectoryPath: this.procDirectoryPath,
+        });
+        return { resultId, ...reservation };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
-        if (created) await fsp.unlink(reservationPath).catch(() => undefined);
         throw error;
-      } finally {
-        await reservation?.close();
       }
     }
     throw new Error("Could not reserve a unique immutable result identity");
@@ -477,7 +464,6 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
 
   private async buildAndLaunch(config: RunnerConfig): Promise<LaunchResult> {
     await fsp.mkdir(config.asyncDir, { recursive: true });
-    await fsp.mkdir(config.resultsDir, { recursive: true });
     const configPath = safeJoin(config.asyncDir, "config.json");
     await writeJsonFile(configPath, config);
     const launch: LaunchResult = {
@@ -597,7 +583,11 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
         sessionId,
         runId,
         resultId: handle.resultId,
-      }, terminalResult);
+      }, terminalResult, {
+        root: this.dataRoot,
+        beforeMutation: this.storageMutationHook,
+        procDirectoryPath: this.procDirectoryPath,
+      });
     } catch {
       return false;
     }

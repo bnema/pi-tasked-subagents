@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -111,6 +111,34 @@ describe("PiRunnerAdapter task graph boundary", () => {
       });
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps result reservation in its pinned session directory after a symlink swap", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    const outside = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-outside-"));
+    try {
+      const sessionDirectory = path.join(root, "results", "session-a");
+      const adapter = new PiRunnerAdapter({
+        piBin: "true",
+        dataRoot: root,
+        resultIdFactory: () => "0123456789abcdef0123456789abcdef",
+        storageMutationHook: async (operation) => {
+          if (operation !== "reserve-result") return;
+          await rename(sessionDirectory, `${sessionDirectory}-real`);
+          await symlink(outside, sessionDirectory);
+        },
+      });
+      await expect(adapter.launchTaskGraph({
+        runId: "run-1", title: "Run", taskSummary: "Run",
+        tasks: [{ assignmentId: "a1", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
+      }, { cwd: process.cwd(), sessionId: "session-a", pi: {} as never })).rejects.toThrow(/symlink|storage/i);
+
+      expect(await readdir(outside)).toEqual([]);
+      await expect(readFile(path.join(`${sessionDirectory}-real`, "0123456789abcdef0123456789abcdef.json.reservation"), "utf8")).resolves.toContain("0123456789abcdef0123456789abcdef");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
     }
   });
 

@@ -642,7 +642,7 @@ async function writeResult(config, status, results) {
     rawOutput,
     timestamp,
     results,
-  });
+  }, { root: config.storageRoot });
 
   status.state = success ? "complete" : "failed";
   status.endedAt = timestamp;
@@ -780,7 +780,6 @@ async function run(config) {
     throw new Error(`Unsupported direct-runner mode: ${config.mode}. Expected task_graph.`);
   }
   await ensureDir(config.asyncDir);
-  await ensureDir(config.resultsDir);
   for (const child of config.children) await ensureDir(child.sessionDir);
 
   const status = createInitialStatus(config);
@@ -823,7 +822,7 @@ if (isMain) {
           sessionId: config.sessionId,
           runId: config.runId,
           resultId: config.resultId,
-        }, signal.result);
+        }, signal.result, { root: config.storageRoot });
       } catch (error) {
         console.error("[direct-runner] Failed to write termination state", error);
       } finally {
@@ -862,7 +861,7 @@ if (isMain) {
         success: false,
         summary: message,
         timestamp,
-      }).catch((publishError) => {
+      }, { root: config.storageRoot }).catch((publishError) => {
         console.error("[direct-runner] Failed to publish terminal result", toErrorMessage(publishError));
       });
       process.exitCode = 1;

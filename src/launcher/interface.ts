@@ -75,6 +75,8 @@ export interface RunnerConfig {
   mode: "task_graph";
   maxConcurrency?: number;
   piBin: string;
+  /** Pinned durable root; result paths are rejected if they do not match it. */
+  storageRoot: string;
   asyncDir: string;
   resultsDir: string;
   resultId: string;

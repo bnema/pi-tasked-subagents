@@ -21,7 +21,8 @@ import {
 import { DurableObjectStore } from "./object-store.js";
 import type { SessionEntry } from "./persistence.js";
 import { ensureState } from "./store.js";
-import { resultFilePath, sessionStoragePaths, type SessionStoragePaths } from "./storage-paths.js";
+import { sessionStoragePaths, type SessionStoragePaths } from "./storage-paths.js";
+import { openPinnedDirectory, safeBasename } from "./pinned-directory.mjs";
 
 const TERMINAL_ASSIGNMENT_STATUSES = new Set<AssignmentStatus>(["completed", "failed", "cancelled", "skipped"]);
 const ACTIVE_HANDLE_STATUSES = new Set<AssignmentStatus>(["running", "blocked", "paused"]);
@@ -73,10 +74,12 @@ async function digestFile(path: string): Promise<string> {
 export async function ingestLegacyResult(
   sourcePath: string,
   destination: SessionStoragePaths,
+  options: { beforeMutation?: (operation: "ingest-legacy-result" | "install-legacy-result") => Promise<void> | void } = {},
 ): Promise<{ resultId: string } | { unavailable: "missing-legacy-result" }> {
   let source: fs.FileHandle | undefined;
   let temporary: fs.FileHandle | undefined;
-  let temporaryPath: string | undefined;
+  let destinationDirectory: Awaited<ReturnType<typeof openPinnedDirectory>> | undefined;
+  let temporaryName: string | undefined;
   try {
     try {
       source = await fs.open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -85,9 +88,10 @@ export async function ingestLegacyResult(
       return missingResult();
     }
 
-    await fs.mkdir(destination.resultsDir, { recursive: true, mode: 0o700 });
-    temporaryPath = `${destination.resultsDir}/.${process.pid}.${randomBytes(12).toString("hex")}.tmp`;
-    temporary = await fs.open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    destinationDirectory = await openPinnedDirectory(destination.root, destination.resultsDir);
+    await options.beforeMutation?.("ingest-legacy-result");
+    temporaryName = safeBasename(`.${process.pid}.${randomBytes(12).toString("hex")}.tmp`);
+    temporary = await destinationDirectory.openFile(temporaryName, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     const hash = createHash("sha256");
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
@@ -106,19 +110,15 @@ export async function ingestLegacyResult(
     source = undefined;
 
     const resultId = hash.digest("hex");
-    const finalPath = resultFilePath(destination, resultId);
+    const finalName = safeBasename(`${resultId}.json`);
     try {
-      // link(2) provides a no-replace winner gate on the destination filesystem.
-      await fs.link(temporaryPath, finalPath);
-      const directory = await fs.open(dirname(finalPath), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      // link(2) is the no-replace winner gate, through the still-open dirfd.
+      await options.beforeMutation?.("install-legacy-result");
+      await destinationDirectory.link(temporaryName, destinationDirectory, finalName);
+      await destinationDirectory.sync();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (await digestFile(finalPath) !== resultId) {
+      if (await digestFile(destinationDirectory.path(finalName)) !== resultId) {
         throw new Error("Existing durable result digest mismatch", { cause: error });
       }
     }
@@ -126,7 +126,8 @@ export async function ingestLegacyResult(
   } finally {
     await source?.close();
     await temporary?.close();
-    if (temporaryPath) await fs.rm(temporaryPath, { force: true });
+    if (temporaryName && destinationDirectory) await destinationDirectory.unlink(temporaryName).catch(() => undefined);
+    await destinationDirectory?.close();
   }
 }
 
