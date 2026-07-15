@@ -32,7 +32,7 @@ interface TaskRunControllerApi {
   stopRun(assignmentId: string): Promise<boolean>;
   cancelRun(assignmentId: string): Promise<boolean>;
   cancelActiveRuns(): Promise<number>;
-  clear(scope?: "completed" | "all"): Promise<number>;
+  clear(scope?: "completed" | "all", targetId?: string): Promise<number>;
   handleUserAsk(prompt: string, ctx?: unknown): Promise<unknown>;
   awaitLastWork(): Promise<void>;
   restoreState(state: TaskedSubagentsState): void;
@@ -277,6 +277,27 @@ class ControlledSpyRuntime extends ControlledRuntime {
   async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
     this.cancelled.push(handle);
     return true;
+  }
+}
+
+class CancelControlledRuntime extends ControlledSpyRuntime {
+  private cancelStartedResolve!: () => void;
+  private releaseCancelResolve!: () => void;
+  readonly cancelStarted = new Promise<void>((resolve) => {
+    this.cancelStartedResolve = resolve;
+  });
+  private readonly releaseCancel = new Promise<void>((resolve) => {
+    this.releaseCancelResolve = resolve;
+  });
+
+  async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.cancelStartedResolve();
+    await this.releaseCancel;
+    return super.cancelRun(handle);
+  }
+
+  finishCancel(): void {
+    this.releaseCancelResolve();
   }
 }
 
@@ -696,6 +717,36 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(runtime.requests.map((request) => request.tasks.map((task) => task.taskId))).toEqual([["triage"], ["review"]]);
   });
 
+  test("wait mode does not queue automatic completion turns", async () => {
+    const pi = fakePi();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { runtime: new ExpansionRuntime() }));
+
+    await controller.setTasks({
+      ...baseSetTasks,
+      tasks: [{ id: "triage", group: "main", text: "Plan review work", criteria: ["Plan produced"], expansionMode: "append_tasks" }],
+      wait: true,
+    });
+
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("background multi-wave dispatch queues one turn only after the TaskRun is terminal", async () => {
+    const pi = fakePi();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { runtime: new ExpansionRuntime() }));
+
+    await controller.setTasks({
+      ...baseSetTasks,
+      tasks: [{ id: "triage", group: "main", text: "Plan review work", criteria: ["Plan produced"], expansionMode: "append_tasks" }],
+    });
+    await controller.awaitLastWork();
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ details: expect.objectContaining({ taskRunId: "task-run-1", status: "completed" }) }),
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+  });
+
   test("triage expansion malformed task ids mark visible task attention without throwing", async () => {
     const runtime = new MalformedIdExpansionRuntime();
     const { controller } = controllerWith(runtime);
@@ -849,6 +900,26 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     } as never)).resolves.toMatchObject({ patched: false, dispatchScheduled: false, errors: ["Patch expansionMode is not supported; set expansionMode on appended tasks"] });
 
     expect(controller.getState().taskRuns[0]).toEqual(beforePatch);
+  });
+
+  test("waited patch suppresses a terminal signal from an already-running background dispatch", async () => {
+    const runtime = new FirstResultControlledRuntime();
+    const pi = fakePi();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { runtime }));
+
+    await controller.setTasks(baseSetTasks);
+    await runtime.resultStarted;
+
+    const patch = controller.patchTaskRun({
+      taskRunId: "task-run-1",
+      tasks: [{ id: "review", group: "main", text: "Review after task", criteria: ["Reviewed"], dependsOn: ["task"] }],
+      wait: true,
+    });
+    runtime.releaseResult();
+    await patch;
+
+    expect(controller.getState().taskRuns[0].status).toBe("completed");
+    expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
   test("patchTaskRun does not invalidate an active dispatch result", async () => {
@@ -1420,6 +1491,24 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(assignment.completedAt).toBeUndefined();
   });
 
+  test("background launch failure emits one terminal failure signal", async () => {
+    const pi = fakePi();
+    const runtime = new LaunchRejectControlledRuntime();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { runtime }));
+
+    await controller.setTasks(baseSetTasks);
+    await runtime.launchStarted;
+    runtime.rejectLaunch();
+    await controller.awaitLastWork();
+
+    expect(controller.getState().taskRuns[0].status).toBe("failed");
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ details: expect.objectContaining({ status: "failed" }) }),
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+  });
+
   test.each([
     ["paused", "paused"],
     ["cancelled", "cancelled"],
@@ -1452,6 +1541,83 @@ describe("TaskedSubagentsController TaskRun public API", () => {
 
     await expect(controller.clear()).resolves.toBe(1);
 
+    expect(controller.getState().taskRuns).toEqual([]);
+  });
+
+  test("targeted clear removes only the requested inactive TaskRun", async () => {
+    const { controller } = controllerWith(new CompletingRuntime());
+    const state = recoverableState("attention");
+    const other = structuredClone(state.taskRuns[0]);
+    other.id = "task-run-other";
+    other.title = "Other run";
+    other.assignments[0].taskRunId = other.id;
+    state.taskRuns.push(other);
+    state.currentTaskRunId = other.id;
+    controller.restoreState(state);
+
+    await expect(controller.clear("completed", "task-run-1")).resolves.toBe(1);
+
+    expect(controller.getState().taskRuns.map((taskRun) => taskRun.id)).toEqual(["task-run-other"]);
+  });
+
+  test("targeted relaunch becomes the TaskRun displayed after clearing the prior current run", async () => {
+    const runtime = new CompletingRuntime();
+    const { controller } = controllerWith(runtime);
+    const state = recoverableState("attention");
+    state.taskRuns[0].id = "task-run-relaunch";
+    state.taskRuns[0].title = "Relaunched run";
+    state.taskRuns[0].assignments[0].taskRunId = "task-run-relaunch";
+    const stale = structuredClone(state.taskRuns[0]);
+    stale.id = "task-run-stale";
+    stale.title = "Stale run";
+    stale.assignments[0].taskRunId = stale.id;
+    const completed = structuredClone(state.taskRuns[0]);
+    completed.id = "task-run-completed";
+    completed.title = "Completed current run";
+    completed.status = "completed";
+    completed.tasks[0].status = "completed";
+    completed.assignments[0].taskRunId = completed.id;
+    completed.assignments[0].status = "completed";
+    state.taskRuns = [state.taskRuns[0], stale, completed];
+    state.currentTaskRunId = completed.id;
+    controller.restoreState(state);
+
+    await controller.clear();
+    await expect(controller.continueTarget("task-run-relaunch", "retry now")).resolves.toBe(true);
+    await controller.awaitLastWork();
+
+    expect(controller.getState().currentTaskRunId).toBe("task-run-relaunch");
+  });
+
+  test("clear all rejects new TaskRuns while active cancellation is in progress", async () => {
+    const runtime = new CancelControlledRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await runtime.waitStarted;
+    const clearing = controller.clear("all");
+    await runtime.cancelStarted;
+
+    await expect(controller.setTasks({ ...baseSetTasks, title: "Too late" })).resolves.toMatchObject({
+      accepted: false,
+      dispatchScheduled: false,
+    });
+
+    runtime.finishCancel();
+    await clearing;
+    expect(controller.getState().taskRuns).toEqual([]);
+  });
+
+  test("clear all cancels a committed active run before removing its state", async () => {
+    const runtime = new ControlledSpyRuntime();
+    const { controller } = controllerWith(runtime);
+
+    await controller.setTasks(baseSetTasks);
+    await runtime.waitStarted;
+
+    await expect(controller.clear("all")).resolves.toBe(1);
+
+    expect(runtime.cancelled).toHaveLength(1);
     expect(controller.getState().taskRuns).toEqual([]);
   });
 

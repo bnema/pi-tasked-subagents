@@ -63,7 +63,12 @@ tasked_subagents action=set_tasks tasks=[...] groups=[...]
 tasked_subagents action=patch_task_run taskRunId=<id> groups=[...] tasks=[...]
 tasked_subagents action=inspect taskRunId=<id>
 tasked_subagents action=attach taskRunId=<id>
+tasked_subagents action=clear targetId=<taskRunId|groupId|taskId|assignmentId>
 ```
+
+Background dispatch emits one automatic signal when its TaskRun reaches a terminal state. Operations using `wait=true` return their final report directly and do not queue an additional agent turn.
+
+Targeted `clear` removes one inactive TaskRun. `clear scope=all` cancels active subagents before removing their state.
 
 Use `patch_task_run` when triage or planning discovers additional groups or tasks for the same visible TaskRun. This appends new task ids and new or updated groups without replacing completed tasks or assignment history.
 
