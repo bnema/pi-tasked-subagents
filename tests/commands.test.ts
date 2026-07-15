@@ -145,7 +145,7 @@ describe("commands", () => {
 
   test("help documents TaskRun result, attach targets, and wait mode", () => {
     const help = buildHelpText();
-    expect(help).toContain("/tasked-subagents result <taskRunId|groupId|taskId|assignmentId>");
+    expect(help).toContain("/tasked-subagents result <assignmentId> [archiveId]");
     expect(help).toContain("/tasked-subagents attach [taskRunId|groupId|taskId|assignmentId]");
     expect(help).toContain("wait=true");
     expect(help).not.toContain("alias: wait");

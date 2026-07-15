@@ -30,6 +30,12 @@ export const MAX_ASSIGNMENT_ARCHIVE_BYTES = 256 * 1024;
 export const MAX_RECOVERABLE_TASK_RUNS = 100;
 export const MAX_RECENT_COMPLETED = 20;
 export const MAX_RECENT_ASSIGNMENT_REFS = 1_000;
+/**
+ * Recovery retains one raw JSONL record at a time. 256 MiB accommodates a
+ * v4 state containing the maximum 100 recoverable 2 MiB TaskRuns plus its
+ * bounded checkpoint metadata, while rejecting unbounded legacy records.
+ */
+export const MAX_RECOVERY_RECORD_BYTES = 256 * 1024 * 1024;
 
 // Defaults for launcher / dispatch
 export const DEFAULT_POLL_INTERVAL_MS = 500;

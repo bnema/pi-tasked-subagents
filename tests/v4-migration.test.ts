@@ -160,6 +160,18 @@ describe("v4 bounded migration", () => {
     expect(reloaded).toMatchObject({ restored: true, migrated: false, pointer: migrated.pointer });
   });
 
+  test("rejects Number.MAX_SAFE_INTEGER as an exhausted migration sequence before writing", async () => {
+    const dataRoot = await root();
+    const appended: unknown[] = [];
+    const store = new DurableObjectStore(dataRoot);
+
+    await expect(migrateV4State(state("running"), store, {
+      sessionId: "generic-session", sequence: Number.MAX_SAFE_INTEGER, appendMigratedPointer: (pointer) => appended.push(pointer),
+    })).resolves.toMatchObject({ migrated: false, reason: "limit_exceeded" });
+    expect(appended).toEqual([]);
+    await expect(readdir(join(dataRoot, "objects"))).rejects.toThrow(/ENOENT/);
+  });
+
   test("falls back from malformed v4 scalar, status, and graph-reference candidates and refuses them alone", async () => {
     const corruptions: Array<(candidate: TaskedSubagentsState) => void> = [
       (candidate) => { (candidate.taskRuns[0] as unknown as { title: unknown }).title = 17; },

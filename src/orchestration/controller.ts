@@ -425,13 +425,14 @@ export class TaskedSubagentsController {
       const projectionError = this.preflightCheckpoint(candidate);
       if (projectionError) return { accepted: false, errors: [projectionError], dispatchScheduled: false } satisfies SetTasksResult;
 
-      this.stateEpoch += 1;
+      // Replacing a TaskRun invalidates its prior in-flight work. Appending
+      // an unrelated TaskRun is non-destructive and must not fence it.
+      if (candidateIndex >= 0) this.stateEpoch += 1;
       // The preflight candidate is the complete validated transition, so
       // install it rather than duplicating the live mutation.
       this.state = candidate;
       this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
-      if (input.wait) this.suppressTaskRunSignal(normalized.taskRun.id);
-      await this.checkpointState(checkpointContext);
+      await this.checkpointWithOptionalSignalSuppression(checkpointContext, normalized.taskRun.id, input.wait);
       this.updateUI(ctx ?? this.lastContext);
       return { accepted: true, taskRunId: normalized.taskRun.id, errors: [], dispatchScheduled: true } satisfies SetTasksResult;
     });
@@ -935,11 +936,16 @@ export class TaskedSubagentsController {
     return this.lock.withLock(async () => {
       const before = this.state.taskRuns.length + (this.state.completedHistory?.length ?? 0);
       if (normalizedTargetId) {
-        const taskRunId = this.resolveTaskRunIdForTarget(normalizedTargetId);
+        const taskRunId = this.resolveTaskRunIdForTarget(normalizedTargetId) ?? this.resolveCompletedHistoryTaskRunId(normalizedTargetId);
         const target = taskRunId ? this.state.taskRuns.find((taskRun) => taskRun.id === taskRunId) : undefined;
         const active = target?.assignments.some((assignment) => assignment.status === "queued" || assignment.status === "running");
-        if (target && !active) this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.id !== target.id);
-        this.state.completedHistory = this.state.completedHistory?.filter((summary) => summary.taskRunId !== normalizedTargetId);
+        // A target resolving to active state is protected, including any
+        // colliding completed-history identifier. Otherwise remove the
+        // matching live terminal run and/or compact completed summary.
+        if (!active && taskRunId) {
+          this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.id !== taskRunId);
+          this.state.completedHistory = this.state.completedHistory?.filter((summary) => summary.taskRunId !== taskRunId);
+        }
       } else {
         this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.status !== "completed" && taskRun.status !== "cancelled");
         this.state.completedHistory = [];
@@ -967,6 +973,22 @@ export class TaskedSubagentsController {
     if (!context.sessionId) throw new PersistenceError("Checkpoint context has no active session");
     const result = await this.persistence.checkpoint(cloneState(this.state), context);
     if (!result.committed) throw new PersistenceError(result.error.message);
+  }
+
+  /** Keep wait-mode suppression only after its structural checkpoint succeeds. */
+  private async checkpointWithOptionalSignalSuppression(
+    context: CheckpointContext,
+    taskRunId: string,
+    suppressSignal?: boolean,
+  ): Promise<void> {
+    if (suppressSignal) this.suppressTaskRunSignal(taskRunId);
+    let checkpointed = false;
+    try {
+      await this.checkpointState(context);
+      checkpointed = true;
+    } finally {
+      if (suppressSignal && !checkpointed) this.releaseTaskRunSignal(taskRunId);
+    }
   }
 
   async flushPersistence(ctx?: ExtensionContext): Promise<void> {
@@ -1061,8 +1083,7 @@ export class TaskedSubagentsController {
     if (projectionError) return { patched: false, taskRunId: taskRun.id, errors: [projectionError], dispatchScheduled: false };
     // The validated candidate is the exact state transition to install.
     this.state = candidate;
-    if (input.wait && result.dispatchScheduled) this.suppressTaskRunSignal(taskRun.id);
-    await this.checkpointState(checkpointContext);
+    await this.checkpointWithOptionalSignalSuppression(checkpointContext, taskRun.id, input.wait && result.dispatchScheduled);
     this.updateUI(ctx ?? this.lastContext);
     return { patched: true, taskRunId: taskRun.id, errors: [], dispatchScheduled: result.dispatchScheduled };
   }
@@ -1137,8 +1158,7 @@ export class TaskedSubagentsController {
     taskRun.updatedAt = timestamp;
     deriveTaskRunStatus(taskRun, timestamp);
     this.state.currentTaskRunId = taskRun.id;
-    if (input.wait) this.suppressTaskRunSignal(taskRun.id);
-    await this.checkpointState(checkpointContext);
+    await this.checkpointWithOptionalSignalSuppression(checkpointContext, taskRun.id, input.wait);
     this.updateUI(ctx ?? this.lastContext);
     return { edited: true, taskRunId: taskRun.id, taskId: nextTask.id, errors: [], dispatchScheduled: true };
   }
@@ -1192,8 +1212,7 @@ export class TaskedSubagentsController {
     taskRun.updatedAt = timestamp;
     deriveTaskRunStatus(taskRun, timestamp);
     this.state.currentTaskRunId = taskRun.id;
-    if (input.wait) this.suppressTaskRunSignal(taskRun.id);
-    await this.checkpointState(checkpointContext);
+    await this.checkpointWithOptionalSignalSuppression(checkpointContext, taskRun.id, input.wait);
     this.updateUI(ctx ?? this.lastContext);
     return { edited: true, taskRunId: taskRun.id, groupId: nextGroup.id, errors: [], dispatchScheduled: true };
   }
@@ -1549,6 +1568,16 @@ export class TaskedSubagentsController {
       if (taskRun.groups.some((group) => group.id === targetId)) return taskRun.id;
       if (taskRun.tasks.some((task) => task.id === targetId)) return taskRun.id;
       if (taskRun.assignments.some((assignment) => assignment.id === targetId)) return taskRun.id;
+    }
+    return undefined;
+  }
+
+  private resolveCompletedHistoryTaskRunId(targetId: string): string | undefined {
+    for (const summary of this.state.completedHistory ?? []) {
+      if (summary.taskRunId === targetId) return summary.taskRunId;
+      if (summary.archives.some((archive) => archive.groupId === targetId || archive.taskId === targetId || archive.assignmentId === targetId)) {
+        return summary.taskRunId;
+      }
     }
     return undefined;
   }

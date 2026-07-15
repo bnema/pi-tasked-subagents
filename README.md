@@ -90,7 +90,8 @@ State storage enforces these limits:
 - assignment archive: 256 KiB;
 - recoverable TaskRuns per checkpoint: 100;
 - recent assignment references per checkpoint: 1,000;
-- completed summaries in normal history: 20.
+- completed summaries in normal history: 20;
+- raw JSONL recovery record: 256 MiB (enough for a bounded v4 state with up to 100 recoverable 2 MiB TaskRuns plus checkpoint metadata).
 
 ## Recover an oversized session
 

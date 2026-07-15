@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import * as fs from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+import { MAX_RECOVERY_RECORD_BYTES } from "../defaults.js";
 import { migrateV4State } from "../state/v4-migration.js";
 import { DurableObjectStore } from "../state/object-store.js";
 import { stateFromEntryData } from "../state/persistence.js";
@@ -57,16 +58,26 @@ async function existingOutput(path: string): Promise<boolean> {
 }
 
 /**
- * Yield one JSONL record at a time while retaining its original delimiter. Chunks
- * are accumulated only until their next LF, so no full input prepass or buffer is needed.
+ * Yield one JSONL record at a time while retaining its original delimiter. A
+ * record is capped before retaining a chunk, concatenating buffers, or decoding UTF-8.
  */
-async function* jsonlRecords(source: AsyncIterable<Buffer>): AsyncGenerator<{ line: string; delimiter?: "\n" | "\r\n" }> {
+export async function* jsonlRecords(
+  source: AsyncIterable<Buffer>,
+  maxRecordBytes = MAX_RECOVERY_RECORD_BYTES,
+): AsyncGenerator<{ line: string; delimiter?: "\n" | "\r\n" }> {
+  if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes <= 0) fail("invalid JSONL recovery record limit");
   let pending: Buffer[] = [];
+  let pendingBytes = 0;
+  const checkSize = (bytes: number): void => {
+    if (bytes > maxRecordBytes) fail(`JSONL record exceeds the ${maxRecordBytes} byte recovery limit`);
+  };
 
   for await (const chunk of source) {
     let start = 0;
     let newline = chunk.indexOf(10, start);
     while (newline !== -1) {
+      const rawBytes = pendingBytes + newline - start;
+      checkSize(rawBytes);
       const parts = pending.length === 0 ? [chunk.subarray(start, newline)] : [...pending, chunk.subarray(start, newline)];
       const rawLine = parts.length === 1 ? parts[0]! : Buffer.concat(parts);
       const crlf = rawLine.at(-1) === 13;
@@ -75,13 +86,20 @@ async function* jsonlRecords(source: AsyncIterable<Buffer>): AsyncGenerator<{ li
         delimiter: crlf ? "\r\n" : "\n",
       };
       pending = [];
+      pendingBytes = 0;
       start = newline + 1;
       newline = chunk.indexOf(10, start);
     }
-    if (start < chunk.length) pending.push(chunk.subarray(start));
+    if (start < chunk.length) {
+      const remainder = chunk.subarray(start);
+      checkSize(pendingBytes + remainder.length);
+      pending.push(remainder);
+      pendingBytes += remainder.length;
+    }
   }
 
   if (pending.length > 0) {
+    checkSize(pendingBytes);
     const rawLine = pending.length === 1 ? pending[0]! : Buffer.concat(pending);
     yield { line: rawLine.toString("utf8") };
   }

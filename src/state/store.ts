@@ -3,7 +3,7 @@
 // ──────────────────────────────────────────────
 
 import { STATE_VERSION } from "../defaults.js";
-import { isSessionId } from "./storage-paths.js";
+import { isResultId, isSessionId } from "./storage-paths.js";
 import type {
   ArtifactRef,
   AssignmentStatus,
@@ -219,7 +219,7 @@ function normalizeLaunchRef(raw: unknown, assignmentId: string, assignmentRunId?
   if (input.legacy === true) {
     return { ...common, legacy: true, ...(resultPath ? { resultPath } : {}) };
   }
-  if (asyncDir && sessionId && isSessionId(sessionId) && resultId && resultPath && resultReservationPath) {
+  if (asyncDir && sessionId && isSessionId(sessionId) && resultId && isResultId(resultId) && resultPath && resultReservationPath) {
     return { ...common, sessionId, asyncDir, resultId, resultPath, resultReservationPath };
   }
   // Compatibility is opt-in at the v4 migration boundary. Do not downgrade an

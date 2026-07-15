@@ -1,7 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
-import { dirname } from "node:path";
 
 import {
   MAX_CHECKPOINT_BYTES,
@@ -21,6 +20,7 @@ import {
   type ArchiveRef,
 } from "./durable-projection.js";
 import { sessionStoragePaths } from "./storage-paths.js";
+import { openPinnedDirectory, safeBasename } from "./pinned-directory.mjs";
 
 const DIGEST_ID = /^[a-f0-9]{64}$/;
 
@@ -44,7 +44,9 @@ export interface PersistenceFailure {
 
 export type CheckpointResult =
   | { committed: true; pointer: StatePointerV5; deduplicated: boolean }
-  | { committed: false; error: PersistenceFailure; dirty: true };
+  | { committed: false; error: PersistenceFailure; dirty: true }
+  /** The caller must correct the input; retaining an uncloneable object cannot be retried safely. */
+  | { committed: false; error: PersistenceFailure; dirty: false };
 
 /** Minimal store boundary keeps coordinator tests independent of filesystem implementation details. */
 export interface CheckpointObjectStore {
@@ -83,30 +85,31 @@ export async function rewriteSessionRefs(
   sessionId: string,
   checkpointIds: ReadonlySet<string>,
   onWritten?: () => void,
+  beforeInstall?: () => void | Promise<void>,
 ): Promise<void> {
   if ([...checkpointIds].some((checkpointId) => !DIGEST_ID.test(checkpointId))) throw new Error("Invalid checkpoint digest");
   const paths = sessionStoragePaths(root, sessionId);
   const bytes = canonicalJson({ version: 1, checkpointIds: [...checkpointIds].sort() });
-  await fs.mkdir(dirname(paths.refsPath), { recursive: true, mode: 0o700 });
-  const temporary = `${paths.refsPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  const directory = await openPinnedDirectory(paths.root, paths.sessionDir);
+  const temporaryName = safeBasename(`.refs.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+  const refsName = safeBasename("refs.json");
   let handle: fs.FileHandle | undefined;
   try {
-    handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    handle = await directory.openFile(temporaryName, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     await handle.writeFile(bytes, "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await fs.rename(temporary, paths.refsPath);
-    const directory = await fs.open(dirname(paths.refsPath), constants.O_RDONLY | constants.O_DIRECTORY);
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
+    await beforeInstall?.();
+    // Both paths are resolved through the same live dirfd. A spelling swap of
+    // sessions/<id> after pinning therefore cannot redirect this replacement.
+    await directory.rename(temporaryName, refsName);
+    await directory.sync();
     onWritten?.();
   } finally {
     await handle?.close();
-    await fs.rm(temporary, { force: true });
+    await directory.unlink(temporaryName).catch(() => undefined);
+    await directory.close();
   }
 }
 
@@ -143,7 +146,9 @@ export class PersistenceCoordinator {
     try {
       snapshot = structuredClone(state);
     } catch {
-      return Promise.resolve(this.recordDirty(state, contextSnapshot, this.epoch, failure("projection", "State cannot be safely cloned for durable persistence")));
+      // Do not record an object that cannot itself be cloned: doing so would
+      // either throw again or create a retry loop with the caller's mutable state.
+      return Promise.resolve({ committed: false, dirty: false, error: failure("projection", "State cannot be safely cloned for durable persistence") });
     }
     const contextError = this.activateContext(contextSnapshot);
     if (contextError) return Promise.resolve(this.rejected(contextError));
@@ -156,7 +161,7 @@ export class PersistenceCoordinator {
     if (contextError) return Promise.resolve(this.rejected(contextError));
     const dirty = this.dirty;
     if (!dirty) {
-      if (!this.lastCommitted) return Promise.resolve(this.rejected(failure("projection", "No durable checkpoint is available")));
+      if (!this.lastCommitted) return Promise.resolve(this.rejected(failure("projection", "No durable checkpoint is available"), false));
       if (context.sessionId !== this.sessionId) {
         return Promise.resolve(this.rejected(failure("session_mismatch", "Checkpoint context belongs to a different session")));
       }
@@ -301,8 +306,8 @@ export class PersistenceCoordinator {
     };
   }
 
-  private rejected(error: PersistenceFailure): CheckpointResult {
-    return { committed: false, error, dirty: true };
+  private rejected(error: PersistenceFailure, dirty = true): CheckpointResult {
+    return { committed: false, error, dirty };
   }
 
   private contextError(context: CheckpointContext): PersistenceFailure | undefined {

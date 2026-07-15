@@ -19,7 +19,7 @@ import {
   MAX_ARCHIVE_FOLLOW_UPS,
   MAX_ARCHIVE_SUMMARY_BYTES,
 } from "./durable-projection.js";
-import { sha256Hex, utf8Bytes } from "./canonical-json.js";
+import { canonicalJson, sha256Hex, utf8Bytes } from "./canonical-json.js";
 import type {
   AssignmentArchiveV1,
   CheckpointManifestV1,
@@ -208,23 +208,12 @@ function validateTaskRunGraph(run: TaskRunRecord): boolean {
   try {
     const candidate: TaskedSubagentsState = { version: 4, taskRuns: [run], currentTaskRunId: run.id, updatedAt: run.updatedAt };
     const normalized = ensureState(candidate).taskRuns[0];
-    // The existing state validator establishes scalar/type validity. Its repair
-    // behavior is acceptable only when it did not discard any graph member.
-    if (!normalized || normalized.id !== run.id || normalized.title !== run.title || normalized.request !== run.request ||
-      normalized.context !== run.context || normalized.status !== run.status || normalized.groups.length !== run.groups.length ||
-      normalized.tasks.length !== run.tasks.length || normalized.assignments.length !== run.assignments.length ||
-      normalized.artifacts.length !== run.artifacts.length) return false;
-    if (normalized.groups.some((group, index) => group.id !== run.groups[index]?.id || group.title !== run.groups[index]?.title ||
-      group.status !== run.groups[index]?.status || group.createdAt !== run.groups[index]?.createdAt || group.updatedAt !== run.groups[index]?.updatedAt)) return false;
-    if (normalized.tasks.some((task, index) => task.id !== run.tasks[index]?.id || task.groupId !== run.tasks[index]?.groupId ||
-      task.text !== run.tasks[index]?.text || task.status !== run.tasks[index]?.status || task.criteria.length !== run.tasks[index]?.criteria.length ||
-      task.criteria.some((criterion, criterionIndex) => criterion.id !== run.tasks[index]?.criteria[criterionIndex]?.id ||
-        criterion.text !== run.tasks[index]?.criteria[criterionIndex]?.text || criterion.satisfied !== run.tasks[index]?.criteria[criterionIndex]?.satisfied ||
-        criterion.evidence.length !== run.tasks[index]?.criteria[criterionIndex]?.evidence.length))) return false;
-    if (normalized.assignments.some((assignment, index) => assignment.id !== run.assignments[index]?.id ||
-      assignment.taskRunId !== run.assignments[index]?.taskRunId || assignment.taskId !== run.assignments[index]?.taskId ||
-      assignment.groupId !== run.assignments[index]?.groupId || assignment.agent !== run.assignments[index]?.agent ||
-      assignment.prompt !== run.assignments[index]?.prompt || assignment.status !== run.assignments[index]?.status)) return false;
+    // A durable graph is accepted only when normalizing it is a no-op. Compare
+    // the complete JSON-shaped graph, not a hand-picked scalar subset, because
+    // ensureState can repair nested criteria, dependencies, results, launch
+    // handles, supersession metadata, artifacts, and timestamps.
+    if (!normalized || canonicalJson(JSON.parse(JSON.stringify(run))) !==
+      canonicalJson(JSON.parse(JSON.stringify(normalized)))) return false;
 
     const groupIds = new Set(run.groups.map((group) => group.id));
     const taskIds = new Set(run.tasks.map((task) => task.id));

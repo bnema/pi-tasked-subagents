@@ -648,6 +648,27 @@ describe("task-run state store", () => {
     expect(legacy.taskRuns[0].assignments[0].launchRef).toMatchObject({ legacy: true, resultPath: "/legacy/result.json" });
   });
 
+  test("rejects launch handles whose resultId violates the shared lowercase 32-or-64-hex contract", () => {
+    const restored = ensureState({
+      version: 4,
+      currentTaskRunId: "task-run-1",
+      updatedAt: 1,
+      taskRuns: [{
+        ...taskRun,
+        assignments: [{
+          ...taskRun.assignments[0],
+          launchRef: {
+            runId: "run-1", asyncId: "run-1", sessionId: "session-a", asyncDir: "/runs/session-a/bad",
+            resultId: "A".repeat(32), resultPath: "/results/session-a/bad.json", resultReservationPath: "/results/session-a/bad.json.reservation",
+            assignments: [{ assignmentId: "assignment-1", runId: "run-1" }],
+          },
+        }],
+      }],
+    });
+
+    expect(restored.taskRuns[0].assignments[0].launchRef).toBeUndefined();
+  });
+
   test("restores the newest fully valid v5 checkpoint and falls back only to an earlier complete graph", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
     storageRoots.push(root);
@@ -718,6 +739,24 @@ describe("task-run state store", () => {
 
     const refs = JSON.parse(await readFile(sessionStoragePaths(root, "generic-session").refsPath, "utf8")) as { checkpointIds: string[] };
     expect(refs.checkpointIds).toEqual([activePointer.checkpointId, inactivePointer.checkpointId].sort());
+  });
+
+  test("rejects a task-run graph whenever durable normalization changes a nested launch handle", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
+    storageRoots.push(root);
+    const store = new DurableObjectStore(root);
+    const malformed = structuredClone(currentState);
+    (malformed.taskRuns[0].assignments[0] as unknown as { launchRef: unknown }).launchRef = {
+      runId: "run-1", asyncId: "run-1", sessionId: "generic-session", asyncDir: "/runs/generic-session/bad",
+      resultId: "A".repeat(32), resultPath: "/results/generic-session/bad.json", resultReservationPath: "/results/generic-session/bad.json.reservation",
+      assignments: [{ assignmentId: "assignment-1", runId: "run-1" }],
+    };
+    const pointer = await v5Checkpoint(store, malformed, 1);
+    const entry = { type: "custom" as const, customType: ENTRY_TYPE_STATE, data: pointer };
+
+    await expect(restoreBranchState([entry], store, {
+      sessionId: "generic-session", allEntries: [entry], appendMigratedPointer: () => undefined,
+    })).resolves.toMatchObject({ restored: false, diagnostics: [{ code: "object_invalid" }] });
   });
 
   test("rejects a newest graph with a malformed manifest resultId in favor of its preceding valid pointer", async () => {

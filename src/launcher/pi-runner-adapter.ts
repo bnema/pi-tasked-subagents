@@ -24,6 +24,7 @@ import type {
 } from "../types.js";
 import { getAgentProfile, listAvailableAgentProfiles } from "./agent-profiles.js";
 import { ensureTaskGraphRequest, type LaunchResult, type RunnerRuntimeContext, type RunnerChildConfig, type RunnerConfig } from "./interface.js";
+import { captureProcessIdentity, isProcessIdentityAlive, signalProcessIdentity } from "./process-identity.mjs";
 import { publishTerminalResult, releaseResultReservation, reserveResultReservation } from "./result-files.mjs";
 
 function now(): number {
@@ -86,13 +87,20 @@ interface RunPaths {
   eventsPath: string;
 }
 
+interface ProcessIdentity {
+  pid: number;
+  startTime: string;
+}
+
 interface RunnerStatusFile {
   runId?: string;
   state?: "queued" | "running" | "complete" | "failed" | "paused" | "cancelled" | "skipped";
   pid?: number;
+  pidStartTime?: string;
   steps?: Array<{
     id?: string;
     pid?: number;
+    pidStartTime?: string;
     status?: string;
     agent?: string;
     currentTool?: string;
@@ -183,15 +191,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = typeof error === "object" && error !== null ? (error as { code?: string }).code : undefined;
-    return code === "EPERM";
-  }
-}
 
 export interface PiRunnerAdapterOptions {
   piBin?: string;
@@ -218,7 +217,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   private readonly storageMutationHook: PiRunnerAdapterOptions["storageMutationHook"];
   private readonly procDirectoryPath: PiRunnerAdapterOptions["procDirectoryPath"];
   /** Each launch is keyed by session and immutable identity, never by report-oriented runId. */
-  private readonly trackedLaunches = new Map<string, { launch: LaunchResult; pid?: number }>();
+  private readonly trackedLaunches = new Map<string, { launch: LaunchResult; identity?: ProcessIdentity }>();
 
   constructor(options: PiRunnerAdapterOptions = {}) {
     this.piBin = options.piBin ?? "pi";
@@ -241,43 +240,45 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     if (!cwd) throw new Error("Task graph cwd is required");
     const resultsDir = this.requireResultsDir(sessionId);
     const reservation = await this.reserveResultIdentity(sessionId, request.runId, resultsDir);
-    const paths = this.requireRunPaths(request.runId, sessionId, reservation.resultId);
-    const children = this.buildChildren(request.tasks, cwd, paths.asyncDir);
-    const config: RunnerConfig = {
-      runId: request.runId,
-      sessionId,
-      mode: "task_graph",
-      maxConcurrency: request.maxConcurrency,
-      piBin: this.piBin,
-      storageRoot: this.dataRoot,
-      asyncDir: paths.asyncDir,
-      resultsDir: paths.resultsDir,
-      resultId: reservation.resultId,
-      resultPath: reservation.resultPath,
-      resultReservationPath: reservation.resultReservationPath,
-      statusPath: paths.statusPath,
-      eventsPath: paths.eventsPath,
-      children,
-    };
-    let launch: LaunchResult;
+    let launched = false;
     try {
-      launch = await this.buildAndLaunch(config);
-    } catch (error) {
-      await releaseResultReservation(this.dataRoot, resultsDir, {
-        sessionId,
+      const paths = this.requireRunPaths(request.runId, sessionId, reservation.resultId);
+      const children = this.buildChildren(request.tasks, cwd, paths.asyncDir);
+      const config: RunnerConfig = {
         runId: request.runId,
+        sessionId,
+        mode: "task_graph",
+        maxConcurrency: request.maxConcurrency,
+        piBin: this.piBin,
+        storageRoot: this.dataRoot,
+        asyncDir: paths.asyncDir,
+        resultsDir: paths.resultsDir,
         resultId: reservation.resultId,
-      }, { procDirectoryPath: this.procDirectoryPath }).catch(() => undefined);
-      throw error;
+        resultPath: reservation.resultPath,
+        resultReservationPath: reservation.resultReservationPath,
+        statusPath: paths.statusPath,
+        eventsPath: paths.eventsPath,
+        children,
+      };
+      const launch = await this.buildAndLaunch(config);
+      launched = true;
+      return {
+        ...toRunHandleBase(launch),
+        assignments: request.tasks.map((task) => ({
+          assignmentId: task.assignmentId.trim(),
+          runId: launch.runId,
+          resultPath: launch.resultPath,
+        })),
+      };
+    } finally {
+      if (!launched) {
+        await releaseResultReservation(this.dataRoot, resultsDir, {
+          sessionId,
+          runId: request.runId,
+          resultId: reservation.resultId,
+        }, { procDirectoryPath: this.procDirectoryPath }).catch(() => undefined);
+      }
     }
-    return {
-      ...toRunHandleBase(launch),
-      assignments: request.tasks.map((task) => ({
-        assignmentId: task.assignmentId.trim(),
-        runId: launch.runId,
-        resultPath: launch.resultPath,
-      })),
-    };
   }
 
   async stopRun(handle: SubagentRunHandle, ctx: RunnerRuntimeContext): Promise<boolean> {
@@ -353,13 +354,8 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return false;
     const statusFile = await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath);
-    const pids = new Set<number>();
-    const trackedPid = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId))?.pid;
-    if (trackedPid) pids.add(trackedPid);
-    if (statusFile?.pid) pids.add(statusFile.pid);
-    for (const step of statusFile?.steps ?? []) if (step.pid) pids.add(step.pid);
-    if (pids.size === 0) return false;
-    for (const pid of pids) if (isPidAlive(pid)) return true;
+    const identities = this.processIdentities(handle, statusFile);
+    for (const identity of identities) if (await isProcessIdentityAlive(identity)) return true;
     return false;
   }
 
@@ -483,9 +479,18 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       });
       child.once("error", reject);
       child.once("spawn", () => {
-        this.trackedLaunches.set(this.launchKey(config.sessionId, config.resultId), { launch, pid: child.pid ?? undefined });
-        child.unref();
-        resolve();
+        const key = this.launchKey(config.sessionId, config.resultId);
+        let exited = false;
+        child.once("exit", () => {
+          exited = true;
+          this.trackedLaunches.delete(key);
+        });
+        void (async () => {
+          const identity = child.pid === undefined ? undefined : await captureProcessIdentity(child.pid);
+          if (!exited) this.trackedLaunches.set(key, { launch, identity });
+          child.unref();
+          resolve();
+        })().catch(reject);
       });
     });
     return launch;
@@ -493,6 +498,23 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
 
   private launchKey(sessionId: string, resultId: string): string {
     return `${sessionId}:${resultId}`;
+  }
+
+  /** PID values are useful only with the kernel-issued process start time. */
+  private processIdentities(
+    handle: SubagentRunHandle,
+    statusFile: RunnerStatusFile | undefined,
+    tracked = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId)),
+  ): ProcessIdentity[] {
+    const identities = new Map<string, ProcessIdentity>();
+    const add = (pid: number | undefined, startTime: string | undefined): void => {
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 || typeof startTime !== "string" || !/^\d+$/u.test(startTime)) return;
+      identities.set(`${pid}:${startTime}`, { pid, startTime });
+    };
+    if (!handle.legacy && tracked?.identity) add(tracked.identity.pid, tracked.identity.startTime);
+    add(statusFile?.pid, statusFile?.pidStartTime);
+    for (const step of statusFile?.steps ?? []) add(step.pid, step.pidStartTime);
+    return [...identities.values()];
   }
 
   private resolveRunHandle(handle: SubagentRunHandle): { paths: RunPaths; launch: { resultPath: string } } | undefined {
@@ -536,10 +558,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     const existingStatus = await readJsonFile<RunnerStatusFile>(paths.statusPath);
     const resultPath = launch.resultPath ?? paths.resultPath;
 
-    const pids = new Set<number>();
-    if (tracked?.pid) pids.add(tracked.pid);
-    if (existingStatus?.pid) pids.add(existingStatus.pid);
-    for (const step of existingStatus?.steps ?? []) if (step.pid) pids.add(step.pid);
+    const identities = this.processIdentities(handle, existingStatus, tracked);
 
     const timestamp = now();
     const terminalStatus = {
@@ -564,13 +583,9 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     };
 
     let allSignaled = true;
-    for (const pid of pids) {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch (error) {
-        const code = typeof error === "object" && error !== null ? (error as { code?: string }).code : undefined;
-        if (code !== "ESRCH") allSignaled = false;
-      }
+    for (const identity of identities) {
+      // A missing or stale identity is intentionally treated as no longer ours.
+      if (await isProcessIdentityAlive(identity) && !await signalProcessIdentity(identity)) allSignaled = false;
     }
 
     await writeJsonFile(paths.statusPath, terminalStatus);

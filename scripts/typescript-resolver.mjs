@@ -2,14 +2,25 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
+function localJavaScriptSpecifier(specifier) {
+  return specifier.endsWith(".js") && (
+    specifier.startsWith("./") ||
+    specifier.startsWith("../") ||
+    specifier.startsWith("/") ||
+    specifier.startsWith("file:")
+  );
+}
+
 export async function resolve(specifier, context, nextResolve) {
   try {
     return await nextResolve(specifier, context);
   } catch (error) {
-    if (specifier.endsWith(".js")) {
-      return nextResolve(`${specifier.slice(0, -3)}.ts`, context);
+    if (error?.code !== "ERR_MODULE_NOT_FOUND" || !localJavaScriptSpecifier(specifier)) throw error;
+    try {
+      return await nextResolve(`${specifier.slice(0, -3)}.ts`, context);
+    } catch {
+      throw error;
     }
-    throw error;
   }
 }
 

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +12,21 @@ import {
   parseStructuredStepOutput,
   renderTaskGraphTemplate,
   renderTerminationSignal,
+  terminateTrackedSteps,
 } from "../src/launcher/direct-runner.mjs";
+
+describe("runner process identities", () => {
+  test("does not signal a PID whose stored start identity is missing or stale", async () => {
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100000)"], { stdio: "ignore" });
+    try {
+      await terminateTrackedSteps([{ pid: child.pid }, { pid: child.pid, pidStartTime: "0" }]);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("exit", resolve));
+    }
+  });
+});
 
 describe("immutable terminal result publication", () => {
   async function withResultPaths(testBody: (paths: {

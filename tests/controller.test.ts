@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,6 +54,19 @@ interface TaskRunControllerApi {
   reconcileRestoredRuns(ctx?: unknown): void;
   getState(): TaskedSubagentsState;
 }
+
+const temporaryControllerRoots = new Set<string>();
+
+async function createControllerDataRoot(prefix: string): Promise<string> {
+  const dataRoot = await mkdtemp(join(tmpdir(), prefix));
+  temporaryControllerRoots.add(dataRoot);
+  return dataRoot;
+}
+
+afterEach(async () => {
+  await Promise.all([...temporaryControllerRoots].map((dataRoot) => rm(dataRoot, { recursive: true, force: true })));
+  temporaryControllerRoots.clear();
+});
 
 function fakePi(): ExtensionAPI {
   return {
@@ -652,6 +665,10 @@ function liveRunIds(controller: TaskRunControllerApi): Map<string, number> {
   return (controller as unknown as { liveRunIds: Map<string, number> }).liveRunIds;
 }
 
+function signalSuppressionCounts(controller: TaskRunControllerApi): Map<string, number> {
+  return (controller as unknown as { signalSuppressionCounts: Map<string, number> }).signalSuppressionCounts;
+}
+
 function controllerWith(runtime: SubagentRuntime = new CompletingRuntime()): { controller: TaskRunControllerApi; runtime: SubagentRuntime } {
   const controller = new TaskedSubagentsController(fakePi(), { launcher: runtime });
   return { controller: asTaskRunApi(controller), runtime };
@@ -683,6 +700,18 @@ class RecordingPersistence {
 
   async flush(): Promise<void> {}
   invalidate(): void {}
+}
+
+class ToggleFailingPersistence extends RecordingPersistence {
+  fail = false;
+
+  override async checkpoint(state: TaskedSubagentsState, context: CheckpointContext): Promise<CheckpointResult> {
+    if (this.fail) {
+      this.snapshots.push(structuredClone(state));
+      return { committed: false, dirty: true, error: { code: "pointer_append", message: "durability unavailable" } };
+    }
+    return super.checkpoint(state, context);
+  }
 }
 
 class ContextRecordingPersistence extends RecordingPersistence {
@@ -820,6 +849,42 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     });
   });
 
+  test("creating an unrelated TaskRun does not fence an active dispatch outcome", async () => {
+    const runtime = new MultiWaitControlledRuntime();
+    const { controller } = controllerWith(runtime);
+    controller.restoreState({
+      version: 4,
+      currentTaskRunId: "task-run-active",
+      updatedAt: 1,
+      taskRuns: [{
+        id: "task-run-active",
+        title: "Active run",
+        request: "Complete active work",
+        context: "Context",
+        status: "pending",
+        groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 }],
+        tasks: [{ id: "active-task", groupId: "main", text: "Complete active work", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 }],
+        assignments: [],
+        artifacts: [],
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    });
+
+    const activeDispatch = controller.dispatchReady({ taskRunId: "task-run-active" });
+    await vi.waitFor(() => expect(runtime.waitResolvers).toHaveLength(1));
+    const { taskRunId: _taskRunId, ...newTaskRun } = baseSetTasks;
+    await expect(controller.setTasks({ ...newTaskRun, title: "Unrelated run", tasks: [{ id: "new-task", group: "main", text: "Do unrelated work", criteria: ["Done"] }] })).resolves.toMatchObject({ accepted: true });
+    await vi.waitFor(() => expect(runtime.waitResolvers).toHaveLength(2));
+
+    runtime.resolveWait(0);
+    await activeDispatch;
+
+    expect(controller.getState().taskRuns.find((taskRun) => taskRun.id === "task-run-active")?.assignments[0]?.status).toBe("completed");
+    runtime.resolveWait(1);
+    await controller.awaitLastWork();
+  });
+
   test("setTasks creates a TaskRun and dispatches assignments with taskRunId prompts", async () => {
     const runtime = new CompletingRuntime();
     const { controller } = controllerWith(runtime);
@@ -839,7 +904,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
   });
 
   test("stores and links terminal assignment archives before checkpointing", async () => {
-    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-archive-"));
+    const dataRoot = await createControllerDataRoot("tasked-archive-");
     const runtime = new DurableResultRuntime();
     await mkdir(join(dataRoot, "results", "pi-tasked-subagents"), { recursive: true });
     await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${runtime.resultId}.json`), "authoritative output");
@@ -854,7 +919,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
   });
 
   test("flush retries a failed terminal archive checkpoint with its original branch-local result reference", async () => {
-    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-dirty-terminal-"));
+    const dataRoot = await createControllerDataRoot("tasked-dirty-terminal-");
     const sessionId = "pi-tasked-subagents";
     const assignmentId = "assignment-001";
     const selectedResultId = "a".repeat(32);
@@ -933,7 +998,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
   });
 
   test("loads only the selected immutable result and never silently chooses an ambiguous archive", async () => {
-    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-result-"));
+    const dataRoot = await createControllerDataRoot("tasked-result-");
     const store = new DurableObjectStore(dataRoot);
     const assignmentId = "old-assignment";
     const createArchive = async (runId: string, resultId: string) => {
@@ -980,7 +1045,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
   });
 
   test("restore fencing preserves selected archive result lookup when tree restore later fails", async () => {
-    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-result-"));
+    const dataRoot = await createControllerDataRoot("tasked-result-");
     const store = new DurableObjectStore(dataRoot);
     const assignmentId = "archived-assignment";
     const resultId = "c".repeat(32);
@@ -1881,6 +1946,25 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(runtime.requests[0].tasks[0]).toMatchObject({ taskRunId: taskRun.id, taskId: "task" });
   });
 
+  test("checkpoint failures release wait signal suppression for every mutation scope", async () => {
+    const persistence = new ToggleFailingPersistence();
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { persistence, runtime: new CompletingRuntime() }));
+
+    persistence.fail = true;
+    await expect(controller.setTasks({ ...baseSetTasks, wait: true })).rejects.toThrow("durability unavailable");
+    expect(signalSuppressionCounts(controller)).toEqual(new Map());
+
+    persistence.fail = false;
+    await controller.setTasks({ ...baseSetTasks, wait: true });
+    persistence.fail = true;
+    await expect(controller.patchTaskRun({ taskRunId: "task-run-1", tasks: [{ id: "next", group: "main", text: "Next", criteria: ["Done"] }], wait: true })).rejects.toThrow("durability unavailable");
+    expect(signalSuppressionCounts(controller)).toEqual(new Map());
+    await expect(controller.editTask({ taskRunId: "task-run-1", targetId: "task", task: { text: "Retry", criteria: ["Done"] }, wait: true })).rejects.toThrow("durability unavailable");
+    expect(signalSuppressionCounts(controller)).toEqual(new Map());
+    await expect(controller.editGroup({ taskRunId: "task-run-1", targetId: "main", group: { title: "Retry group" }, wait: true })).rejects.toThrow("durability unavailable");
+    expect(signalSuppressionCounts(controller)).toEqual(new Map());
+  });
+
   test("clear removes completed task runs", async () => {
     const { controller } = controllerWith(new CompletingRuntime());
     await controller.setTasks(baseSetTasks);
@@ -1889,6 +1973,27 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     await expect(controller.clear()).resolves.toBe(1);
 
     expect(controller.getState().taskRuns).toEqual([]);
+  });
+
+  test("targeted clear resolves completed archive group, task, and assignment ids without clearing active runs", async () => {
+    const { controller } = controllerWith(new CompletingRuntime());
+    const active = recoverableState("running");
+    active.completedHistory = [{
+      taskRunId: "completed-run", title: "Completed", status: "completed", createdAt: 1, updatedAt: 2, completedAt: 2,
+      groupCount: 1, taskCount: 1, assignmentCount: 1, assignmentArchiveIds: ["a".repeat(64)],
+      archives: [{ archiveId: "a".repeat(64), assignmentId: "archived-assignment", taskRunId: "completed-run", groupId: "archived-group", taskId: "archived-task", status: "completed", runId: "archived-run", resultId: "b".repeat(32), completedAt: 2, summary: "Done", criteriaEvidence: [], artifacts: [], followUps: [] }],
+    }];
+    controller.restoreState(active);
+
+    for (const targetId of ["archived-group", "archived-task", "archived-assignment"]) {
+      controller.restoreState(active);
+      await expect(controller.clear("completed", targetId)).resolves.toBe(1);
+      expect(controller.getState().taskRuns).toHaveLength(1);
+      expect(controller.getState().completedHistory).toEqual([]);
+    }
+
+    await expect(controller.clear("completed", "a1")).resolves.toBe(0);
+    expect(controller.getState().taskRuns).toHaveLength(1);
   });
 
   test("targeted clear removes only the requested inactive TaskRun", async () => {
@@ -2335,7 +2440,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
   });
 
   test("restored lifecycle retains dependency and attention context for attach, status, inspect, results, and controls", async () => {
-    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-restored-lifecycle-"));
+    const dataRoot = await createControllerDataRoot("tasked-restored-lifecycle-");
     try {
       const assignmentId = "archived-assignment";
       const resultId = "d".repeat(32);

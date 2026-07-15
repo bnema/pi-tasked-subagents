@@ -52,8 +52,19 @@ export class PinnedDirectory {
   async openFile(name, flags, mode) {
     await this.assert();
     const handle = await fs.open(this.path(name), flags, mode);
+    try {
+      await this.assert();
+      return handle;
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
+  }
+
+  async rename(name, destinationName) {
     await this.assert();
-    return handle;
+    await fs.rename(this.path(name), this.path(destinationName));
+    await this.assert();
   }
 
   async link(name, destination, destinationName) {

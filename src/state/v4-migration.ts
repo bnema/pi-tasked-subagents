@@ -332,6 +332,12 @@ export async function migrateV4State(
   store: DurableObjectStore,
   context: V4MigrationContext,
 ): Promise<V4MigrationResult> {
+  const sequence = context.sequence ?? 1;
+  // A migration must reserve a strictly newer sequence. MAX_SAFE_INTEGER
+  // cannot be advanced without losing integer precision on the next write.
+  if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence >= Number.MAX_SAFE_INTEGER) {
+    return { migrated: false, reason: "limit_exceeded", message: "Checkpoint sequence space is exhausted" };
+  }
   const state = structuredClone(input);
   const now = context.now ?? Date.now();
   for (const run of state.taskRuns) {
@@ -366,7 +372,7 @@ export async function migrateV4State(
     }
     const manifest = buildCheckpointManifest({
       sessionId: context.sessionId,
-      sequence: context.sequence ?? 1,
+      sequence,
       recoverableRuns,
       projection: {
         currentTaskRunId: projected.value.currentTaskRunId,
@@ -381,7 +387,7 @@ export async function migrateV4State(
       version: 5,
       checkpointId,
       ...(state.currentTaskRunId === undefined ? {} : { currentTaskRunId: state.currentTaskRunId }),
-      sequence: context.sequence ?? 1,
+      sequence,
       writtenAt: now,
     };
     if (utf8Bytes(pointer) > MAX_POINTER_BYTES) {
@@ -576,19 +582,25 @@ export async function migrateNewestV4State(
   store: DurableObjectStore,
   context: V4MigrationContext,
 ): Promise<V4MigrationResult> {
-  const sequence = entries.reduce((highest, entry) => {
-    if (entry.type !== "custom" || entry.customType !== "pi-tasked-subagents:state") return highest;
+  let sequence = 1;
+  let sequenceExhausted = false;
+  for (const entry of entries) {
+    if (entry.type !== "custom" || entry.customType !== "pi-tasked-subagents:state") continue;
     try {
       const data = typeof entry.data === "string" ? JSON.parse(entry.data) : entry.data;
       const candidate = data as { version?: unknown; sequence?: unknown } | undefined;
-      return candidate?.version === 5 && typeof candidate.sequence === "number" &&
-        Number.isSafeInteger(candidate.sequence) && candidate.sequence >= 0
-        ? Math.max(highest, candidate.sequence + 1)
-        : highest;
+      if (candidate?.version === 5 && typeof candidate.sequence === "number" &&
+        Number.isSafeInteger(candidate.sequence) && candidate.sequence >= 0) {
+        if (candidate.sequence >= Number.MAX_SAFE_INTEGER) sequenceExhausted = true;
+        else sequence = Math.max(sequence, candidate.sequence + 1);
+      }
     } catch {
-      return highest;
+      // Malformed pointer-like records do not affect migration sequence.
     }
-  }, 1);
+  }
+  if (sequenceExhausted) {
+    return { migrated: false, reason: "limit_exceeded", message: "Checkpoint sequence space is exhausted" };
+  }
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const raw = rawV4(entries[index]);
     if (!raw) continue;

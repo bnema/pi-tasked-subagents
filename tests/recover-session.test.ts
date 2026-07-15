@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, test } from "vitest";
 
-import { recoverSession } from "../src/recovery/recover-session.js";
+import { jsonlRecords, recoverSession } from "../src/recovery/recover-session.js";
 import { syntheticState } from "./persistence-fixtures.js";
 
 const execFileAsync = promisify(execFile);
@@ -149,10 +149,32 @@ describe("offline session recovery", () => {
     const directory = await root();
     const input = join(directory, "generic-session.jsonl");
     await writeFile(input, `${JSON.stringify({ type: "session", id: 5 })}\n`);
+    const malformedOutput = join(directory, "malformed-header.jsonl");
+    await expect(recoverSession({ input, output: malformedOutput, dataRoot: join(directory, "data") })).rejects.toThrow("invalid session header");
+    await expect(stat(malformedOutput)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(recoverSession({ input, output: input, dataRoot: join(directory, "data") })).rejects.toThrow("input and output must differ");
     const output = join(directory, "existing.jsonl");
     await writeFile(output, "existing");
     await expect(recoverSession({ input, output, dataRoot: join(directory, "data") })).rejects.toThrow("output already exists");
+  });
+});
+
+describe("JSONL record bounds", () => {
+  async function collectRecords(chunks: readonly Buffer[], maxRecordBytes: number): Promise<void> {
+    async function* source(): AsyncGenerator<Buffer> {
+      yield* chunks;
+    }
+    for await (const _record of jsonlRecords(source(), maxRecordBytes)) {
+      // Consume records so generator errors are surfaced.
+    }
+  }
+
+  test("rejects oversized newline-terminated records spanning chunks before concatenating or decoding", async () => {
+    await expect(collectRecords([Buffer.from("1234"), Buffer.from("56789\n")], 8)).rejects.toThrow("JSONL record exceeds the 8 byte recovery limit");
+  });
+
+  test("rejects oversized final unterminated records spanning chunks before concatenating or decoding", async () => {
+    await expect(collectRecords([Buffer.from("1234"), Buffer.from("56789")], 8)).rejects.toThrow("JSONL record exceeds the 8 byte recovery limit");
   });
 });
 

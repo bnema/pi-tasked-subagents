@@ -13,6 +13,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { captureProcessIdentity, signalProcessIdentity } from "./process-identity.mjs";
 import { publishTerminalResult } from "./result-files.mjs";
 
 // ── Helpers ────────────────────────────────────
@@ -216,12 +217,13 @@ export async function runTaskGraphStepWithRetries({ maxAttempts, executeAttempt,
 
 // ── Status management ─────────────────────────
 
-function createInitialStatus(config) {
+function createInitialStatus(config, processIdentity) {
   const startedAt = now();
   return {
     runId: config.runId,
     mode: config.mode,
     pid: process.pid,
+    pidStartTime: processIdentity?.startTime,
     state: "queued",
     startedAt,
     lastUpdate: startedAt,
@@ -383,6 +385,7 @@ async function runChild(config, statusPath, status, child, index, promptOverride
   });
 
   step.pid = childProcess.pid;
+  step.pidStartTime = childProcess.pid === undefined ? undefined : (await captureProcessIdentity(childProcess.pid))?.startTime;
   await updateStatus(statusPath, status);
 
   let stdoutBuffer = "";
@@ -527,6 +530,15 @@ function buildResultSummary(results, maxChildLength = 200) {
 
 function isPreservedStepStatus(status) {
   return status === "completed" || status === "failed" || status === "skipped";
+}
+
+/** A persisted PID is never a termination authority without its start identity. */
+export async function terminateTrackedSteps(steps = []) {
+  for (const step of steps) {
+    if (step?.pid && step.pidStartTime) {
+      await signalProcessIdentity({ pid: step.pid, startTime: step.pidStartTime });
+    }
+  }
 }
 
 export function renderTerminationSignal(existingStatus = {}, existingResult = {}, timestamp = now()) {
@@ -782,7 +794,7 @@ async function run(config) {
   await ensureDir(config.asyncDir);
   for (const child of config.children) await ensureDir(child.sessionDir);
 
-  const status = createInitialStatus(config);
+  const status = createInitialStatus(config, await captureProcessIdentity(process.pid));
   await writeJson(config.statusPath, status);
 
   const results = await runTaskGraph(config, status);
@@ -809,11 +821,7 @@ if (isMain) {
         const resultPath = config.resultPath;
         const existingStatus = JSON.parse(await fs.readFile(statusPath, "utf8").catch(() => "{}"));
 
-        for (const step of existingStatus.steps ?? []) {
-          if (step.pid) {
-            try { process.kill(step.pid, "SIGTERM"); } catch { /* ignore */ }
-          }
-        }
+        await terminateTrackedSteps(existingStatus.steps);
 
         const existingResult = JSON.parse(await fs.readFile(resultPath, "utf8").catch(() => "{}"));
         const signal = renderTerminationSignal(existingStatus, existingResult, timestamp);
@@ -838,6 +846,7 @@ if (isMain) {
         runId: config.runId,
         mode: config.mode,
         pid: process.pid,
+        pidStartTime: (await captureProcessIdentity(process.pid))?.startTime,
         state: "failed",
         startedAt: timestamp,
         lastUpdate: timestamp,

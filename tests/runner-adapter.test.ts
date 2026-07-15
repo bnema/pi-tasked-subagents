@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 
 import { ensureTaskGraphRequest } from "../src/launcher/interface.js";
+import { readProcessStartTime } from "../src/launcher/process-identity.mjs";
 import { PiRunnerAdapter } from "../src/launcher/pi-runner-adapter.js";
 import type { SubagentRunHandle } from "../src/types.js";
 
@@ -161,6 +162,38 @@ describe("PiRunnerAdapter task graph boundary", () => {
 
       await expect(adapter.launchTaskGraph(request, { cwd: process.cwd(), sessionId: "../escape", pi: {} as never })).rejects.toThrow("Unsafe session ID");
       await expect(adapter.launchTaskGraph(request, { cwd: process.cwd(), sessionId: "session-a", pi: {} as never })).resolves.toMatchObject({ resultId: winner });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["requireRunPaths", "buildChildren"] as const)("releases the durable reservation when post-reservation %s fails", async (method) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    const resultId = "0123456789abcdef0123456789abcdef";
+    try {
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root, resultIdFactory: () => resultId });
+      const internals = adapter as unknown as Record<string, () => unknown>;
+      internals[method] = () => { throw new Error(`forced ${method} failure`); };
+      await expect(adapter.launchTaskGraph({
+        runId: "run-reservation-release", title: "Run", taskSummary: "Run",
+        tasks: [{ assignmentId: "a1", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
+      }, { cwd: process.cwd(), sessionId: "test", pi: {} as never })).rejects.toThrow(`forced ${method} failure`);
+      await expect(readFile(path.join(root, "results", "test", `${resultId}.json.reservation`), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removes a tracked adapter launch when its runner child exits", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    try {
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
+      await adapter.launchTaskGraph({
+        runId: "run-cleanup", title: "Run", taskSummary: "Run",
+        tasks: [{ assignmentId: "a1", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
+      }, { cwd: process.cwd(), sessionId: "test", pi: {} as never });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect((adapter as unknown as { trackedLaunches: Map<string, unknown> }).trackedLaunches.size).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -626,7 +659,36 @@ describe("PiRunnerAdapter task graph boundary", () => {
     }
   });
 
-  test("isRunAlive reflects recorded pid liveness", async () => {
+  test("never signals a restored PID entry without its matching start identity", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100000)"], { stdio: "ignore" });
+    try {
+      const resultId = "0123456789abcdef0123456789abcdef";
+      const asyncDir = path.join(root, "runs", "test", resultId);
+      const resultPath = path.join(root, "results", "test", `${resultId}.json`);
+      await mkdir(asyncDir, { recursive: true });
+      await mkdir(path.dirname(resultPath), { recursive: true });
+      await writeFile(`${resultPath}.reservation`, JSON.stringify({ sessionId: "test", runId: "run-stale-pid", resultId }), "utf8");
+      await writeFile(path.join(asyncDir, "status.json"), JSON.stringify({
+        runId: "run-stale-pid", state: "running", pid: child.pid, pidStartTime: "0",
+        steps: [{ id: "a1", status: "running", pid: child.pid }],
+      }), "utf8");
+      const handle: SubagentRunHandle = {
+        runId: "run-stale-pid", asyncId: "run-stale-pid", sessionId: "test", asyncDir, resultId,
+        resultPath, resultReservationPath: `${resultPath}.reservation`, assignments: [],
+      };
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
+      await expect(adapter.isRunAlive(handle)).resolves.toBe(false);
+      await expect(adapter.stopRun(handle, { cwd: process.cwd(), sessionId: "test", pi: {} as never })).resolves.toBe(true);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("exit", resolve));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("requires a matching PID start identity for recorded process liveness", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
     try {
       const asyncRoot = path.join(root, "async");
@@ -651,10 +713,15 @@ describe("PiRunnerAdapter task graph boundary", () => {
         assignments: [],
       };
 
+      const startTime = await readProcessStartTime(process.pid);
+      expect(startTime).toMatch(/^\d+$/u);
       await writeFile(statusPath, JSON.stringify({ runId: "run-alive", state: "running", steps: [{ id: "a1", status: "running", pid: process.pid }] }), "utf8");
+      await expect(adapter.isRunAlive(handle)).resolves.toBe(false);
+
+      await writeFile(statusPath, JSON.stringify({ runId: "run-alive", state: "running", steps: [{ id: "a1", status: "running", pid: process.pid, pidStartTime: startTime }] }), "utf8");
       await expect(adapter.isRunAlive(handle)).resolves.toBe(true);
 
-      await writeFile(statusPath, JSON.stringify({ runId: "run-alive", state: "running", pid: deadPid, steps: [{ id: "a1", status: "running", pid: deadPid }] }), "utf8");
+      await writeFile(statusPath, JSON.stringify({ runId: "run-alive", state: "running", pid: deadPid, pidStartTime: "0", steps: [{ id: "a1", status: "running", pid: deadPid, pidStartTime: "0" }] }), "utf8");
       await expect(adapter.isRunAlive(handle)).resolves.toBe(false);
 
       await rm(statusPath);

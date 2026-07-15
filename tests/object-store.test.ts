@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, constants, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -19,6 +19,7 @@ import {
 import { canonicalJson, canonicalJsonBounded, sha256Hex, utf8Bytes } from "../src/state/canonical-json.js";
 import type { AssignmentArchiveV1 } from "../src/state/durable-types.js";
 import { DurableObjectStore } from "../src/state/object-store.js";
+import { PinnedDirectory } from "../src/state/pinned-directory.mjs";
 import { rewriteSessionRefs } from "../src/state/persistence-coordinator.js";
 import {
   assignmentArchiveDir,
@@ -31,12 +32,21 @@ import {
 
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalHome = process.env.HOME;
+const temporaryRoots = new Set<string>();
+
+function temporaryRoot(prefix: string): string {
+  const root = mkdtempSync(prefix);
+  temporaryRoots.add(root);
+  return root;
+}
 
 afterEach(() => {
   if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
   else process.env.XDG_DATA_HOME = originalXdgDataHome;
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  for (const root of temporaryRoots) rmSync(root, { recursive: true, force: true });
+  temporaryRoots.clear();
 });
 
 function expectContained(root: string, target: string): void {
@@ -76,7 +86,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("contains session and result paths and hashes assignment IDs instead of inserting them", () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-paths-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-paths-"));
     const paths = sessionStoragePaths(root, "session-123");
     const resultId = "0123456789abcdef0123456789abcdef";
     const archiveId = "a".repeat(64);
@@ -91,17 +101,38 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("fails closed for traversal, unsafe IDs, and symlinked path components", () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-paths-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-paths-"));
     const paths = sessionStoragePaths(root, "session-123");
 
     expect(() => sessionStoragePaths(root, "../escape")).toThrow(/unsafe/i);
     expect(() => resultFilePath(paths, "../escape")).toThrow(/unsafe/i);
     expect(() => assignmentArchiveLinkPath(paths, "assignment", "../escape")).toThrow(/unsafe/i);
 
-    const outside = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-outside-"));
+    const outside = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-outside-"));
     mkdirSync(join(paths.root, "results"), { recursive: true });
     symlinkSync(outside, paths.resultsDir);
     expect(() => resultFilePath(paths, "0123456789abcdef0123456789abcdef")).toThrow(/symlink|contain/i);
+  });
+
+  test("closes an acquired child handle when its post-open pin assertion fails", async () => {
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-pinned-"));
+    writeFileSync(join(root, "child"), "x");
+    const parent = await fs.open(root, constants.O_RDONLY | constants.O_DIRECTORY);
+    const identity = await parent.stat();
+    const stat = vi.spyOn(parent, "stat")
+      .mockResolvedValueOnce(identity)
+      .mockResolvedValueOnce({ ...identity, isDirectory: () => false });
+    const directory = new PinnedDirectory(parent, { dev: identity.dev, ino: identity.ino }, root);
+    const descriptorsBefore = readdirSync("/proc/self/fd").length;
+
+    try {
+      await expect(directory.openFile("child", constants.O_RDONLY)).rejects.toThrow(/identity/i);
+      // The failed post-open assertion must not leave the just-acquired fd live.
+      expect(readdirSync("/proc/self/fd")).toHaveLength(descriptorsBefore);
+    } finally {
+      stat.mockRestore();
+      await parent.close();
+    }
   });
 
   test("canonicalizes JSON and SHA-256 deterministically", () => {
@@ -117,7 +148,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("creates and normalizes every durable-store directory as private 0700", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     chmodSync(root, 0o755);
     mkdirSync(join(root, "objects"), { recursive: true, mode: 0o755 });
     chmodSync(join(root, "objects"), 0o755);
@@ -141,7 +172,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("writes canonical immutable objects locally, deduplicates them, and rejects oversized payloads", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root);
     const first = await store.put("checkpoint", { z: 1, a: "value" }, 1_024);
     const second = await store.put("checkpoint", { a: "value", z: 1 }, 1_024);
@@ -169,7 +200,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("rejects an oversized regular object from fstat before allocating a read buffer", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root);
     const maxBytes = 1_024;
     const bytes = "x".repeat(maxBytes + 1);
@@ -191,7 +222,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("never overwrites a corrupt immutable destination and verifies digests and kinds on read", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root);
     const payload = { value: "immutable" };
     const id = sha256Hex(canonicalJson({ storeVersion: 1, kind: "checkpoint", payload }));
@@ -205,7 +236,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("rejects a self-consistently hashed non-canonical object envelope", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root);
     const bytes = '{"kind":"checkpoint","payload":{"z":1,"a":2},"storeVersion":1}';
     const id = sha256Hex(bytes);
@@ -217,10 +248,10 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("rejects intermediate symlink substitution at the archive I/O boundary", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const sessionId = "session-123";
     const assignmentId = "assignment-1";
-    const outside = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-outside-"));
+    const outside = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-outside-"));
     const store = new DurableObjectStore(root, {
       beforePathOperation: async (operation) => {
         if (operation !== "link-assignment-archive") return;
@@ -239,7 +270,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("hard-links verified assignment archives and verifies hash, kind, byte bound, and original assignment identity on lookup", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root);
     const sessionId = "session-123";
     const assignmentId = "assignment/original-id";
@@ -275,8 +306,8 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("installs immutable objects through the pinned original directory after a final-validation swap", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
-    const outside = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-outside-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const outside = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-outside-"));
     let swapped = false;
     const store = new DurableObjectStore(root, {
       beforePathOperation: (operation) => {
@@ -295,8 +326,8 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("pins both archive-link directories after final validation so swaps cannot write outside root", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
-    const outside = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-outside-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const outside = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-outside-"));
     const sessionId = "session-123";
     const assignmentId = "assignment-1";
     let swapped = false;
@@ -319,7 +350,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("fails closed before mutation when procfs dirfd paths are unavailable", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root, {
       procDirectoryPath: () => join(root, "unavailable-dirfd"),
     });
@@ -328,8 +359,23 @@ describe("bounded durable storage primitives", () => {
     expect(readdirSync(join(root, "objects"))).toEqual([]);
   });
 
+  test("installs refs through the pinned session directory when its spelling is swapped", async () => {
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-refs-"));
+    const outside = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-outside-"));
+    const paths = sessionStoragePaths(root, "session-race");
+    const checkpointId = "a".repeat(64);
+
+    await rewriteSessionRefs(root, "session-race", new Set([checkpointId]), undefined, () => {
+      renameSync(paths.sessionDir, `${paths.sessionDir}-real`);
+      symlinkSync(outside, paths.sessionDir);
+    });
+
+    expect(readdirSync(outside)).toEqual([]);
+    expect(JSON.parse(readFileSync(`${paths.sessionDir}-real/refs.json`, "utf8"))).toEqual({ version: 1, checkpointIds: [checkpointId] });
+  });
+
   test("preserves every branch-pinned object and immutable result until its ref is explicitly cleared", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root);
     const branchOne = await store.put("checkpoint", { branch: "one" }, 1_024);
     const branchTwo = await store.put("checkpoint", { branch: "two" }, 1_024);
@@ -363,7 +409,7 @@ describe("bounded durable storage primitives", () => {
   });
 
   test("quarantines corrupt objects and only cleans unreferenced objects older than 24 hours without following links", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
     const store = new DurableObjectStore(root);
     const retained = await store.put("checkpoint", { retained: true }, 1_024);
     const orphan = await store.put("checkpoint", { orphan: true }, 1_024);
