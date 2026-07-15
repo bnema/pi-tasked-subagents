@@ -42,13 +42,14 @@ export default defineConfig(
     rules: {},
   },
   {
-    files: ["src/**/*.mjs"],
+    files: ["src/**/*.mjs", "scripts/**/*.mjs"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
       globals: {
         console: "readonly",
         process: "readonly",
+        URL: "readonly",
       },
     },
   },

@@ -202,3 +202,8 @@ export function buildStateEntryData(state: TaskedSubagentsState): object {
     updatedAt: state.updatedAt,
   };
 }
+
+// Keep the state persistence surface as the compatibility entrypoint while
+// v4 callers migrate to the asynchronous, all-or-nothing v5 restore path.
+export { restoreBranchState } from "./restore.js";
+export type { RestoreContext, RestoreDiagnostic, RestoreResult } from "./restore.js";

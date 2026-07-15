@@ -4,7 +4,6 @@
 
 import { authoritativeAssignment, isSupersededAssignment } from "./assignment-attempts.js";
 import {
-  ASSIGNMENT_STATUSES,
   type AssignmentStatus,
   type LaunchTaskEntry,
   type RunProgressSnapshot,
@@ -55,10 +54,6 @@ function taskComplete(task: TaskRecord, assignment: TaskAssignmentRecord | undef
 
 function isBlockingStatus(status: string): boolean {
   return status === "failed" || status === "attention" || status === "cancelled" || status === "blocked";
-}
-
-function isAssignmentStatus(status: string | undefined): status is AssignmentStatus {
-  return typeof status === "string" && (ASSIGNMENT_STATUSES as readonly string[]).includes(status);
 }
 
 function isActiveAssignmentStatus(status: AssignmentStatus): boolean {
@@ -412,21 +407,20 @@ export function toLaunchTaskEntries(assignments: TaskAssignmentRecord[], taskRun
   });
 }
 
-export function applyAssignmentProgress(taskRun: TaskRunRecord, snapshot: RunProgressSnapshot, timestamp = Date.now()): boolean {
+export function applyAssignmentProgress(taskRun: TaskRunRecord, snapshot: RunProgressSnapshot, _timestamp = Date.now()): boolean {
   let changed = false;
   for (const step of snapshot.steps) {
     if (!step.id) continue;
     const assignment = taskRun.assignments.find((candidate) => candidate.id === step.id);
     if (!assignment || isSupersededAssignment(assignment)) continue;
     if (assignment.runId !== snapshot.runId) continue;
-    if (isAssignmentStatus(step.status)) assignment.status = step.status;
+    // Progress snapshots are not terminal authority; the result reducer and
+    // explicit controls alone change durable assignment status.
     assignment.currentTool = step.currentTool;
     assignment.lastActionAt = step.lastActionAt ?? assignment.lastActionAt;
     assignment.lastActionSummary = step.lastActionSummary ?? assignment.lastActionSummary;
     assignment.recentActivity = step.recentActivity?.slice(-3) ?? assignment.recentActivity;
-    assignment.updatedAt = timestamp;
     changed = true;
   }
-  if (changed) deriveTaskRunStatus(taskRun, timestamp);
   return changed;
 }

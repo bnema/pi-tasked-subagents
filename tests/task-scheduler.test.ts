@@ -417,21 +417,25 @@ describe("task scheduler", () => {
     });
   });
 
-  test.each(["queued", "running", "completed", "failed", "skipped", "cancelled"] as const)("applies %s assignment progress", (status) => {
+  test("keeps progress display-only without changing durable assignment or task-run state", () => {
     const taskRun = makeTaskRun();
     const assignment = createReadyAssignments(taskRun, { defaultAgent: "delegate", defaultCwd: "/repo", now: 2 }).assignments[0];
-    assignment.status = "queued";
+    assignment.status = "completed";
     assignment.runId = "run-1";
+    task(taskRun, "one").status = "attention";
+    taskRun.status = "attention";
+    const durableUpdatedAt = assignment.updatedAt;
 
     const changed = applyAssignmentProgress(taskRun, {
       runId: "run-1",
       status: "running",
-      steps: [{ id: assignment.id, status }],
+      steps: [{ id: assignment.id, status: "failed", currentTool: "bash" }],
     }, 3);
 
     expect(changed).toBe(true);
-    expect(assignment.status).toBe(status);
-    expect(assignment.updatedAt).toBe(3);
+    expect(assignment).toMatchObject({ status: "completed", updatedAt: durableUpdatedAt, currentTool: "bash" });
+    expect(task(taskRun, "one").status).toBe("attention");
+    expect(taskRun.status).toBe("attention");
   });
 
   test("ignores progress snapshots from a different run with a reused assignment id", () => {

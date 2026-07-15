@@ -1,0 +1,364 @@
+import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
+import * as fs from "node:fs/promises";
+
+import {
+  MAX_CHECKPOINT_BYTES,
+  MAX_POINTER_BYTES,
+  MAX_TASK_RUN_OBJECT_BYTES,
+} from "../defaults.js";
+import type { TaskedSubagentsState } from "../types.js";
+import { canonicalJson, sha256Hex, utf8Bytes } from "./canonical-json.js";
+import type {
+  RecoverableRunReference,
+  StatePointerV5,
+  StoredObject,
+} from "./durable-types.js";
+import {
+  buildCheckpointManifest,
+  buildCheckpointProjection,
+  type ArchiveRef,
+} from "./durable-projection.js";
+import { sessionStoragePaths } from "./storage-paths.js";
+import { openPinnedDirectory, safeBasename } from "./pinned-directory.mjs";
+
+const DIGEST_ID = /^[a-f0-9]{64}$/;
+
+export interface PointerAppender {
+  append(pointer: StatePointerV5): void;
+}
+
+export interface CheckpointContext {
+  sessionId: string;
+  /** Every valid v5 pointer returned by sessionManager.getEntries(), not just the active branch. */
+  visiblePointers: readonly StatePointerV5[];
+  now?: number;
+  /** Terminal archives written before this checkpoint; omitted archives remain discoverable by assignment ID. */
+  archiveRefs?: readonly ArchiveRef[];
+}
+
+export interface PersistenceFailure {
+  code: "projection" | "object_write" | "pointer_too_large" | "pointer_append" | "stale_generation" | "session_mismatch";
+  message: string;
+}
+
+export type CheckpointResult =
+  | { committed: true; pointer: StatePointerV5; deduplicated: boolean }
+  | { committed: false; error: PersistenceFailure; dirty: true }
+  /** The caller must correct the input; retaining an uncloneable object cannot be retried safely. */
+  | { committed: false; error: PersistenceFailure; dirty: false };
+
+/** Minimal store boundary keeps coordinator tests independent of filesystem implementation details. */
+export interface CheckpointObjectStore {
+  readonly root?: string;
+  put<T>(kind: StoredObject<T>["kind"], payload: T, maxBytes: number): Promise<string>;
+}
+
+export interface PersistenceCoordinatorOptions {
+  /** Needed only when an injected store does not expose its storage root. */
+  dataRoot?: string;
+  /** Test-only observation point after the atomic refs replacement completes. */
+  onRefsWritten?: () => void;
+}
+
+interface DirtyCheckpoint {
+  /** The complete originating context is immutable for the life of this retry. */
+  context: CheckpointContext;
+  epoch: number;
+  state: TaskedSubagentsState;
+}
+
+function failure(code: PersistenceFailure["code"], message: string): PersistenceFailure {
+  return { code, message };
+}
+
+function safeErrorMessage(error: unknown): string {
+  // Object-store errors are already intentionally path-free. Do not leak an
+  // arbitrary filesystem error (which can contain a private absolute path).
+  if (error instanceof Error && /^[A-Za-z0-9 _;:,.-]+$/.test(error.message)) return error.message;
+  return "Durable persistence operation failed";
+}
+
+/** Atomically replace the session's complete durable checkpoint root set. */
+export async function rewriteSessionRefs(
+  root: string,
+  sessionId: string,
+  checkpointIds: ReadonlySet<string>,
+  onWritten?: () => void,
+  beforeInstall?: () => void | Promise<void>,
+): Promise<void> {
+  if ([...checkpointIds].some((checkpointId) => !DIGEST_ID.test(checkpointId))) throw new Error("Invalid checkpoint digest");
+  const paths = sessionStoragePaths(root, sessionId);
+  const bytes = canonicalJson({ version: 1, checkpointIds: [...checkpointIds].sort() });
+  const directory = await openPinnedDirectory(paths.root, paths.sessionDir);
+  const temporaryName = safeBasename(`.refs.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+  const refsName = safeBasename("refs.json");
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await directory.openFile(temporaryName, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    await handle.writeFile(bytes, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await beforeInstall?.();
+    // Both paths are resolved through the same live dirfd. A spelling swap of
+    // sessions/<id> after pinning therefore cannot redirect this replacement.
+    await directory.rename(temporaryName, refsName);
+    await directory.sync();
+    onWritten?.();
+  } finally {
+    await handle?.close();
+    await directory.unlink(temporaryName).catch(() => undefined);
+    await directory.close();
+  }
+}
+
+/**
+ * Serializes durable checkpoints. It deliberately does not mutate controller
+ * state: failed snapshots remain available for a later explicit retry.
+ */
+export class PersistenceCoordinator {
+  private queue: Promise<void> = Promise.resolve();
+  private epoch = 0;
+  private sessionId?: string;
+  private sequence = 0;
+  private projectionDigest?: string;
+  private lastCommitted?: StatePointerV5;
+  private dirty?: DirtyCheckpoint;
+  private readonly committedIds = new Set<string>();
+  private readonly root: string;
+
+  constructor(
+    private readonly store: CheckpointObjectStore,
+    private readonly appender: PointerAppender,
+    options: PersistenceCoordinatorOptions = {},
+  ) {
+    this.root = options.dataRoot ?? store.root ?? "";
+    if (!this.root) throw new Error("PersistenceCoordinator requires a storage root");
+    this.onRefsWritten = options.onRefsWritten;
+  }
+
+  private readonly onRefsWritten?: () => void;
+
+  checkpoint(state: TaskedSubagentsState, context: CheckpointContext): Promise<CheckpointResult> {
+    const contextSnapshot = this.snapshotContext(context);
+    let snapshot: TaskedSubagentsState;
+    try {
+      snapshot = structuredClone(state);
+    } catch {
+      // Do not record an object that cannot itself be cloned: doing so would
+      // either throw again or create a retry loop with the caller's mutable state.
+      return Promise.resolve({ committed: false, dirty: false, error: failure("projection", "State cannot be safely cloned for durable persistence") });
+    }
+    const contextError = this.activateContext(contextSnapshot);
+    if (contextError) return Promise.resolve(this.rejected(contextError));
+    const capturedEpoch = this.epoch;
+    return this.enqueue(() => this.write(snapshot, contextSnapshot, capturedEpoch));
+  }
+
+  retryDirty(context: CheckpointContext): Promise<CheckpointResult> {
+    const contextError = this.contextError(context);
+    if (contextError) return Promise.resolve(this.rejected(contextError));
+    const dirty = this.dirty;
+    if (!dirty) {
+      if (!this.lastCommitted) return Promise.resolve(this.rejected(failure("projection", "No durable checkpoint is available"), false));
+      if (context.sessionId !== this.sessionId) {
+        return Promise.resolve(this.rejected(failure("session_mismatch", "Checkpoint context belongs to a different session")));
+      }
+      return Promise.resolve({ committed: true, pointer: this.lastCommitted, deduplicated: true });
+    }
+    if (dirty.context.sessionId !== context.sessionId || context.sessionId !== this.sessionId) {
+      return Promise.resolve(this.rejected(failure("session_mismatch", "Dirty state belongs to a different session")));
+    }
+    if (dirty.epoch !== this.epoch) {
+      return Promise.resolve(this.rejected(failure("stale_generation", "A newer session generation superseded this checkpoint")));
+    }
+    return this.enqueue(() => this.write(dirty.state, dirty.context, dirty.epoch));
+  }
+
+  async flush(context: CheckpointContext): Promise<void> {
+    await this.queue;
+    if (!this.dirty) return;
+    const result = await this.retryDirty(context);
+    if (!result.committed) throw new Error(result.error.message);
+  }
+
+  restoreCommitted(pointer: StatePointerV5): void {
+    if (!this.validPointer(pointer)) return;
+    this.lastCommitted = pointer;
+    this.sequence = Math.max(this.sequence, pointer.sequence);
+    this.committedIds.add(pointer.checkpointId);
+    // A restored pointer is authoritative, but its projection digest is not
+    // available without reading the manifest. The first new request may write
+    // one equivalent pointer; later requests are deduplicated exactly.
+    this.projectionDigest = undefined;
+  }
+
+  invalidate(epoch: number): void {
+    if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error("Invalid persistence epoch");
+    this.epoch = Math.max(this.epoch + 1, epoch);
+    this.resetSessionScopedState();
+  }
+
+  private enqueue(operation: () => Promise<CheckpointResult>): Promise<CheckpointResult> {
+    const result = this.queue.then(operation, operation);
+    this.queue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async write(state: TaskedSubagentsState, context: CheckpointContext, capturedEpoch: number): Promise<CheckpointResult> {
+    if (!this.currentContext(context, capturedEpoch)) {
+      return this.recordDirty(state, context, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
+    }
+
+    const projected = buildCheckpointProjection(state, context.archiveRefs ?? []);
+    if (!projected.ok) return this.recordDirty(state, context, capturedEpoch, failure("projection", projected.error.message));
+    const digest = sha256Hex(canonicalJson(projected.value));
+    if (digest === this.projectionDigest && this.lastCommitted) {
+      this.dirty = undefined;
+      return { committed: true, pointer: this.lastCommitted, deduplicated: true };
+    }
+
+    const sequence = Math.max(
+      this.sequence,
+      ...context.visiblePointers.filter((pointer) => this.validPointer(pointer)).map((pointer) => pointer.sequence),
+    ) + 1;
+    const pointer: StatePointerV5 = {
+      version: 5,
+      checkpointId: "0".repeat(64),
+      ...(projected.value.currentTaskRunId === undefined ? {} : { currentTaskRunId: projected.value.currentTaskRunId }),
+      sequence,
+      writtenAt: context.now ?? Date.now(),
+    };
+    if (utf8Bytes(pointer) > MAX_POINTER_BYTES) {
+      return this.recordDirty(state, context, capturedEpoch, failure("pointer_too_large", "Checkpoint pointer exceeds the 4 KiB limit"));
+    }
+
+    let manifestId: string;
+    try {
+      const recoverableRuns: RecoverableRunReference[] = [];
+      for (const run of projected.value.recoverableRuns) {
+        const objectId = await this.store.put("task-run", run, MAX_TASK_RUN_OBJECT_BYTES);
+        // buildCheckpointProjection only returns the four recoverable statuses.
+        recoverableRuns.push({ taskRunId: run.id, status: run.status as RecoverableRunReference["status"], objectId, updatedAt: run.updatedAt });
+      }
+      const manifest = buildCheckpointManifest({
+        sessionId: context.sessionId,
+        sequence,
+        recoverableRuns,
+        projection: {
+          currentTaskRunId: projected.value.currentTaskRunId,
+          updatedAt: projected.value.updatedAt,
+          completedRuns: projected.value.completedRuns,
+          recentAssignmentRefs: projected.value.recentAssignmentRefs,
+        },
+      });
+      if (!manifest.ok) return this.recordDirty(state, context, capturedEpoch, failure("projection", manifest.error.message));
+      manifestId = await this.store.put("checkpoint", manifest.value, MAX_CHECKPOINT_BYTES);
+    } catch (error) {
+      return this.recordDirty(state, context, capturedEpoch, failure("object_write", safeErrorMessage(error)));
+    }
+
+    if (!this.currentContext(context, capturedEpoch)) {
+      return this.recordDirty(state, context, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
+    }
+
+    pointer.checkpointId = manifestId;
+    // A real digest is fixed-width, so it cannot make the provisional pointer larger.
+    if (utf8Bytes(pointer) > MAX_POINTER_BYTES) {
+      return this.recordDirty(state, context, capturedEpoch, failure("pointer_too_large", "Checkpoint pointer exceeds the 4 KiB limit"));
+    }
+
+    try {
+      await this.writeRefs(context.sessionId, context.visiblePointers, manifestId);
+    } catch (error) {
+      return this.recordDirty(state, context, capturedEpoch, failure("object_write", safeErrorMessage(error)));
+    }
+    if (!this.currentContext(context, capturedEpoch)) {
+      return this.recordDirty(state, context, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
+    }
+
+    try {
+      this.appender.append(pointer);
+    } catch (error) {
+      return this.recordDirty(state, context, capturedEpoch, failure("pointer_append", safeErrorMessage(error)));
+    }
+
+    this.sequence = sequence;
+    this.projectionDigest = digest;
+    this.lastCommitted = pointer;
+    this.committedIds.add(manifestId);
+    this.dirty = undefined;
+    return { committed: true, pointer, deduplicated: false };
+  }
+
+  private recordDirty(state: TaskedSubagentsState, context: CheckpointContext, epoch: number, error: PersistenceFailure): CheckpointResult {
+    this.dirty = { state: structuredClone(state), context: this.snapshotContext(context), epoch };
+    return { committed: false, error, dirty: true };
+  }
+
+  private snapshotContext(context: CheckpointContext): CheckpointContext {
+    return {
+      sessionId: context.sessionId,
+      visiblePointers: structuredClone(context.visiblePointers),
+      ...(context.now === undefined ? {} : { now: context.now }),
+      ...(context.archiveRefs === undefined ? {} : { archiveRefs: structuredClone(context.archiveRefs) }),
+    };
+  }
+
+  private rejected(error: PersistenceFailure, dirty = true): CheckpointResult {
+    return { committed: false, error, dirty };
+  }
+
+  private contextError(context: CheckpointContext): PersistenceFailure | undefined {
+    if (typeof context.sessionId !== "string" || !context.sessionId) {
+      return failure("session_mismatch", "Checkpoint context has no active session");
+    }
+    if (!Array.isArray(context.visiblePointers)) {
+      return failure("session_mismatch", "Checkpoint context has no visible pointer set");
+    }
+    try {
+      sessionStoragePaths(this.root, context.sessionId);
+    } catch {
+      return failure("session_mismatch", "Checkpoint context has an invalid session");
+    }
+    return undefined;
+  }
+
+  private activateContext(context: CheckpointContext): PersistenceFailure | undefined {
+    const error = this.contextError(context);
+    if (error) return error;
+    if (this.sessionId !== undefined && this.sessionId !== context.sessionId) {
+      this.epoch += 1;
+      this.resetSessionScopedState();
+    }
+    this.sessionId = context.sessionId;
+    return undefined;
+  }
+
+  private currentContext(context: CheckpointContext, epoch: number): boolean {
+    return this.sessionId === context.sessionId && this.epoch === epoch;
+  }
+
+  private resetSessionScopedState(): void {
+    this.sequence = 0;
+    this.projectionDigest = undefined;
+    this.lastCommitted = undefined;
+    this.dirty = undefined;
+    this.committedIds.clear();
+  }
+
+  private validPointer(pointer: StatePointerV5): boolean {
+    return pointer.version === 5 && DIGEST_ID.test(pointer.checkpointId) &&
+      Number.isSafeInteger(pointer.sequence) && pointer.sequence >= 0;
+  }
+
+  private async writeRefs(sessionId: string, visiblePointers: readonly StatePointerV5[], checkpointId: string): Promise<void> {
+    const checkpointIds = new Set<string>(this.committedIds);
+    for (const pointer of visiblePointers) {
+      if (this.validPointer(pointer)) checkpointIds.add(pointer.checkpointId);
+    }
+    checkpointIds.add(checkpointId);
+    await rewriteSessionRefs(this.root, sessionId, checkpointIds, this.onRefsWritten);
+  }
+}

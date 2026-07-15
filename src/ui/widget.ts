@@ -306,6 +306,7 @@ function taskActivityLines(
   const activityItems = assignmentActivityItems(assignment);
   const assignmentLine = `${assignmentPrefix}${joinParts([
     colorStatus(assignment.status, theme),
+    muted(task.id, theme),
     muted(assignment.agent, theme),
     muted(shortAssignmentId(assignment.id), theme),
     elapsed ? muted(elapsed, theme) : undefined,

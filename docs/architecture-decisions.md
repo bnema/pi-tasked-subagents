@@ -15,11 +15,39 @@ This document describes the current target architecture for the unreleased v0 pa
 
 **Rationale.** Main-agent coordination should stay simple and flat. Groups provide enough structure for dependency and concurrency control without exposing recursive subtasks or executable phases.
 
-## Clean v4 state
+## Bounded v5 state ownership
 
-**Decision.** The state shape is v4 and contains `taskRuns`, the current task-run id, and timestamps. Older plan/phase development snapshots are reset instead of migrated.
+**Decision.** Pi owns only append-only `pi-tasked-subagents:state` entries containing v5 checkpoint pointers. Each pointer is at most 4 KiB and contains a checkpoint digest, sequence, timestamp, and optional current TaskRun id; it contains no filesystem path, complete TaskRun, or raw result output.
 
-**Rationale.** The plugin is unreleased. Compatibility code would preserve the old conceptual model and make the task-run refactor harder to reason about.
+`pi-tasked-subagents` owns the referenced immutable, content-addressed objects and result files in a private application-data root. On Linux the root is `$XDG_DATA_HOME/pi-tasked-subagents/`, falling back to `~/.local/share/pi-tasked-subagents/`; tests inject a temporary root. Checkpoint manifests are limited to 256 KiB, recoverable TaskRun objects to 2 MiB, and assignment archives to 256 KiB. A checkpoint contains at most 100 recoverable TaskRuns, 1,000 recent assignment references, and the newest 20 completed summaries.
+
+Transient runner display fields update memory and UI but do not create checkpoints. Durable structural and terminal mutations write referenced objects before appending a pointer. Repeated durable projections are deduplicated.
+
+**Rationale.** Small pointers bound Pi resume cost, while immutable external objects retain recoverable state without embedding output in the session.
+
+## Branch restoration and retention
+
+**Decision.** The newest fully valid v5 pointer on the selected branch restores the complete checkpoint. Pi `/tree` navigation selects the immutable checkpoint from that branch; restoration never combines generations. If the newest graph is missing, corrupt, the wrong type, or over its limit, restoration tries an earlier branch pointer and reports diagnostics rather than silently resetting state.
+
+The session reference index includes checkpoint ids visible across all branches. Their object graphs remain pinned so exact branch rollback stays reliable. Unreferenced temporary or orphan objects become eligible for cleanup after 24 hours. `clear` removes logical state immediately, but physical data is deleted only when no session reference index pins it. Immutable authoritative results remain retained until explicit clear or maintenance. Cleanup never follows or deletes paths outside the configured data root.
+
+**Rationale.** Exact indefinite rollback and a fixed total external-storage quota are incompatible. Branch correctness takes priority; storage grows with meaningful durable transitions rather than repeated full snapshots.
+
+## Completed history and immutable results
+
+**Decision.** Normal status presents active or actionable state plus at most the newest 20 completed TaskRun summaries. Terminal assignment metadata is stored in bounded immutable archives, while raw output is stored only in immutable session-scoped result files under random result identities.
+
+`result <assignmentId>` hashes the requested assignment id, verifies archive identity and digest, and loads only the referenced authoritative result file. A known result remains discoverable after its TaskRun leaves recent history. The selected checkpoint's archive reference wins; otherwise multiple branch archives require explicit archive-id disambiguation. TaskRun, group, and task result targets work only when they resolve unambiguously.
+
+**Rationale.** Bounded summaries keep ordinary state small. Lazy, identity-checked result lookup preserves detailed output without loading unrelated TaskRuns or copying raw output into Pi state.
+
+## Session recovery
+
+**Decision.** A normally loadable v4 branch is converted once through the same bounded object and result-ingestion rules, then receives one v5 pointer. An oversized JSONL session is recovered with the standalone `recover-session` command while Pi is closed. The command streams one record at a time, preserves unrelated records, writes a distinct output file, removes incomplete output on failure, and reports only counts and byte totals.
+
+Operators back up the source, check free disk space, run recovery with Pi closed, review the command output, and explicitly open the generated file with `pi --session`. The source and backup remain untouched until the recovered session is verified.
+
+**Rationale.** Pi must parse a session before an extension can load, so recovery for an oversized file cannot depend on Pi startup. A streaming, source-preserving command keeps memory use and privacy exposure bounded.
 
 ## Removed legacy concepts
 
@@ -43,9 +71,9 @@ Removed public concepts include:
 
 ## Runner integration strategy
 
-**Decision.** v0 keeps a local direct runner adapted from the earlier lazy-subagents runner. The runner reads a JSON config, launches child Pi processes, writes progress snapshots, and writes a result file.
+**Decision.** v0 keeps a local direct runner. Before launch, the adapter reserves a cryptographically random 128-bit result identity in the session-scoped application-data directory. The runner reads a JSON config, launches child Pi processes, writes transient progress snapshots, and atomically publishes one immutable terminal result. Concurrent completion or cancellation writers cannot replace the winning result.
 
-**Rationale.** Result-file delivery gives the parent controller one authoritative channel for subagent output. It is easier to test and avoids races between stdout, custom session entries, and direct parent-state mutation.
+**Rationale.** An immutable result file gives the parent controller one authoritative output channel and prevents divergent branches or terminal races from overwriting result content.
 
 ## Task acceptance, patching, and dispatch
 
@@ -132,7 +160,7 @@ Public target ids are `taskRunId`, `groupId`, `taskId`, and `assignmentId`.
 
 | Type | Purpose |
 |---|---|
-| `pi-tasked-subagents:state` | serialized v4 task-run state |
+| `pi-tasked-subagents:state` | bounded v5 pointer to an immutable external checkpoint |
 | `pi-tasked-subagents:completion` | task-run completion follow-up |
 | `pi-tasked-subagents:attention` | attention follow-up |
 | `pi-tasked-subagents:failure` | failure/cancellation follow-up |

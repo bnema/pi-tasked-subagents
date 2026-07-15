@@ -3,24 +3,31 @@
 // ──────────────────────────────────────────────
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_WAIT_TIMEOUT_MS } from "../defaults.js";
+import { isResultId, isSessionId, resolveStorageRoot, resultFilePath, resultReservationPath, runDirectoryPath, runFilePath, sessionStoragePaths } from "../state/storage-paths.js";
 import type {
   LaunchTaskEntry,
   LaunchTaskGraphRequest,
   RunCounts,
   RunProgressSnapshot,
   RunStatus,
+  DurableSubagentRunHandle,
   SubagentRunHandle,
   SubagentRuntime,
   TaskAssignmentRecord,
 } from "../types.js";
 import { getAgentProfile, listAvailableAgentProfiles } from "./agent-profiles.js";
 import { ensureTaskGraphRequest, type LaunchResult, type RunnerRuntimeContext, type RunnerChildConfig, type RunnerConfig } from "./interface.js";
+import { captureProcessIdentity, isProcessIdentityAlive, signalProcessIdentity } from "./process-identity.mjs";
+import { openPinnedDirectory } from "../state/pinned-directory.mjs";
+import { publishTerminalResult, reserveResultReservation } from "./result-files.mjs";
 
 function now(): number {
   return Date.now();
@@ -42,6 +49,40 @@ async function readJsonFile<T>(filePath: string | undefined): Promise<T | undefi
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   await fsp.writeFile(filePath, JSON.stringify(value, null, 2), "utf8");
+}
+
+/** Durable runner files are read and written only relative to a live dirfd. */
+async function readPinnedJsonFile<T>(root: string, directoryPath: string, name: string, procDirectoryPath?: (fd: number) => string): Promise<T | undefined> {
+  const directory = await openPinnedDirectory(root, directoryPath, { procDirectoryPath });
+  let handle;
+  try {
+    handle = await directory.openFile(name, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) return undefined;
+    const content = await handle.readFile("utf8");
+    const after = await handle.stat();
+    if (!after.isFile() || after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size) return undefined;
+    return JSON.parse(content) as T;
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close();
+    await directory.close();
+  }
+}
+
+async function writePinnedJsonFile(root: string, directoryPath: string, name: string, value: unknown, procDirectoryPath?: (fd: number) => string): Promise<void> {
+  const directory = await openPinnedDirectory(root, directoryPath, { procDirectoryPath });
+  let handle;
+  try {
+    handle = await directory.openFile(name, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    await handle.writeFile(JSON.stringify(value, null, 2), "utf8");
+    await handle.sync();
+    await directory.sync();
+  } finally {
+    await handle?.close();
+    await directory.close();
+  }
 }
 
 function tempRoot(): string {
@@ -75,18 +116,29 @@ function childOutputFile(index: number): string {
 
 interface RunPaths {
   asyncDir: string;
+  resultsDir: string;
   resultPath: string;
+  resultReservationPath: string;
   statusPath: string;
   eventsPath: string;
+}
+
+interface ProcessIdentity {
+  pid: number;
+  startTime: string;
 }
 
 interface RunnerStatusFile {
   runId?: string;
   state?: "queued" | "running" | "complete" | "failed" | "paused" | "cancelled" | "skipped";
+  success?: boolean;
+  summary?: string;
   pid?: number;
+  pidStartTime?: string;
   steps?: Array<{
     id?: string;
     pid?: number;
+    pidStartTime?: string;
     status?: string;
     agent?: string;
     currentTool?: string;
@@ -98,6 +150,7 @@ interface RunnerStatusFile {
 
 interface RunnerResultFile {
   runId?: string;
+  timestamp?: number;
   state?: "complete" | "failed" | "paused" | "cancelled" | "skipped";
   success?: boolean;
   summary?: string;
@@ -155,12 +208,15 @@ function emptyCounts(): RunCounts {
   };
 }
 
-function toRunHandleBase(launch: LaunchResult): Omit<SubagentRunHandle, "assignments"> {
+function toRunHandleBase(launch: LaunchResult): Omit<DurableSubagentRunHandle, "assignments"> {
   return {
     runId: launch.runId,
     asyncId: launch.asyncId,
+    sessionId: launch.sessionId,
     asyncDir: launch.asyncDir,
+    resultId: launch.resultId,
     resultPath: launch.resultPath,
+    resultReservationPath: launch.resultReservationPath,
     sessionFile: launch.sessionFile,
     artifactPath: launch.artifactPath,
   };
@@ -174,72 +230,99 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = typeof error === "object" && error !== null ? (error as { code?: string }).code : undefined;
-    return code === "EPERM";
-  }
-}
 
 export interface PiRunnerAdapterOptions {
   piBin?: string;
+  /** Application-data root override for tests and embedders. */
+  dataRoot?: string;
+  /** @deprecated Test-only compatibility override for pre-v5 run directories. */
   asyncDirRootOverride?: string;
+  /** @deprecated Test-only compatibility override for pre-v5 result directories. */
   resultsDirOverride?: string;
+  /** Injectable only for deterministic tests; production uses cryptographic random bytes. */
+  resultIdFactory?: () => string;
+  /** Injectable operation boundary for deterministic pinned-storage race tests. */
+  storageMutationHook?: (operation: "reserve-result" | "publish-terminal-result") => Promise<void> | void;
+  /** Injectable only for deterministic unavailable-procfs tests. */
+  procDirectoryPath?: (fd: number) => string;
 }
 
 export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   private readonly piBin: string;
+  private readonly dataRoot: string;
   private readonly asyncRoot: string;
   private readonly resultsRoot: string;
-  private readonly trackedRuns = new Map<string, { launch: LaunchResult; pid?: number }>();
+  private readonly resultIdFactory: () => string;
+  private readonly storageMutationHook: PiRunnerAdapterOptions["storageMutationHook"];
+  private readonly procDirectoryPath: PiRunnerAdapterOptions["procDirectoryPath"];
+  /** Each launch is keyed by session and immutable identity, never by report-oriented runId. */
+  private readonly trackedLaunches = new Map<string, { launch: LaunchResult; identity?: ProcessIdentity }>();
 
   constructor(options: PiRunnerAdapterOptions = {}) {
     this.piBin = options.piBin ?? "pi";
+    // Legacy directory overrides are used only by explicitly marked legacy
+    // handles. All new durable launches use the application-data root.
+    this.dataRoot = resolveStorageRoot({ dataRoot: options.dataRoot });
     this.asyncRoot = options.asyncDirRootOverride ?? defaultAsyncRoot();
     this.resultsRoot = options.resultsDirOverride ?? defaultResultsRoot();
+    this.resultIdFactory = options.resultIdFactory ?? (() => randomBytes(16).toString("hex"));
+    this.storageMutationHook = options.storageMutationHook;
+    this.procDirectoryPath = options.procDirectoryPath;
   }
 
-  async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: RunnerRuntimeContext): Promise<SubagentRunHandle> {
+  async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: RunnerRuntimeContext): Promise<DurableSubagentRunHandle> {
     ensureTaskGraphRequest(request);
-    const paths = this.requireRunPaths(request.runId);
-    const runtimeCtx = ctx && typeof ctx === "object" ? ctx as Partial<RunnerRuntimeContext> : undefined;
+    const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : "";
     const requestCwd = typeof request.cwd === "string" && request.cwd.trim() ? request.cwd.trim() : undefined;
-    const contextCwd = typeof runtimeCtx?.cwd === "string" && runtimeCtx.cwd.trim() ? runtimeCtx.cwd.trim() : undefined;
+    const contextCwd = typeof ctx?.cwd === "string" && ctx.cwd.trim() ? ctx.cwd.trim() : undefined;
     const cwd = requestCwd ?? contextCwd;
     if (!cwd) throw new Error("Task graph cwd is required");
-    const children = this.buildChildren(request.tasks, cwd, paths.asyncDir);
-    const config: RunnerConfig = {
-      runId: request.runId,
-      mode: "task_graph",
-      maxConcurrency: request.maxConcurrency,
-      piBin: this.piBin,
-      asyncDir: paths.asyncDir,
-      resultsDir: this.resultsRoot,
-      resultPath: paths.resultPath,
-      statusPath: paths.statusPath,
-      eventsPath: paths.eventsPath,
-      children,
-    };
-    const launch = await this.buildAndLaunch(config);
-    return {
-      ...toRunHandleBase(launch),
-      assignments: request.tasks.map((task) => ({
-        assignmentId: task.assignmentId.trim(),
-        runId: launch.runId,
-        resultPath: launch.resultPath,
-      })),
-    };
+    const resultsDir = this.requireResultsDir(sessionId);
+    const reservation = await this.reserveResultIdentity(sessionId, request.runId, resultsDir);
+    let launched = false;
+    try {
+      const paths = this.requireRunPaths(request.runId, sessionId, reservation.resultId);
+      const children = this.buildChildren(request.tasks, cwd, paths.asyncDir);
+      const config: RunnerConfig = {
+        runId: request.runId,
+        sessionId,
+        mode: "task_graph",
+        maxConcurrency: request.maxConcurrency,
+        piBin: this.piBin,
+        storageRoot: this.dataRoot,
+        asyncDir: paths.asyncDir,
+        resultsDir: paths.resultsDir,
+        resultId: reservation.resultId,
+        resultPath: reservation.resultPath,
+        resultReservationPath: reservation.resultReservationPath,
+        statusPath: paths.statusPath,
+        eventsPath: paths.eventsPath,
+        children,
+      };
+      const launch = await this.buildAndLaunch(config);
+      launched = true;
+      return {
+        ...toRunHandleBase(launch),
+        assignments: request.tasks.map((task) => ({
+          assignmentId: task.assignmentId.trim(),
+          runId: launch.runId,
+          resultPath: launch.resultPath,
+        })),
+      };
+    } finally {
+      // The reservation retains its dirfd, so a renamed/symlink-swapped spelling
+      // cannot redirect failure cleanup outside the directory that owns it.
+      if (!launched) await reservation.release().catch(() => undefined);
+      else await reservation.close();
+    }
   }
 
-  async stopRun(handle: SubagentRunHandle, _ctx: unknown): Promise<boolean> {
-    return this.terminate(handle, "paused", "Stopped by user; continuation available");
+  async stopRun(handle: SubagentRunHandle, ctx: RunnerRuntimeContext): Promise<boolean> {
+    return this.terminate(handle, "paused", "Stopped by user; continuation available", ctx);
   }
 
-  async cancelRun(handle: SubagentRunHandle, _ctx: unknown): Promise<boolean> {
-    return this.terminate(handle, "cancelled", "Cancelled by user");
+  async cancelRun(handle: SubagentRunHandle, ctx: RunnerRuntimeContext): Promise<boolean> {
+    return this.terminate(handle, "cancelled", "Cancelled by user", ctx);
   }
 
   async waitForRunSignal(
@@ -262,11 +345,15 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     let terminalResultSeenAt: number | undefined;
     while (now() < deadline) {
       if (options?.signal?.aborted) return "cancelled";
-      const statusFile = await readJsonFile<RunnerStatusFile>(paths.statusPath);
+      const statusFile = handle.legacy
+        ? await readJsonFile<RunnerStatusFile>(paths.statusPath)
+        : await this.readDurableStatus(paths);
       if (statusFile?.state) {
         await options?.onUpdate?.(buildProgressSnapshot(runId, statusFile));
       }
-      const result = await readJsonFile<RunnerResultFile>(launch.resultPath ?? paths.resultPath);
+      const result = handle.legacy
+        ? await readJsonFile<RunnerResultFile>(launch.resultPath ?? paths.resultPath)
+        : await this.readDurableResult(paths);
       if (result?.state) {
         const status = mapRunnerState(result.state);
         if (isTerminalStatus(status)) {
@@ -284,7 +371,9 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     const { runId } = handle;
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return undefined;
-    const result = await readJsonFile<RunnerResultFile>(resolved.launch.resultPath);
+    const result = handle.legacy
+      ? await readJsonFile<RunnerResultFile>(resolved.launch.resultPath)
+      : await this.readDurableResult(resolved.paths);
     if (!result) return undefined;
     if (typeof result.rawOutput === "string" && result.rawOutput.trim()) return result.rawOutput;
     if (Array.isArray(result.results) && result.results.length > 1) {
@@ -306,14 +395,11 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   async isRunAlive(handle: SubagentRunHandle): Promise<boolean> {
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return false;
-    const statusFile = await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath);
-    const pids = new Set<number>();
-    const trackedPid = this.trackedRuns.get(handle.runId)?.pid;
-    if (trackedPid) pids.add(trackedPid);
-    if (statusFile?.pid) pids.add(statusFile.pid);
-    for (const step of statusFile?.steps ?? []) if (step.pid) pids.add(step.pid);
-    if (pids.size === 0) return false;
-    for (const pid of pids) if (isPidAlive(pid)) return true;
+    const statusFile = handle.legacy
+      ? await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath)
+      : await this.readDurableStatus(resolved.paths);
+    const identities = this.processIdentities(handle, statusFile);
+    for (const identity of identities) if (await isProcessIdentityAlive(identity)) return true;
     return false;
   }
 
@@ -321,21 +407,89 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     return { assignments: [], counts: emptyCounts() };
   }
 
-  private runPaths(runId: string): RunPaths | undefined {
-    if (!SAFE_RUN_ID_PATTERN.test(runId)) return undefined;
-    const asyncDir = safeJoin(this.asyncRoot, runId);
+  private async readDurableStatus(paths: RunPaths): Promise<RunnerStatusFile | undefined> {
+    return readPinnedJsonFile<RunnerStatusFile>(this.dataRoot, paths.asyncDir, "status.json", this.procDirectoryPath);
+  }
+
+  private async readDurableResult(paths: RunPaths): Promise<RunnerResultFile | undefined> {
+    return readPinnedJsonFile<RunnerResultFile>(this.dataRoot, paths.resultsDir, path.basename(paths.resultPath), this.procDirectoryPath);
+  }
+
+  private async writeDurableStatus(paths: RunPaths, value: unknown): Promise<void> {
+    await writePinnedJsonFile(this.dataRoot, paths.asyncDir, "status.json", value, this.procDirectoryPath);
+  }
+
+  private requireResultsDir(sessionId: string): string {
+    if (!isSessionId(sessionId)) throw new Error("Unsafe session ID");
+    return sessionStoragePaths(this.dataRoot, sessionId).resultsDir;
+  }
+
+  /** Derive, never trust, every durable path from its validated identities. */
+  private runPaths(runId: string, sessionId: string, resultId: string): RunPaths | undefined {
+    if (!SAFE_RUN_ID_PATTERN.test(runId) || !isSessionId(sessionId) || !isResultId(resultId)) return undefined;
+    const storage = sessionStoragePaths(this.dataRoot, sessionId);
+    const asyncDir = runDirectoryPath(storage, resultId);
+    const resultPath = resultFilePath(storage, resultId);
     return {
       asyncDir,
-      resultPath: safeJoin(this.resultsRoot, `${runId}.json`),
+      resultsDir: storage.resultsDir,
+      resultPath,
+      resultReservationPath: resultReservationPath(storage, resultId),
+      statusPath: runFilePath(storage, resultId, "status.json"),
+      eventsPath: runFilePath(storage, resultId, "events.jsonl"),
+    };
+  }
+
+  private legacyRunPaths(runId: string): RunPaths | undefined {
+    if (!SAFE_RUN_ID_PATTERN.test(runId)) return undefined;
+    const asyncDir = safeJoin(this.asyncRoot, runId);
+    const resultPath = safeJoin(this.resultsRoot, `${runId}.json`);
+    return {
+      asyncDir,
+      resultsDir: this.resultsRoot,
+      resultPath,
+      resultReservationPath: `${resultPath}.reservation`,
       statusPath: safeJoin(asyncDir, "status.json"),
       eventsPath: safeJoin(asyncDir, "events.jsonl"),
     };
   }
 
-  private requireRunPaths(runId: string): RunPaths {
-    const paths = this.runPaths(runId);
+  private requireRunPaths(runId: string, sessionId: string, resultId: string): RunPaths {
+    const paths = this.runPaths(runId, sessionId, resultId);
     if (!paths) throw new Error("Unsafe run ID");
     return paths;
+  }
+
+  private async reserveResultIdentity(sessionId: string, runId: string, resultsDir: string): Promise<{
+    resultId: string;
+    resultPath: string;
+    resultReservationPath: string;
+    close: () => Promise<void>;
+    release: () => Promise<void>;
+  }> {
+    if (!sessionId) throw new Error("Unsafe session ID");
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const resultId = this.resultIdFactory();
+      if (!/^[a-f0-9]{32}$/u.test(resultId)) throw new Error("Result ID factory returned an invalid 128-bit identity");
+      try {
+        const reservation = await reserveResultReservation(this.dataRoot, resultsDir, { sessionId, runId, resultId }, {
+          beforeMutation: this.storageMutationHook,
+          procDirectoryPath: this.procDirectoryPath,
+          retainDirectory: true,
+        });
+        return { resultId, ...reservation } as {
+          resultId: string;
+          resultPath: string;
+          resultReservationPath: string;
+          close: () => Promise<void>;
+          release: () => Promise<void>;
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+        throw error;
+      }
+    }
+    throw new Error("Could not reserve a unique immutable result identity");
   }
 
   private buildChildren(entries: LaunchTaskEntry[], baseCwd: string, asyncDir: string): RunnerChildConfig[] {
@@ -371,14 +525,16 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
 
   private async buildAndLaunch(config: RunnerConfig): Promise<LaunchResult> {
     await fsp.mkdir(config.asyncDir, { recursive: true });
-    await fsp.mkdir(this.resultsRoot, { recursive: true });
     const configPath = safeJoin(config.asyncDir, "config.json");
     await writeJsonFile(configPath, config);
     const launch: LaunchResult = {
       runId: config.runId,
       asyncId: config.runId,
       asyncDir: config.asyncDir,
+      sessionId: config.sessionId,
+      resultId: config.resultId,
       resultPath: config.resultPath,
+      resultReservationPath: config.resultReservationPath,
     };
     await new Promise<void>((resolve, reject) => {
       const child = spawn(process.execPath, [runnerPath(), configPath], {
@@ -388,53 +544,91 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       });
       child.once("error", reject);
       child.once("spawn", () => {
-        this.trackedRuns.set(config.runId, { launch, pid: child.pid ?? undefined });
-        child.unref();
-        resolve();
+        const key = this.launchKey(config.sessionId, config.resultId);
+        let exited = false;
+        child.once("exit", () => {
+          exited = true;
+          this.trackedLaunches.delete(key);
+        });
+        void (async () => {
+          const identity = child.pid === undefined ? undefined : await captureProcessIdentity(child.pid);
+          if (!exited) this.trackedLaunches.set(key, { launch, identity });
+          child.unref();
+          resolve();
+        })().catch(reject);
       });
     });
     return launch;
   }
 
-  private resolveRunHandle(handle: SubagentRunHandle): { paths: RunPaths; launch: LaunchResult } | undefined {
-    const fallback = this.runPaths(handle.runId);
-    if (!fallback) return undefined;
-    const asyncDir = handle.asyncDir ?? fallback.asyncDir;
-    const paths = {
+  private launchKey(sessionId: string, resultId: string): string {
+    return `${sessionId}:${resultId}`;
+  }
+
+  /** PID values are useful only with the kernel-issued process start time. */
+  private processIdentities(
+    handle: SubagentRunHandle,
+    statusFile: RunnerStatusFile | undefined,
+    tracked = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId)),
+  ): ProcessIdentity[] {
+    const identities = new Map<string, ProcessIdentity>();
+    const add = (pid: number | undefined, startTime: string | undefined): void => {
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 || typeof startTime !== "string" || !/^\d+$/u.test(startTime)) return;
+      identities.set(`${pid}:${startTime}`, { pid, startTime });
+    };
+    if (!handle.legacy && tracked?.identity) add(tracked.identity.pid, tracked.identity.startTime);
+    add(statusFile?.pid, statusFile?.pidStartTime);
+    for (const step of statusFile?.steps ?? []) add(step.pid, step.pidStartTime);
+    return [...identities.values()];
+  }
+
+  private resolveRunHandle(handle: SubagentRunHandle): { paths: RunPaths; launch: { resultPath: string } } | undefined {
+    if (!SAFE_RUN_ID_PATTERN.test(handle.runId)) return undefined;
+    if (!handle.legacy) {
+      const paths = this.runPaths(handle.runId, handle.sessionId, handle.resultId);
+      // Persisted paths are evidence only: a mismatch fails before any file I/O
+      // or PID collection, rather than being used as an alternate location.
+      if (!paths || handle.asyncDir !== paths.asyncDir || handle.resultPath !== paths.resultPath ||
+        handle.resultReservationPath !== paths.resultReservationPath) return undefined;
+      return { paths, launch: { resultPath: paths.resultPath } };
+    }
+    const fallback = !handle.asyncDir || !handle.resultPath ? this.legacyRunPaths(handle.runId) : undefined;
+    const asyncDir = handle.asyncDir ?? fallback?.asyncDir;
+    const resultPath = handle.resultPath ?? fallback?.resultPath;
+    if (!asyncDir || !resultPath) return undefined;
+    const paths: RunPaths = {
       asyncDir,
-      resultPath: handle.resultPath ?? fallback.resultPath,
+      resultsDir: path.dirname(resultPath),
+      resultPath,
+      resultReservationPath: `${resultPath}.reservation`,
       statusPath: safeJoin(asyncDir, "status.json"),
       eventsPath: safeJoin(asyncDir, "events.jsonl"),
     };
-    const trackedLaunch = this.trackedRuns.get(handle.runId)?.launch;
-    const launch = {
-      ...trackedLaunch,
-      runId: handle.runId,
-      asyncId: handle.asyncId,
-      asyncDir: paths.asyncDir,
-      resultPath: paths.resultPath,
-      sessionFile: handle.sessionFile ?? trackedLaunch?.sessionFile,
-      artifactPath: handle.artifactPath ?? trackedLaunch?.artifactPath,
-    };
-    return { paths, launch };
+    return { paths, launch: { resultPath } };
   }
 
-  private async terminate(handle: SubagentRunHandle, state: "paused" | "cancelled", summary: string): Promise<boolean> {
+  private async terminate(
+    handle: SubagentRunHandle,
+    state: "paused" | "cancelled",
+    summary: string,
+    ctx: RunnerRuntimeContext,
+  ): Promise<boolean> {
     const { runId } = handle;
+    const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : "";
+    if (!handle.legacy && sessionId !== handle.sessionId) return false;
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return false;
     const { paths, launch } = resolved;
-    const tracked = this.trackedRuns.get(runId);
-    const existingStatus = await readJsonFile<RunnerStatusFile>(paths.statusPath);
+    const tracked = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId));
+    const existingStatus = handle.legacy
+      ? await readJsonFile<RunnerStatusFile>(paths.statusPath)
+      : await this.readDurableStatus(paths);
     const resultPath = launch.resultPath ?? paths.resultPath;
 
-    const pids = new Set<number>();
-    if (tracked?.pid) pids.add(tracked.pid);
-    if (existingStatus?.pid) pids.add(existingStatus.pid);
-    for (const step of existingStatus?.steps ?? []) if (step.pid) pids.add(step.pid);
+    const identities = this.processIdentities(handle, existingStatus, tracked);
 
     const timestamp = now();
-    const terminalStatus = {
+    const terminalStatus: RunnerStatusFile & { endedAt?: number; lastUpdate?: number } = {
       ...(existingStatus ?? {}),
       runId,
       state,
@@ -445,7 +639,9 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
         status: preservedStepStatus(step.status) ? step.status : state,
       })),
     };
-    const existingResult = await readJsonFile<RunnerResultFile>(resultPath);
+    const existingResult = handle.legacy
+      ? await readJsonFile<RunnerResultFile>(resultPath)
+      : await this.readDurableResult(paths);
     const terminalResult = {
       ...(existingResult ?? {}),
       runId,
@@ -456,17 +652,36 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     };
 
     let allSignaled = true;
-    for (const pid of pids) {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch (error) {
-        const code = typeof error === "object" && error !== null ? (error as { code?: string }).code : undefined;
-        if (code !== "ESRCH") allSignaled = false;
-      }
+    for (const identity of identities) {
+      // A missing or stale identity is intentionally treated as no longer ours.
+      if (await isProcessIdentityAlive(identity) && !await signalProcessIdentity(identity)) allSignaled = false;
     }
 
-    await writeJsonFile(paths.statusPath, terminalStatus);
-    await writeJsonFile(resultPath, terminalResult);
+    if (handle.legacy) {
+      await writeJsonFile(paths.statusPath, terminalStatus);
+      await writeJsonFile(resultPath, terminalResult);
+      return allSignaled;
+    }
+    try {
+      const publication = await publishTerminalResult(resultPath, handle.resultReservationPath, {
+        sessionId,
+        runId,
+        resultId: handle.resultId,
+      }, terminalResult, {
+        root: this.dataRoot,
+        beforeMutation: this.storageMutationHook,
+        procDirectoryPath: this.procDirectoryPath,
+      });
+      const winner = publication.value as RunnerResultFile;
+      terminalStatus.state = winner.state ?? terminalStatus.state;
+      terminalStatus.success = winner.success;
+      terminalStatus.summary = winner.summary;
+      terminalStatus.endedAt = typeof winner.timestamp === "number" ? winner.timestamp : timestamp;
+      terminalStatus.lastUpdate = terminalStatus.endedAt;
+      await this.writeDurableStatus(paths, terminalStatus);
+    } catch {
+      return false;
+    }
     return allSignaled;
   }
 }

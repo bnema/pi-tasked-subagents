@@ -2,6 +2,8 @@
 // Command parsing and formatting for tasked subagent task runs
 // ──────────────────────────────────────────────
 
+import { MAX_RECENT_COMPLETED } from "../defaults.js";
+import type { AssignmentArchiveV1, RestoredCompletedHistoryV1 } from "../state/durable-types.js";
 import type { AgentProfile } from "../launcher/agent-profiles.js";
 import type { TaskAssignmentRecord, TaskGroupRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
 import { assignmentsForTask, authoritativeAssignment, authoritativeAssignments, isSupersededAssignment } from "./assignment-attempts.js";
@@ -27,6 +29,7 @@ export interface ParsedCommand {
   action: CommandAction;
   targetId?: string;
   assignmentId?: string;
+  archiveId?: string;
   prompt?: string;
   details?: boolean;
   scope?: "completed" | "all";
@@ -140,6 +143,9 @@ export function parseCommand(input: string, internal = false): ParsedCommand {
     case "inspect":
       return tokens[1] ? { action: "inspect", targetId: tokens[1] } : { action: "help" };
     case "result":
+      return tokens[1] && tokens.length <= 3
+        ? { action, assignmentId: tokens[1], ...(tokens[2] ? { archiveId: tokens[2] } : {}) }
+        : { action: "help" };
     case "stop":
     case "cancel":
       return tokens[1] ? { action, assignmentId: tokens[1] } : { action: "help" };
@@ -176,6 +182,18 @@ function orderedTaskRuns(state: TaskedSubagentsState): TaskRunRecord[] {
 
 function findTaskRun(state: TaskedSubagentsState, id: string): TaskRunRecord | undefined {
   return state.taskRuns.find((taskRun) => taskRun.id === id);
+}
+
+function findCompletedHistory(state: TaskedSubagentsState, id: string): RestoredCompletedHistoryV1 | undefined {
+  return state.completedHistory?.find((summary) => summary.taskRunId === id);
+}
+
+function findArchivedAssignment(state: TaskedSubagentsState, id: string): { history: RestoredCompletedHistoryV1; archive: AssignmentArchiveV1 & { archiveId: string } } | undefined {
+  for (const history of state.completedHistory ?? []) {
+    const archive = history.archives.find((candidate) => candidate.assignmentId === id);
+    if (archive) return { history, archive };
+  }
+  return undefined;
 }
 
 function findGroup(state: TaskedSubagentsState, id: string): { taskRun: TaskRunRecord; group: TaskGroupRecord } | undefined {
@@ -241,11 +259,13 @@ function assignmentsForTarget(state: TaskedSubagentsState, targetId: string): Ta
 
 export function resolveResultAssignmentId(state: TaskedSubagentsState, targetId: string): string | undefined {
   const assignments = assignmentsForTarget(state, targetId);
-  return assignments?.length === 1 ? assignments[0].id : undefined;
+  // A compact restored checkpoint intentionally omits old completed runs.
+  // Let the controller perform the assignment-ID archive lookup in that case.
+  return assignments === undefined ? targetId : assignments.length === 1 ? assignments[0].id : undefined;
 }
 
 export function formatStatusReport(state: TaskedSubagentsState, targetId?: string): string {
-  if (state.taskRuns.length === 0) return "No tracked task runs.";
+  if (state.taskRuns.length === 0 && (state.completedHistory?.length ?? 0) === 0) return "No tracked task runs.";
   if (targetId) {
     const taskRun = findTaskRun(state, targetId);
     if (taskRun) return formatTaskRunStatus(taskRun);
@@ -255,19 +275,40 @@ export function formatStatusReport(state: TaskedSubagentsState, targetId?: strin
     if (task) return formatTaskStatus(task.taskRun, task.group, task.task);
     const assignment = findAssignment(state, targetId);
     if (assignment) return formatAssignmentDetail(assignment.taskRun, assignment.assignment);
+    const history = findCompletedHistory(state, targetId);
+    if (history) return formatCompletedHistoryStatus(history);
+    const archived = findArchivedAssignment(state, targetId);
+    if (archived) return formatArchivedAssignmentDetail(archived.history, archived.archive);
     return `Not found: ${targetId}. Use a valid taskRun, group, task, or assignment id.`;
   }
 
   const active = state.taskRuns.filter((taskRun) => taskRun.status === "pending" || taskRun.status === "running").length;
   const attention = state.taskRuns.filter((taskRun) => taskRun.status === "attention" || taskRun.status === "failed").length;
-  const completed = state.taskRuns.filter((taskRun) => taskRun.status === "completed").length;
-  const lines = [`Task runs: ${state.taskRuns.length} total`];
+  const completed = state.taskRuns.filter((taskRun) => taskRun.status === "completed").length + (state.completedHistory?.filter((history) => history.status === "completed").length ?? 0);
+  const lines = [`Task runs: ${state.taskRuns.length + (state.completedHistory?.length ?? 0)} total`];
   if (active) lines.push(`  Active: ${active}`);
   if (attention) lines.push(`  Attention: ${attention}`);
   if (completed) lines.push(`  Completed: ${completed}`);
+  const actionable = state.taskRuns.filter((taskRun) => taskRun.status !== "completed" && taskRun.status !== "cancelled");
+  const recentTerminal = state.taskRuns
+    .filter((taskRun) => taskRun.status === "completed" || taskRun.status === "cancelled")
+    .map((taskRun, index) => ({ taskRun, index }))
+    .sort((left, right) => (right.taskRun.completedAt ?? right.taskRun.updatedAt) - (left.taskRun.completedAt ?? left.taskRun.updatedAt) || right.index - left.index)
+    .slice(0, MAX_RECENT_COMPLETED)
+    .map(({ taskRun }) => taskRun);
   lines.push("");
-  for (const taskRun of state.taskRuns) lines.push(...formatTaskRunStatusLines(taskRun), "");
+  for (const taskRun of [...actionable, ...recentTerminal]) lines.push(...formatTaskRunStatusLines(taskRun), "");
+  for (const history of (state.completedHistory ?? []).slice(0, MAX_RECENT_COMPLETED)) lines.push(...formatCompletedHistoryStatus(history).split("\n"), "");
   return lines.join("\n").trimEnd();
+}
+
+function formatCompletedHistoryStatus(history: RestoredCompletedHistoryV1): string {
+  return [
+    `${history.taskRunId} · ${statusLabel(history.status)} · ${history.title}`,
+    `  groups: ${history.groupCount}`,
+    `  tasks: ${history.taskCount}`,
+    `  assignments: ${history.assignmentCount} archived`,
+  ].join("\n");
 }
 
 function formatTaskRunStatusLines(taskRun: TaskRunRecord): string[] {
@@ -310,7 +351,42 @@ export function formatInspectReport(state: TaskedSubagentsState, targetId: strin
   if (task) return formatTaskDetail(task.taskRun, task.group, task.task);
   const assignment = findAssignment(state, targetId);
   if (assignment) return formatAssignmentDetail(assignment.taskRun, assignment.assignment);
+  const history = findCompletedHistory(state, targetId);
+  if (history) return formatCompletedHistoryDetail(history);
+  const archived = findArchivedAssignment(state, targetId);
+  if (archived) return formatArchivedAssignmentDetail(archived.history, archived.archive);
   return `Not found: ${targetId}. Use a valid taskRun, group, task, or assignment id.`;
+}
+
+function formatCompletedHistoryDetail(history: RestoredCompletedHistoryV1): string {
+  const lines = [
+    `TaskRun: ${history.taskRunId}`,
+    `  title: ${history.title}`,
+    `  status: ${statusLabel(history.status)}`,
+    `  groups: ${history.groupCount}`,
+    `  tasks: ${history.taskCount}`,
+    `  assignments: ${history.assignmentCount}`,
+    "",
+    `Archived assignments (${history.archives.length}):`,
+  ];
+  for (const archive of history.archives) lines.push(`  ${archive.assignmentId} · ${statusLabel(archive.status)} · ${archive.taskId} · ${archive.archiveId}`);
+  return lines.join("\n");
+}
+
+function formatArchivedAssignmentDetail(history: RestoredCompletedHistoryV1, archive: AssignmentArchiveV1 & { archiveId: string }): string {
+  const lines = [
+    `Assignment: ${archive.assignmentId}`,
+    `  status: ${statusLabel(archive.status)}`,
+    `  taskRun: ${history.taskRunId} · ${history.title}`,
+    archive.groupId ? `  group: ${archive.groupId}` : undefined,
+    `  task: ${archive.taskId}`,
+    `  archive: ${archive.archiveId}`,
+  ].filter((line): line is string => Boolean(line));
+  if ("summary" in archive && archive.summary) lines.push(`  result: ${archive.summary}`);
+  if ("followUps" in archive && archive.followUps.length) {
+    lines.push("", "Follow-ups:", ...archive.followUps.map((followUp) => `- ${followUp}`));
+  }
+  return lines.join("\n");
 }
 
 function formatTaskRunDetail(taskRun: TaskRunRecord): string {
@@ -470,7 +546,7 @@ export function buildHelpText(): string {
     "  /tasked-subagents help",
     "  /tasked-subagents status [taskRunId|groupId|taskId|assignmentId]",
     "  /tasked-subagents inspect <taskRunId|groupId|taskId|assignmentId>",
-    "  /tasked-subagents result <taskRunId|groupId|taskId|assignmentId>  (taskRun/group/task must resolve to one assignment)",
+    "  /tasked-subagents result <assignmentId> [archiveId]  (taskRun/group/task targets must resolve to one assignment)",
     "  /tasked-subagents attach [taskRunId|groupId|taskId|assignmentId]",
     "  /tasked-subagents dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>] [wait=true|false]", 
     "  /tasked-subagents stop <assignmentId>",
@@ -488,7 +564,7 @@ export function buildHelpText(): string {
     "  tasked_subagents action=dispatch [taskRunId=<taskRunId>] [maxConcurrency=<n>] [wait=true]", 
     "  tasked_subagents action=status [targetId=<id>]",
     "  tasked_subagents action=inspect targetId=<id>",
-    "  tasked_subagents action=result assignmentId=<assignmentId>",
+    "  tasked_subagents action=result assignmentId=<assignmentId> [archiveId=<archiveId>]",
     "  tasked_subagents action=attach [targetId=<taskRunId|groupId|taskId|assignmentId>]",
     "  Add wait=true to set_tasks/patch_task_run/edit_task/edit_group/dispatch when the main agent should remain locked until launched work finishes.",
     "  tasked_subagents action=continue targetId=<taskId|assignmentId|groupId> prompt=<prompt>",

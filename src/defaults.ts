@@ -20,6 +20,23 @@ export const ENTRY_TYPE_ARTIFACT = "pi-tasked-subagents:artifact";
 // State version for the task-run state model.
 export const STATE_VERSION = 4;
 
+// Bounded durable v5 persistence.
+export const STATE_POINTER_VERSION = 5;
+export const STORE_VERSION = 1;
+export const MAX_POINTER_BYTES = 4 * 1024;
+export const MAX_CHECKPOINT_BYTES = 256 * 1024;
+export const MAX_TASK_RUN_OBJECT_BYTES = 2 * 1024 * 1024;
+export const MAX_ASSIGNMENT_ARCHIVE_BYTES = 256 * 1024;
+export const MAX_RECOVERABLE_TASK_RUNS = 100;
+export const MAX_RECENT_COMPLETED = 20;
+export const MAX_RECENT_ASSIGNMENT_REFS = 1_000;
+/**
+ * Recovery retains one raw JSONL record at a time. 256 MiB accommodates a
+ * v4 state containing the maximum 100 recoverable 2 MiB TaskRuns plus its
+ * bounded checkpoint metadata, while rejecting unbounded legacy records.
+ */
+export const MAX_RECOVERY_RECORD_BYTES = 256 * 1024 * 1024;
+
 // Defaults for launcher / dispatch
 export const DEFAULT_POLL_INTERVAL_MS = 500;
 export const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60_000;

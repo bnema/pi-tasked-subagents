@@ -113,6 +113,13 @@ describe("ui", () => {
     }
   });
 
+  test("active assignment rows retain their task identity when displayed in place of task rows", () => {
+    const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
+    const assignmentLine = lines.find((line) => line.includes("delegate"));
+
+    expect(assignmentLine).toContain("task");
+  });
+
   test("widget renders task run, group, and active assignment in place of the task text", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
