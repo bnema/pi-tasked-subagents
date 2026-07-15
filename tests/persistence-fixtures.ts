@@ -75,6 +75,7 @@ export function syntheticTaskRun(
       launchRef: {
         runId,
         asyncId: `async-${suffix}`,
+        legacy: true,
         resultPath: `/tmp/example/result-${suffix}.json`,
         assignments: [{
           assignmentId,

@@ -54,19 +54,30 @@ export interface CheckpointManifestV1 {
   updatedAt: number;
 }
 
-export interface AssignmentArchiveV1 {
+interface AssignmentArchiveIdentityV1 {
   assignmentId: string;
   taskRunId: string;
   groupId?: string;
   taskId: string;
   status: AssignmentStatus;
-  summary: string;
-  criteriaEvidence: TaskResultRecord["criteriaEvidence"];
-  artifacts: ArtifactRef[];
-  followUps: string[];
   runId: string;
   resultId?: string;
   resultUnavailableReason?: "missing-legacy-result";
   completedAt: number;
-  detailOmitted?: true;
 }
+
+/** Normal bounded terminal metadata. */
+export interface AssignmentArchiveDetailV1 extends AssignmentArchiveIdentityV1 {
+  summary: string;
+  criteriaEvidence: TaskResultRecord["criteriaEvidence"];
+  artifacts: ArtifactRef[];
+  followUps: string[];
+  detailOmitted?: never;
+}
+
+/** Last-resort archive that retains exact identities but no unbounded detail. */
+export interface AssignmentArchiveMetadataOnlyV1 extends AssignmentArchiveIdentityV1 {
+  detailOmitted: true;
+}
+
+export type AssignmentArchiveV1 = AssignmentArchiveDetailV1 | AssignmentArchiveMetadataOnlyV1;

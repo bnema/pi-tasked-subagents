@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { CheckpointContext, CheckpointResult } from "../src/state/persistence-coordinator.js";
 
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 import type {
@@ -13,6 +14,7 @@ import type {
   RunStatus,
   SetTasksInput,
   SetTasksResult,
+  DurableSubagentRunHandle,
   SubagentRunHandle,
   SubagentRuntime,
   TaskAssignmentRecord,
@@ -34,6 +36,7 @@ interface TaskRunControllerApi {
   cancelActiveRuns(): Promise<number>;
   clear(scope?: "completed" | "all", targetId?: string): Promise<number>;
   handleUserAsk(prompt: string, ctx?: unknown): Promise<unknown>;
+  flushPersistence(ctx?: unknown): Promise<void>;
   awaitLastWork(): Promise<void>;
   restoreState(state: TaskedSubagentsState): void;
   reconcileRestoredRuns(ctx?: unknown): void;
@@ -57,12 +60,15 @@ class CompletingRuntime implements SubagentRuntime {
   waitHandles: Array<SubagentRunHandle | undefined> = [];
   resultHandles: SubagentRunHandle[] = [];
 
-  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
+  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<DurableSubagentRunHandle> {
     this.requests.push(request);
     return {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
+      asyncDir: `/tmp/async-${request.runId}`,
+      resultId: `result-${request.runId}`,
       resultPath: `/tmp/${request.runId}.json`,
+      resultReservationPath: `/tmp/${request.runId}.json.reservation`,
       assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
     };
   }
@@ -309,7 +315,7 @@ class LaunchControlledRuntime extends CompletingRuntime {
     this.launchStartedResolve = resolve;
   });
 
-  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
+  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<DurableSubagentRunHandle> {
     this.requests.push(request);
     this.launchStartedResolve();
     await new Promise<void>((resolve) => {
@@ -318,7 +324,10 @@ class LaunchControlledRuntime extends CompletingRuntime {
     return {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
+      asyncDir: `/tmp/async-${request.runId}`,
+      resultId: `result-${request.runId}`,
       resultPath: `/tmp/${request.runId}.json`,
+      resultReservationPath: `/tmp/${request.runId}.json.reservation`,
       assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
     };
   }
@@ -340,10 +349,10 @@ class LaunchRejectControlledRuntime extends CompletingRuntime {
     this.launchStartedResolve = resolve;
   });
 
-  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
+  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<DurableSubagentRunHandle> {
     this.requests.push(request);
     this.launchStartedResolve();
-    return new Promise<SubagentRunHandle>((_resolve, reject) => {
+    return new Promise<DurableSubagentRunHandle>((_resolve, reject) => {
       this.launchReject = reject;
     });
   }
@@ -357,7 +366,7 @@ class MultiLaunchControlledRuntime extends CompletingRuntime {
   cancelled: SubagentRunHandle[] = [];
   private readonly launchResolvers: Array<() => void> = [];
 
-  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<SubagentRunHandle> {
+  async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<DurableSubagentRunHandle> {
     this.requests.push(request);
     await new Promise<void>((resolve) => {
       this.launchResolvers.push(resolve);
@@ -365,7 +374,10 @@ class MultiLaunchControlledRuntime extends CompletingRuntime {
     return {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
+      asyncDir: `/tmp/async-${request.runId}`,
+      resultId: `result-${request.runId}`,
       resultPath: `/tmp/${request.runId}.json`,
+      resultReservationPath: `/tmp/${request.runId}.json.reservation`,
       assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
     };
   }
@@ -472,6 +484,15 @@ class PartialCancelRuntime extends CompletingRuntime {
     this.attempted.push(handle.runId);
     if (handle.runId === "run-1") throw new Error("cancel run-1 failed");
     return true;
+  }
+}
+
+class FailedLaunchCancellationRuntime extends CompletingRuntime {
+  cancelled: SubagentRunHandle[] = [];
+
+  async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.cancelled.push(handle);
+    return false;
   }
 }
 
@@ -616,6 +637,58 @@ function markRunLive(controller: TaskRunControllerApi, runId: string): void {
   (controller as unknown as { liveRunIds: Map<string, number> }).liveRunIds.set(runId, 0);
 }
 
+class RecordingPersistence {
+  readonly snapshots: TaskedSubagentsState[] = [];
+  failAt?: number;
+
+  async checkpoint(state: TaskedSubagentsState, _context: CheckpointContext): Promise<CheckpointResult> {
+    this.snapshots.push(structuredClone(state));
+    if (this.failAt === this.snapshots.length) {
+      return { committed: false, dirty: true, error: { code: "pointer_append", message: "durability unavailable" } };
+    }
+    return {
+      committed: true,
+      deduplicated: false,
+      pointer: { version: 5, checkpointId: `${this.snapshots.length}`.padStart(64, "0"), sequence: this.snapshots.length, writtenAt: 1 },
+    };
+  }
+
+  async retryDirty(): Promise<CheckpointResult> {
+    throw new Error("not used by this test");
+  }
+
+  async flush(): Promise<void> {}
+  invalidate(): void {}
+}
+
+class ContextRecordingPersistence extends RecordingPersistence {
+  readonly checkpointContexts: CheckpointContext[] = [];
+  readonly flushContexts: CheckpointContext[] = [];
+
+  override async checkpoint(state: TaskedSubagentsState, context: CheckpointContext): Promise<CheckpointResult> {
+    this.checkpointContexts.push(structuredClone(context));
+    return super.checkpoint(state, context);
+  }
+
+  override async flush(context?: CheckpointContext): Promise<void> {
+    if (context) this.flushContexts.push(structuredClone(context));
+  }
+}
+
+function persistenceContext(sessionId: string, checkpointId: string): unknown {
+  return {
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getEntries: () => [{ customType: "pi-tasked-subagents:state", data: { version: 5, checkpointId, sequence: 1, writtenAt: 1 } }],
+    },
+    ui: {
+      theme: { fg: (_color: string, value: string) => value },
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+  };
+}
+
 const baseSetTasks = {
   taskRunId: "task-run-1",
   title: "Task run",
@@ -629,6 +702,7 @@ function launchRef(): SubagentRunHandle {
   return {
     runId: "run-1",
     asyncId: "async-run-1",
+    legacy: true,
     resultPath: "/tmp/run-1.json",
     assignments: [
       { assignmentId: "a1", runId: "run-1", resultPath: "/tmp/run-1.json" },
@@ -663,6 +737,62 @@ function recoverableState(status: TaskAssignmentRecord["status"] = "attention"):
 }
 
 describe("TaskedSubagentsController TaskRun public API", () => {
+  test("concurrent mutations retain their entry session context through the locked checkpoint", async () => {
+    const persistence = new ContextRecordingPersistence();
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { persistence }));
+    const internals = controller as unknown as {
+      lock: { withLock: (callback: () => unknown | Promise<unknown>) => Promise<unknown> };
+      scheduleDispatch: (taskRunId: string) => Promise<void>;
+    };
+    const withLock = internals.lock.withLock.bind(internals.lock);
+    let releaseFirstLock!: () => void;
+    const firstLockReleased = new Promise<void>((resolve) => { releaseFirstLock = resolve; });
+    let firstLockEnteredResolve!: () => void;
+    const firstLockEntered = new Promise<void>((resolve) => { firstLockEnteredResolve = resolve; });
+    let first = true;
+    internals.lock.withLock = (callback) => {
+      if (!first) return withLock(callback);
+      first = false;
+      return withLock(async () => {
+        firstLockEnteredResolve();
+        await firstLockReleased;
+        return callback();
+      });
+    };
+    internals.scheduleDispatch = () => Promise.resolve();
+
+    const firstContext = persistenceContext("session-a", "a".repeat(64));
+    const secondContext = persistenceContext("session-b", "b".repeat(64));
+    const firstMutation = controller.setTasks({ ...baseSetTasks, taskRunId: "task-run-a" }, firstContext);
+    await firstLockEntered;
+    const secondMutation = controller.setTasks({ ...baseSetTasks, taskRunId: "task-run-b" }, secondContext);
+    releaseFirstLock();
+
+    await Promise.all([firstMutation, secondMutation]);
+    await controller.flushPersistence(firstContext);
+
+    expect(persistence.checkpointContexts).toEqual([
+      { sessionId: "session-a", visiblePointers: [{ version: 5, checkpointId: "a".repeat(64), sequence: 1, writtenAt: 1 }] },
+      { sessionId: "session-b", visiblePointers: [{ version: 5, checkpointId: "b".repeat(64), sequence: 1, writtenAt: 1 }] },
+    ]);
+    expect(persistence.flushContexts).toEqual([
+      { sessionId: "session-a", visiblePointers: [{ version: 5, checkpointId: "a".repeat(64), sequence: 1, writtenAt: 1 }] },
+    ]);
+  });
+
+  test("uses the last live context when flushing without a call context", async () => {
+    const persistence = new ContextRecordingPersistence();
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { persistence }));
+    const context = persistenceContext("session-retained", "c".repeat(64));
+
+    await controller.setTasks({ ...baseSetTasks, taskRunId: "task-run-retained", wait: true }, context);
+    await controller.flushPersistence();
+
+    expect(persistence.flushContexts).toEqual([
+      { sessionId: "session-retained", visiblePointers: [{ version: 5, checkpointId: "c".repeat(64), sequence: 1, writtenAt: 1 }] },
+    ]);
+  });
+
   test("setTasks creates a TaskRun and dispatches assignments with taskRunId prompts", async () => {
     const runtime = new CompletingRuntime();
     const { controller } = controllerWith(runtime);
@@ -1299,6 +1429,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     const secondRef: SubagentRunHandle = {
       runId: "run-2",
       asyncId: "async-run-2",
+      legacy: true,
       resultPath: "/tmp/run-2.json",
       assignments: [
         { assignmentId: "b1", runId: "run-2", resultPath: "/tmp/run-2.json" },
@@ -1587,6 +1718,137 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     await controller.awaitLastWork();
 
     expect(controller.getState().currentTaskRunId).toBe("task-run-relaunch");
+  });
+
+  test("awaits durable structural, launch, and terminal boundaries while keeping progress UI-only", async () => {
+    const pi = fakePi();
+    const runtime = new CompletedProgressNoResultRuntime();
+    const persistence = new RecordingPersistence();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { runtime, persistence } as never));
+
+    await controller.setTasks({ ...baseSetTasks, wait: true });
+
+    expect(persistence.snapshots).toHaveLength(4);
+    expect(persistence.snapshots[0].taskRuns[0].assignments).toHaveLength(0);
+    expect(persistence.snapshots[1].taskRuns[0].assignments[0]).toMatchObject({ status: "queued" });
+    expect(persistence.snapshots[2].taskRuns[0].assignments[0]).toMatchObject({ status: "running", launchRef: expect.any(Object) });
+    expect(persistence.snapshots[3].taskRuns[0].assignments[0]).toMatchObject({ status: "attention" });
+    expect(controller.getState().taskRuns[0].assignments[0].status).toBe("attention");
+    expect(pi.appendEntry).not.toHaveBeenCalled();
+  });
+
+  test("cancels and rolls back a spawned launch when launch-handle durability fails", async () => {
+    const pi = fakePi();
+    const runtime = new LaunchControlledRuntime();
+    const persistence = new RecordingPersistence();
+    persistence.failAt = 3;
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { runtime, persistence } as never));
+
+    const request = controller.setTasks({ ...baseSetTasks, wait: true });
+    await runtime.launchStarted;
+    runtime.releaseLaunch();
+    await request;
+
+    expect(runtime.cancelled).toHaveLength(1);
+    const assignment = controller.getState().taskRuns[0].assignments[0];
+    expect(assignment).toMatchObject({ status: "queued" });
+    expect(assignment.launchRef).toBeUndefined();
+    expect(pi.appendEntry).not.toHaveBeenCalled();
+  });
+
+  test("does not claim cancellation or checkpoint queued compensation when post-spawn cancellation fails", async () => {
+    const runtime = new FailedLaunchCancellationRuntime();
+    const persistence = new RecordingPersistence();
+    persistence.failAt = 2;
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { runtime, persistence } as never));
+    controller.restoreState({
+      version: 4,
+      currentTaskRunId: "task-run-1",
+      updatedAt: 1,
+      taskRuns: [{
+        id: "task-run-1",
+        title: "Task run",
+        request: "Ship it",
+        context: "Context",
+        status: "pending",
+        groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 }],
+        tasks: [{ id: "task", groupId: "main", text: "Do task", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 }],
+        assignments: [],
+        artifacts: [],
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    });
+
+    await expect(controller.dispatchReady({ taskRunId: "task-run-1" })).resolves.toMatchObject({
+      launched: 0,
+      hasBlockingIssue: true,
+      errors: [expect.stringContaining("Could not cancel")],
+    });
+
+    expect(runtime.cancelled).toHaveLength(1);
+    expect(persistence.snapshots).toHaveLength(2);
+    expect(controller.getState().taskRuns[0].assignments[0]).toMatchObject({
+      status: "running",
+      runId: runtime.requests[0].runId,
+      launchRef: expect.objectContaining({ runId: runtime.requests[0].runId }),
+    });
+    expect(liveRunIds(controller).has(runtime.requests[0].runId)).toBe(true);
+  });
+
+  test("preflights oversized structural mutations without changing controller state", async () => {
+    const runtime = new CompletingRuntime();
+    const { controller } = controllerWith(runtime);
+    await controller.setTasks({ ...baseSetTasks, wait: true });
+    const initial = controller.getState();
+    const oversized = "x".repeat(2 * 1024 * 1024);
+
+    await expect(controller.patchTaskRun({ taskRunId: "task-run-1", tasks: [{ id: "large", group: "main", text: oversized, criteria: ["Done"] }] }))
+      .resolves.toMatchObject({ patched: false, dispatchScheduled: false, errors: [expect.stringContaining("2 MiB")] });
+    expect(controller.getState()).toEqual(initial);
+
+    await expect(controller.editTask({ taskRunId: "task-run-1", targetId: "task", task: { text: oversized } }))
+      .resolves.toMatchObject({ edited: false, dispatchScheduled: false, errors: [expect.stringContaining("2 MiB")] });
+    expect(controller.getState()).toEqual(initial);
+
+    controller.restoreState(recoverableState());
+    const recoverableInitial = controller.getState();
+    await expect(controller.editGroup({ taskRunId: "task-run-1", targetId: "main", group: { title: oversized } }))
+      .resolves.toMatchObject({ edited: false, dispatchScheduled: false, errors: [expect.stringContaining("2 MiB")] });
+    expect(controller.getState()).toEqual(recoverableInitial);
+
+    await expect(controller.continueTarget("attention", oversized)).resolves.toBe(false);
+    expect(controller.getState()).toEqual(recoverableInitial);
+    await expect(controller.resolveTarget("attention", oversized)).resolves.toBe(false);
+    expect(controller.getState()).toEqual(recoverableInitial);
+  });
+
+  test("rejects a missing session persistence context before it reaches the coordinator", async () => {
+    const { controller } = controllerWith(new CompletingRuntime());
+
+    await expect(controller.flushPersistence({})).rejects.toThrow("Checkpoint context has no active session");
+  });
+
+  test("preflights oversized setTasks and more than 100 recoverable runs before mutating", async () => {
+    const { controller } = controllerWith(new CompletingRuntime());
+    const oversized = "x".repeat(2 * 1024 * 1024);
+    await expect(controller.setTasks({ ...baseSetTasks, context: oversized }))
+      .resolves.toMatchObject({ accepted: false, dispatchScheduled: false, errors: [expect.stringContaining("2 MiB")] });
+    expect(controller.getState()).toEqual({ version: 4, taskRuns: [], updatedAt: expect.any(Number) });
+
+    const seeded = recoverableState();
+    seeded.taskRuns = Array.from({ length: 100 }, (_, index) => {
+      const run = structuredClone(recoverableState().taskRuns[0]);
+      run.id = `task-run-${index}`;
+      return run;
+    });
+    seeded.currentTaskRunId = seeded.taskRuns[0].id;
+    controller.restoreState(seeded);
+    const before = controller.getState();
+
+    await expect(controller.setTasks({ ...baseSetTasks, taskRunId: "task-run-101" }))
+      .resolves.toMatchObject({ accepted: false, dispatchScheduled: false, errors: [expect.stringContaining("more than 100")] });
+    expect(controller.getState()).toEqual(before);
   });
 
   test("clear all rejects new TaskRuns while active cancellation is in progress", async () => {

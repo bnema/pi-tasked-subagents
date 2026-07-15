@@ -203,15 +203,21 @@ function normalizeLaunchRef(raw: unknown, assignmentId: string, assignmentRunId?
   if (!assignments.some((entry) => entry.assignmentId === assignmentId)) {
     assignments.push({ assignmentId, runId, ...(resultPath ? { resultPath } : {}) });
   }
-  return {
+  const resultId = optionalString(input.resultId);
+  const resultReservationPath = optionalString(input.resultReservationPath);
+  const asyncDir = optionalString(input.asyncDir);
+  const common = {
     runId,
     asyncId,
-    ...(optionalString(input.asyncDir) ? { asyncDir: optionalString(input.asyncDir) } : {}),
-    ...(resultPath ? { resultPath } : {}),
+    ...(asyncDir ? { asyncDir } : {}),
     ...(optionalString(input.sessionFile) ? { sessionFile: optionalString(input.sessionFile) } : {}),
     ...(optionalString(input.artifactPath) ? { artifactPath: optionalString(input.artifactPath) } : {}),
     assignments,
   };
+  if (asyncDir && resultId && resultPath && resultReservationPath) {
+    return { ...common, asyncDir, resultId, resultPath, resultReservationPath };
+  }
+  return { ...common, legacy: true, ...(resultPath ? { resultPath } : {}) };
 }
 
 function normalizeCriteriaEvidence(raw: unknown): TaskResultRecord["criteriaEvidence"][number] | undefined {

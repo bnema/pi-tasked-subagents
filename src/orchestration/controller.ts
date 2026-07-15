@@ -37,6 +37,15 @@ import type {
 import { PiRunnerAdapter } from "../launcher/pi-runner-adapter.js";
 import type { RunnerRuntimeContext } from "../launcher/interface.js";
 import { cloneState, createEmptyState, createStateLock, ensureState } from "../state/store.js";
+import { DurableObjectStore } from "../state/object-store.js";
+import { buildCheckpointProjection } from "../state/durable-projection.js";
+import {
+  PersistenceCoordinator,
+  type CheckpointContext,
+  type CheckpointResult,
+} from "../state/persistence-coordinator.js";
+import type { StatePointerV5 } from "../state/durable-types.js";
+import { resolveStorageRoot } from "../state/storage-paths.js";
 import { normalizeTaskRunInput, validateTaskRunInput } from "../state/task-run-validation.js";
 import { statusLabel } from "../ui/messages.js";
 import { buildFooterStatus } from "../ui/status.js";
@@ -73,10 +82,27 @@ export interface DispatchResult {
   hasBlockingIssue: boolean;
 }
 
+export interface ControllerPersistence {
+  checkpoint(state: TaskedSubagentsState, context: CheckpointContext): Promise<CheckpointResult>;
+  retryDirty(context: CheckpointContext): Promise<CheckpointResult>;
+  flush(context: CheckpointContext): Promise<void>;
+  invalidate(epoch: number): void;
+}
+
 export interface TaskedSubagentsControllerOptions {
   runtime?: SubagentRuntime<RunnerRuntimeContext>;
   launcher?: SubagentRuntime<RunnerRuntimeContext>;
   defaultAgent?: string;
+  /** Injectable coordinator boundary for tests and extension lifecycle wiring. */
+  persistence?: ControllerPersistence;
+  dataRoot?: string;
+}
+
+export class PersistenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PersistenceError";
+  }
 }
 
 const DEFAULT_OPTIONS = {
@@ -234,11 +260,14 @@ export class TaskedSubagentsController {
   private readonly runtime: SubagentRuntime<RunnerRuntimeContext>;
   private readonly defaultAgent: string;
   private readonly pi: ExtensionAPI;
+  private readonly persistence: ControllerPersistence;
   private taskRunCounter = 0;
   private lastContext: ExtensionContext | undefined;
   private lastDispatchWork: Promise<void> = Promise.resolve();
   private readonly scheduledDispatches = new Map<string, Promise<void>>();
   private readonly runProgressSignatures = new Map<string, string>();
+  /** Ephemeral polling hint used only to present an ambiguous failed wait. */
+  private readonly terminalProgressAssignmentIds = new Set<string>();
   private readonly liveRunIds = new Map<string, number>();
   private readonly launchingRuns = new Map<string, string[]>();
   private readonly cancellationRequestedRunIds = new Set<string>();
@@ -251,6 +280,11 @@ export class TaskedSubagentsController {
     this.pi = pi;
     this.runtime = options?.runtime ?? options?.launcher ?? DEFAULT_OPTIONS.runtime;
     this.defaultAgent = options?.defaultAgent ?? DEFAULT_OPTIONS.defaultAgent;
+    this.persistence = options?.persistence ?? new PersistenceCoordinator(
+      new DurableObjectStore(resolveStorageRoot({ dataRoot: options?.dataRoot })),
+      { append: (pointer) => this.pi.appendEntry(ENTRY_TYPE_STATE, pointer) },
+      { dataRoot: resolveStorageRoot({ dataRoot: options?.dataRoot }) },
+    );
   }
 
   getState(): TaskedSubagentsState {
@@ -261,6 +295,7 @@ export class TaskedSubagentsController {
     this.state = ensureState(state);
     this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
     this.runProgressSignatures.clear();
+    this.terminalProgressAssignmentIds.clear();
     this.liveRunIds.clear();
     this.launchingRuns.clear();
     this.cancellationRequestedRunIds.clear();
@@ -269,11 +304,13 @@ export class TaskedSubagentsController {
     this.scheduledDispatches.clear();
     this.lastDispatchWork = Promise.resolve();
     this.stateEpoch += 1;
+    this.persistence.invalidate(this.stateEpoch);
     this.dispatchRunCounter = Math.max(this.dispatchRunCounter, maxDispatchRunCounter(this.state.taskRuns));
   }
 
   reconcileRestoredRuns(ctx?: ExtensionContext): void {
     if (ctx) this.lastContext = ctx;
+    const checkpointContext = this.checkpointContext(ctx);
     const expectedEpoch = this.stateEpoch;
     const runtimeCtx = this.runtimeContext(ctx ?? this.lastContext);
     const reconciledRunIds = new Set<string>();
@@ -287,7 +324,7 @@ export class TaskedSubagentsController {
         if (!assignment.runId || assignment.runId !== handle.runId) continue;
         if (this.liveRunIds.has(handle.runId) || reconciledRunIds.has(handle.runId)) continue;
         reconciledRunIds.add(handle.runId);
-        const watcher = this.watchRestoredRun(taskRun.id, handle, expectedEpoch, runtimeCtx, ctx ?? this.lastContext);
+        const watcher = this.watchRestoredRun(taskRun.id, handle, expectedEpoch, runtimeCtx, ctx ?? this.lastContext, checkpointContext);
         const grouped = watchersByTaskRun.get(taskRun.id) ?? [];
         grouped.push(watcher);
         watchersByTaskRun.set(taskRun.id, grouped);
@@ -357,7 +394,8 @@ export class TaskedSubagentsController {
 
   async setTasks(input: SetTasksInput, ctx?: ExtensionContext): Promise<SetTasksResult> {
     if (ctx) this.lastContext = ctx;
-    const result = await this.lock.withLock(() => {
+    const checkpointContext = this.checkpointContext(ctx);
+    const result = await this.lock.withLock(async () => {
       if (this.clearAllInProgress) return { accepted: false, errors: ["Clear all is in progress"], dispatchScheduled: false } satisfies SetTasksResult;
       const errors = validateTaskRunInput(input);
       if (errors.length > 0) return { accepted: false, errors, dispatchScheduled: false } satisfies SetTasksResult;
@@ -366,15 +404,22 @@ export class TaskedSubagentsController {
       const normalized = normalizeTaskRunInput(input, { taskRunId });
       if (!normalized.taskRun) return { accepted: false, errors: normalized.errors, dispatchScheduled: false } satisfies SetTasksResult;
 
+      const candidate = cloneState(this.state);
+      const candidateIndex = candidate.taskRuns.findIndex((taskRun) => taskRun.id === normalized.taskRun!.id);
+      if (candidateIndex >= 0) candidate.taskRuns[candidateIndex] = normalized.taskRun;
+      else candidate.taskRuns.push(normalized.taskRun);
+      candidate.currentTaskRunId = normalized.taskRun.id;
+      candidate.updatedAt = normalized.taskRun.updatedAt;
+      const projectionError = this.preflightCheckpoint(candidate);
+      if (projectionError) return { accepted: false, errors: [projectionError], dispatchScheduled: false } satisfies SetTasksResult;
+
       this.stateEpoch += 1;
-      const existingIndex = this.state.taskRuns.findIndex((candidate) => candidate.id === normalized.taskRun!.id);
-      if (existingIndex >= 0) this.state.taskRuns[existingIndex] = normalized.taskRun;
-      else this.state.taskRuns.push(normalized.taskRun);
+      // The preflight candidate is the complete validated transition, so
+      // install it rather than duplicating the live mutation.
+      this.state = candidate;
       this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
-      this.state.currentTaskRunId = normalized.taskRun.id;
-      this.state.updatedAt = normalized.taskRun.updatedAt;
       if (input.wait) this.suppressTaskRunSignal(normalized.taskRun.id);
-      this.persistState();
+      await this.checkpointState(checkpointContext);
       this.updateUI(ctx ?? this.lastContext);
       return { accepted: true, taskRunId: normalized.taskRun.id, errors: [], dispatchScheduled: true } satisfies SetTasksResult;
     });
@@ -394,7 +439,8 @@ export class TaskedSubagentsController {
 
   async editTask(input: EditTaskInput, ctx?: ExtensionContext): Promise<EditTaskResult> {
     if (ctx) this.lastContext = ctx;
-    const result = await this.lock.withLock(() => this.editTaskMutable(input, ctx));
+    const checkpointContext = this.checkpointContext(ctx);
+    const result = await this.lock.withLock(() => this.editTaskMutable(input, ctx, checkpointContext));
     if (result.edited && result.dispatchScheduled && result.taskRunId) {
       const work = this.scheduleDispatch(result.taskRunId, ctx, { emitTerminalSignal: !input.wait });
       if (input.wait) {
@@ -410,7 +456,8 @@ export class TaskedSubagentsController {
 
   async patchTaskRun(input: PatchTaskRunInput, ctx?: ExtensionContext): Promise<PatchTaskRunResult> {
     if (ctx) this.lastContext = ctx;
-    const result = await this.lock.withLock(() => this.patchTaskRunMutable(input, ctx));
+    const checkpointContext = this.checkpointContext(ctx);
+    const result = await this.lock.withLock(() => this.patchTaskRunMutable(input, ctx, checkpointContext));
     if (result.patched && result.dispatchScheduled && result.taskRunId) {
       const work = this.scheduleDispatch(result.taskRunId, ctx, { emitTerminalSignal: !input.wait });
       if (input.wait) {
@@ -426,7 +473,8 @@ export class TaskedSubagentsController {
 
   async editGroup(input: EditGroupInput, ctx?: ExtensionContext): Promise<EditGroupResult> {
     if (ctx) this.lastContext = ctx;
-    const result = await this.lock.withLock(() => this.editGroupMutable(input, ctx));
+    const checkpointContext = this.checkpointContext(ctx);
+    const result = await this.lock.withLock(() => this.editGroupMutable(input, ctx, checkpointContext));
     if (result.edited && result.dispatchScheduled && result.taskRunId) {
       const work = this.scheduleDispatch(result.taskRunId, ctx, { emitTerminalSignal: !input.wait });
       if (input.wait) {
@@ -442,12 +490,13 @@ export class TaskedSubagentsController {
 
   async dispatchReady(options: DispatchOptions = {}): Promise<DispatchResult> {
     if (options.ctx) this.lastContext = options.ctx;
+    const checkpointContext = this.checkpointContext(options.ctx);
     const aggregate: DispatchResult = { launched: 0, skipped: 0, errors: [], hasBlockingIssue: false };
     const runtimeCtx = this.runtimeContext(options.ctx);
     const dispatchEpoch = this.stateEpoch;
 
     while (true) {
-      const launch = await this.lock.withLock(() => {
+      const launch = await this.lock.withLock(async () => {
         if (this.clearAllInProgress || this.stateEpoch !== dispatchEpoch) return undefined;
         const taskRun = this.resolveTaskRunMutable(options.taskRunId);
         if (!taskRun) return undefined;
@@ -459,10 +508,13 @@ export class TaskedSubagentsController {
         aggregate.hasBlockingIssue ||= scheduled.hasBlockingIssue;
         if (scheduled.assignments.length === 0) {
           deriveTaskRunStatus(taskRun);
-          this.persistState();
+          await this.checkpointState(checkpointContext);
           this.updateUI(options.ctx ?? this.lastContext);
           return undefined;
         }
+        // Assignment creation is structural: it must be durable before a
+        // child can observe or depend on the queued work.
+        await this.checkpointState(checkpointContext);
         const runId = this.nextDispatchRunId(taskRun.id);
         this.launchingRuns.set(runId, scheduled.assignments.map((assignment) => assignment.id));
         return { taskRunId: taskRun.id, runId, title: taskRun.title, maxConcurrency: taskRun.maxConcurrency, assignments: scheduled.assignments };
@@ -471,6 +523,7 @@ export class TaskedSubagentsController {
       if (!launch) return aggregate;
 
       let ref: SubagentRunHandle | undefined;
+      let preserveLiveRunForReconciliation = false;
       try {
         const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
         if (!taskRun) return aggregate;
@@ -494,25 +547,37 @@ export class TaskedSubagentsController {
           await this.runtime.cancelRun(launchedRef, runtimeCtx).catch((cancelError: unknown) => {
             console.error(`[${PACKAGE_NAME}] failed to cancel stale dispatch:`, cancelError);
           });
-          await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext);
+          await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext, checkpointContext);
           return aggregate;
         }
 
-        const commit = await this.lock.withLock(() => {
+        let failedLaunchCommit: Array<{ stored: TaskAssignmentRecord; status: TaskAssignmentRecord["status"]; runId: string | undefined; launchRef: SubagentRunHandle | undefined; updatedAt: number }> | undefined;
+        const commit = await this.lock.withLock(async () => {
           if (this.cancellationRequestedRunIds.delete(launchedRef.runId)) return "cancelled" as const;
           if (this.stateEpoch !== dispatchEpoch) return "stale" as const;
           const current = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
           if (!current) return "stale" as const;
-          for (const assignment of launch.assignments) {
+          const previous = launch.assignments.map((assignment) => {
             const stored = current.assignments.find((candidate) => candidate.id === assignment.id);
-            if (!stored) continue;
-            stored.status = "running";
-            stored.runId = launchedRef.runId;
-            stored.launchRef = launchedRef;
-            stored.updatedAt = Date.now();
+            return stored ? { stored, status: stored.status, runId: stored.runId, launchRef: stored.launchRef, updatedAt: stored.updatedAt } : undefined;
+          }).filter((entry): entry is { stored: TaskAssignmentRecord; status: TaskAssignmentRecord["status"]; runId: string | undefined; launchRef: SubagentRunHandle | undefined; updatedAt: number } => Boolean(entry));
+          for (const entry of previous) {
+            entry.stored.status = "running";
+            entry.stored.runId = launchedRef.runId;
+            entry.stored.launchRef = launchedRef;
+            entry.stored.updatedAt = Date.now();
           }
           deriveTaskRunStatus(current);
-          this.persistState();
+          try {
+            await this.checkpointState(checkpointContext);
+          } catch {
+            // The child is live. Keep its handle and running status in memory
+            // until cancellation succeeds, so a failed cancellation remains
+            // reconcilable instead of being falsely represented as queued.
+            failedLaunchCommit = previous;
+            this.updateUI(options.ctx ?? this.lastContext);
+            return "persistence-failed" as const;
+          }
           this.updateUI(options.ctx ?? this.lastContext);
           return "committed" as const;
         });
@@ -522,7 +587,40 @@ export class TaskedSubagentsController {
             return false;
           });
           if (commit === "cancelled" && !cancelled) throw new Error(`Could not cancel launching subagent run ${launchedRef.runId}`);
-          if (commit === "stale") await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext);
+          if (commit === "stale") await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext, checkpointContext);
+          if (commit === "persistence-failed") {
+            if (!cancelled) {
+              preserveLiveRunForReconciliation = true;
+              aggregate.errors.push(`Could not cancel spawned subagent run ${launchedRef.runId} after launch-handle durability failed; launch remains reconcilable`);
+              aggregate.hasBlockingIssue = true;
+              return aggregate;
+            }
+            // Only a confirmed child cancellation permits compensation back to
+            // queued state. A failed checkpoint remains dirty for retry.
+            try {
+              await this.lock.withLock(async () => {
+                const current = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
+                if (!current || this.stateEpoch !== dispatchEpoch) return;
+                for (const entry of failedLaunchCommit ?? []) {
+                  if (entry.stored.runId !== launchedRef.runId) continue;
+                  entry.stored.status = entry.status;
+                  entry.stored.runId = entry.runId;
+                  entry.stored.launchRef = entry.launchRef;
+                  entry.stored.updatedAt = entry.updatedAt;
+                }
+                deriveTaskRunStatus(current);
+                await this.checkpointState(checkpointContext);
+                this.updateUI(options.ctx ?? this.lastContext);
+              });
+            } catch (error) {
+              aggregate.errors.push(error instanceof Error ? error.message : String(error));
+              aggregate.hasBlockingIssue = true;
+              return aggregate;
+            }
+            aggregate.errors.push("Launch handle could not be made durable; spawned run was cancelled");
+            aggregate.hasBlockingIssue = true;
+            return aggregate;
+          }
           return aggregate;
         }
         aggregate.launched += launch.assignments.length;
@@ -538,15 +636,16 @@ export class TaskedSubagentsController {
           raw,
           dispatchEpoch,
           options.ctx ?? this.lastContext,
+          checkpointContext,
           options.emitTerminalSignal !== false,
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         aggregate.errors.push(message);
         aggregate.hasBlockingIssue = true;
-        if (this.stateEpoch !== dispatchEpoch) await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext);
+        if (this.stateEpoch !== dispatchEpoch) await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext, checkpointContext);
         let failureSignal: TaskRunRecord | undefined;
-        if (this.stateEpoch === dispatchEpoch) await this.lock.withLock(() => {
+        if (this.stateEpoch === dispatchEpoch) await this.lock.withLock(async () => {
           if (this.stateEpoch !== dispatchEpoch) return;
           const taskRun = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
           if (!taskRun) return;
@@ -555,9 +654,10 @@ export class TaskedSubagentsController {
             const stored = taskRun.assignments.find((candidate) => candidate.id === assignment.id);
             if (!stored) continue;
             if (ref && stored.runId !== ref.runId) continue;
-            if (stored.status === "completed" && !stored.result) {
+            if ((stored.status === "completed" && !stored.result) || this.terminalProgressAssignmentIds.has(stored.id)) {
               stored.status = "attention";
               stored.updatedAt = timestamp;
+              stored.completedAt = undefined;
               continue;
             }
             if (stored.status !== "queued" && stored.status !== "running") continue;
@@ -567,7 +667,7 @@ export class TaskedSubagentsController {
           }
           deriveTaskRunStatus(taskRun);
           failureSignal = cloneState({ version: 4, taskRuns: [taskRun], currentTaskRunId: taskRun.id, updatedAt: taskRun.updatedAt }).taskRuns[0];
-          this.persistState();
+          await this.checkpointState(checkpointContext);
           this.updateUI(options.ctx ?? this.lastContext);
         });
         const failureIsTerminal = failureSignal?.status !== "running" && failureSignal?.status !== "pending";
@@ -577,7 +677,7 @@ export class TaskedSubagentsController {
       } finally {
         this.launchingRuns.delete(launch.runId);
         this.cancellationRequestedRunIds.delete(launch.runId);
-        if (ref) this.releaseLiveRun(ref.runId, dispatchEpoch);
+        if (ref && !preserveLiveRunForReconciliation) this.releaseLiveRun(ref.runId, dispatchEpoch);
       }
       if (this.stateEpoch !== dispatchEpoch) return aggregate;
       const shouldContinue = this.state.taskRuns
@@ -593,6 +693,7 @@ export class TaskedSubagentsController {
     expectedEpoch: number,
     runtimeCtx: RunnerRuntimeContext,
     ctx: ExtensionContext | undefined,
+    checkpointContext: CheckpointContext,
   ): Promise<void> {
     if (this.stateEpoch !== expectedEpoch) return;
     this.liveRunIds.set(handle.runId, expectedEpoch);
@@ -601,7 +702,7 @@ export class TaskedSubagentsController {
       if (this.stateEpoch !== expectedEpoch) return;
       const raw = await this.runtime.getRunResult(handle);
       if (this.stateEpoch !== expectedEpoch) return;
-      await this.applyRunOutcome(taskRunId, handle.runId, status, raw, expectedEpoch, ctx);
+      await this.applyRunOutcome(taskRunId, handle.runId, status, raw, expectedEpoch, ctx, checkpointContext);
     } catch (error) {
       console.error(`[${PACKAGE_NAME}] failed to reconcile restored run ${handle.runId}:`, error);
     } finally {
@@ -653,29 +754,32 @@ export class TaskedSubagentsController {
   }
 
   async stopRun(assignmentId: string): Promise<boolean> {
+    const checkpointContext = this.checkpointContext();
     const target = this.resolveControllableHandleForAssignment(assignmentId, "stop");
     if (!target) return false;
     const ok = await this.runtime.stopRun(target.handle, this.runtimeContext(this.lastContext));
     if (!ok) return false;
-    await this.markRunStatus(target.handle.runId, "paused");
+    await this.markRunStatus(target.handle.runId, "paused", checkpointContext);
     return true;
   }
 
   async cancelRun(assignmentId: string): Promise<boolean> {
+    const checkpointContext = this.checkpointContext();
     const target = this.resolveControllableHandleForAssignment(assignmentId, "cancel");
     if (!target) return false;
     if (!target.live) {
-      await this.markRunStatus(target.handle.runId, "cancelled");
+      await this.markRunStatus(target.handle.runId, "cancelled", checkpointContext);
       return true;
     }
     const ok = await this.runtime.cancelRun(target.handle, this.runtimeContext(this.lastContext));
     if (!ok) return false;
-    await this.markRunStatus(target.handle.runId, "cancelled");
+    await this.markRunStatus(target.handle.runId, "cancelled", checkpointContext);
     return true;
   }
 
   async cancelActiveRuns(): Promise<number> {
-    const { assignmentIds, launchingRunIds } = await this.lock.withLock(() => {
+    const checkpointContext = this.checkpointContext();
+    const { assignmentIds, launchingRunIds } = await this.lock.withLock(async () => {
       const assignmentIds: string[] = [];
       const runIds = new Set<string>();
       for (const taskRun of this.state.taskRuns) {
@@ -704,7 +808,7 @@ export class TaskedSubagentsController {
           if (changed) deriveTaskRunStatus(taskRun, timestamp);
         }
         for (const runId of launchingRunIds) this.cancellationRequestedRunIds.add(runId);
-        this.persistState();
+        await this.checkpointState(checkpointContext);
         this.updateUI(this.lastContext);
       }
       return { assignmentIds, launchingRunIds };
@@ -735,6 +839,7 @@ export class TaskedSubagentsController {
   }
 
   async clear(scope: "completed" | "all" = "completed", targetId?: string): Promise<number> {
+    const checkpointContext = this.checkpointContext();
     const normalizedTargetId = normalizeTargetId(targetId);
     const clearEverything = scope === "all" && !normalizedTargetId;
     if (clearEverything) {
@@ -747,7 +852,7 @@ export class TaskedSubagentsController {
 
       try {
         await this.cancelActiveRuns();
-        return await this.lock.withLock(() => {
+        return await this.lock.withLock(async () => {
           const removed = this.state.taskRuns.length;
           this.stateEpoch += 1;
           this.state = createEmptyState();
@@ -757,7 +862,7 @@ export class TaskedSubagentsController {
           this.scheduledDispatches.clear();
           this.lastDispatchWork = Promise.resolve();
           this.clearAllInProgress = false;
-          this.persistState();
+          await this.checkpointState(checkpointContext);
           this.updateUI(this.lastContext);
           return removed;
         });
@@ -769,7 +874,7 @@ export class TaskedSubagentsController {
       }
     }
 
-    return this.lock.withLock(() => {
+    return this.lock.withLock(async () => {
       const before = this.state.taskRuns.length;
       if (normalizedTargetId) {
         const taskRunId = this.resolveTaskRunIdForTarget(normalizedTargetId);
@@ -785,18 +890,58 @@ export class TaskedSubagentsController {
       }
       this.state.updatedAt = Date.now();
       const removed = before - this.state.taskRuns.length;
-      this.persistState();
+      await this.checkpointState(checkpointContext);
       this.updateUI(this.lastContext);
       return removed;
     });
   }
 
-  persistState(): void {
-    try {
-      this.pi.appendEntry(ENTRY_TYPE_STATE, cloneState(this.state));
-    } catch (error) {
-      console.error(`[${PACKAGE_NAME}] failed to persist state:`, error);
+  /** Reject a candidate before exposing any structural mutation in memory. */
+  private preflightCheckpoint(candidate: TaskedSubagentsState): string | undefined {
+    const projection = buildCheckpointProjection(candidate, []);
+    return projection.ok ? undefined : projection.error.message;
+  }
+
+  /** Persist a bounded v5 pointer. Callers must await this at durable boundaries. */
+  private async checkpointState(context: CheckpointContext): Promise<void> {
+    if (!context.sessionId) throw new PersistenceError("Checkpoint context has no active session");
+    const result = await this.persistence.checkpoint(cloneState(this.state), context);
+    if (!result.committed) throw new PersistenceError(result.error.message);
+  }
+
+  async flushPersistence(ctx?: ExtensionContext): Promise<void> {
+    if (ctx) this.lastContext = ctx;
+    const context = this.checkpointContext(ctx);
+    if (!context.sessionId) throw new PersistenceError("Checkpoint context has no active session");
+    await this.persistence.flush(context);
+  }
+
+  private checkpointContext(ctx?: ExtensionContext): CheckpointContext {
+    // Background controls and shutdown commonly have no per-call context.
+    // Keep their checkpoints tied to the last live Pi session rather than
+    // silently placing them in the package fallback session.
+    const liveContext = ctx ?? this.lastContext;
+    const sessionManager = liveContext?.sessionManager;
+    // A controller used without any extension context retains its isolated
+    // package fallback for non-interactive callers. Once a context is known,
+    // however, a missing session must fail closed at the coordinator boundary.
+    const sessionId = sessionManager?.getSessionId() ?? (liveContext ? "" : PACKAGE_NAME);
+    const entries = sessionManager?.getEntries() ?? [];
+    const visiblePointers: StatePointerV5[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const candidate = entry as { customType?: unknown; data?: unknown };
+      if (candidate.customType !== ENTRY_TYPE_STATE || !this.isStatePointer(candidate.data)) continue;
+      visiblePointers.push(structuredClone(candidate.data));
     }
+    return { sessionId, visiblePointers };
+  }
+
+  private isStatePointer(value: unknown): value is StatePointerV5 {
+    if (typeof value !== "object" || value === null) return false;
+    const pointer = value as Partial<StatePointerV5>;
+    return pointer.version === 5 && typeof pointer.checkpointId === "string" && /^[a-f0-9]{64}$/u.test(pointer.checkpointId) &&
+      Number.isSafeInteger(pointer.sequence) && typeof pointer.writtenAt === "number";
   }
 
   updateUI(ctx: ExtensionContext | undefined): void {
@@ -834,24 +979,31 @@ export class TaskedSubagentsController {
       counter += 1;
       candidate = `task-run-${counter}`;
     } while (this.state.taskRuns.some((taskRun) => taskRun.id === candidate));
-    this.taskRunCounter = counter;
     return candidate;
   }
 
-  private patchTaskRunMutable(input: PatchTaskRunInput, ctx?: ExtensionContext): PatchTaskRunResult {
+  private async patchTaskRunMutable(input: PatchTaskRunInput, ctx: ExtensionContext | undefined, checkpointContext: CheckpointContext): Promise<PatchTaskRunResult> {
     if (this.clearAllInProgress) return { patched: false, errors: ["Clear all is in progress"], dispatchScheduled: false };
     const taskRun = this.resolveTaskRunMutable(input.taskRunId);
     if (!taskRun) return { patched: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
-    const result = applyTaskRunPatchMutable(taskRun, input, Date.now());
+    const timestamp = Date.now();
+    const candidate = cloneState(this.state);
+    const candidateTaskRun = candidate.taskRuns.find((item) => item.id === taskRun.id);
+    if (!candidateTaskRun) return { patched: false, taskRunId: taskRun.id, errors: ["TaskRun disappeared before patching"], dispatchScheduled: false };
+    const result = applyTaskRunPatchMutable(candidateTaskRun, input, timestamp);
     if (!result.patched) return { patched: false, taskRunId: taskRun.id, errors: result.errors, dispatchScheduled: false };
-    this.state.currentTaskRunId = taskRun.id;
+    candidate.currentTaskRunId = taskRun.id;
+    const projectionError = this.preflightCheckpoint(candidate);
+    if (projectionError) return { patched: false, taskRunId: taskRun.id, errors: [projectionError], dispatchScheduled: false };
+    // The validated candidate is the exact state transition to install.
+    this.state = candidate;
     if (input.wait && result.dispatchScheduled) this.suppressTaskRunSignal(taskRun.id);
-    this.persistState();
+    await this.checkpointState(checkpointContext);
     this.updateUI(ctx ?? this.lastContext);
     return { patched: true, taskRunId: taskRun.id, errors: [], dispatchScheduled: result.dispatchScheduled };
   }
 
-  private editTaskMutable(input: EditTaskInput, ctx?: ExtensionContext): EditTaskResult {
+  private async editTaskMutable(input: EditTaskInput, ctx: ExtensionContext | undefined, checkpointContext: CheckpointContext): Promise<EditTaskResult> {
     if (this.clearAllInProgress) return { edited: false, errors: ["Clear all is in progress"], dispatchScheduled: false };
     const taskRun = this.resolveTaskRunMutable(input.taskRunId);
     if (!taskRun) return { edited: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
@@ -870,6 +1022,33 @@ export class TaskedSubagentsController {
     const timestamp = Date.now();
     const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
     if (!normalized.taskRun) return { edited: false, taskRunId: taskRun.id, taskId: targetId, errors: normalized.errors, dispatchScheduled: false };
+
+    const candidateState = cloneState(this.state);
+    const candidateTaskRun = candidateState.taskRuns.find((item) => item.id === taskRun.id)!;
+    const candidateOldTask = candidateTaskRun.tasks[taskIndex];
+    const candidateNextTask = structuredClone(normalized.taskRun.tasks[taskIndex]);
+    candidateNextTask.status = "ready";
+    candidateNextTask.assignmentIds = [];
+    candidateNextTask.completedAt = undefined;
+    candidateNextTask.createdAt = candidateOldTask.createdAt;
+    candidateNextTask.updatedAt = timestamp;
+    candidateTaskRun.tasks[taskIndex] = candidateNextTask;
+    const candidateAssignmentIds = new Set(candidateOldTask.assignmentIds);
+    candidateTaskRun.assignments = candidateTaskRun.assignments.filter((assignment) => assignment.taskId !== candidateOldTask.id && !candidateAssignmentIds.has(assignment.id));
+    candidateTaskRun.artifacts = candidateTaskRun.artifacts.filter((artifact) => artifact.taskId !== candidateOldTask.id && !candidateAssignmentIds.has(artifact.assignmentId));
+    const candidateGroup = candidateNextTask.groupId ? candidateTaskRun.groups.find((item) => item.id === candidateNextTask.groupId) : undefined;
+    if (candidateGroup) {
+      candidateGroup.status = "ready";
+      candidateGroup.completedAt = undefined;
+      candidateGroup.updatedAt = timestamp;
+    }
+    candidateTaskRun.status = "running";
+    candidateTaskRun.completedAt = undefined;
+    candidateTaskRun.updatedAt = timestamp;
+    deriveTaskRunStatus(candidateTaskRun, timestamp);
+    candidateState.currentTaskRunId = candidateTaskRun.id;
+    const projectionError = this.preflightCheckpoint(candidateState);
+    if (projectionError) return { edited: false, taskRunId: taskRun.id, taskId: targetId, errors: [projectionError], dispatchScheduled: false };
 
     this.stateEpoch += 1;
     const oldTask = taskRun.tasks[taskIndex];
@@ -895,12 +1074,12 @@ export class TaskedSubagentsController {
     deriveTaskRunStatus(taskRun, timestamp);
     this.state.currentTaskRunId = taskRun.id;
     if (input.wait) this.suppressTaskRunSignal(taskRun.id);
-    this.persistState();
+    await this.checkpointState(checkpointContext);
     this.updateUI(ctx ?? this.lastContext);
     return { edited: true, taskRunId: taskRun.id, taskId: nextTask.id, errors: [], dispatchScheduled: true };
   }
 
-  private editGroupMutable(input: EditGroupInput, ctx?: ExtensionContext): EditGroupResult {
+  private async editGroupMutable(input: EditGroupInput, ctx: ExtensionContext | undefined, checkpointContext: CheckpointContext): Promise<EditGroupResult> {
     if (this.clearAllInProgress) return { edited: false, errors: ["Clear all is in progress"], dispatchScheduled: false };
     const taskRun = this.resolveTaskRunMutable(input.taskRunId);
     if (!taskRun) return { edited: false, errors: [input.taskRunId ? `TaskRun ${input.taskRunId} not found` : "No current TaskRun"], dispatchScheduled: false };
@@ -919,6 +1098,23 @@ export class TaskedSubagentsController {
     const normalized = normalizeTaskRunInput(candidate, { taskRunId: taskRun.id, now: timestamp });
     if (!normalized.taskRun) return { edited: false, taskRunId: taskRun.id, groupId: targetId, errors: normalized.errors, dispatchScheduled: false };
 
+    const candidateState = cloneState(this.state);
+    const candidateTaskRun = candidateState.taskRuns.find((item) => item.id === taskRun.id)!;
+    const candidateOldGroup = candidateTaskRun.groups[groupIndex];
+    const candidateNextGroup = structuredClone(normalized.taskRun.groups[groupIndex]);
+    candidateNextGroup.status = "ready";
+    candidateNextGroup.completedAt = undefined;
+    candidateNextGroup.createdAt = candidateOldGroup.createdAt;
+    candidateNextGroup.updatedAt = timestamp;
+    candidateTaskRun.groups[groupIndex] = candidateNextGroup;
+    candidateTaskRun.status = "running";
+    candidateTaskRun.completedAt = undefined;
+    candidateTaskRun.updatedAt = timestamp;
+    deriveTaskRunStatus(candidateTaskRun, timestamp);
+    candidateState.currentTaskRunId = candidateTaskRun.id;
+    const projectionError = this.preflightCheckpoint(candidateState);
+    if (projectionError) return { edited: false, taskRunId: taskRun.id, groupId: targetId, errors: [projectionError], dispatchScheduled: false };
+
     this.stateEpoch += 1;
     const oldGroup = taskRun.groups[groupIndex];
     const nextGroup = normalized.taskRun.groups[groupIndex];
@@ -933,7 +1129,7 @@ export class TaskedSubagentsController {
     deriveTaskRunStatus(taskRun, timestamp);
     this.state.currentTaskRunId = taskRun.id;
     if (input.wait) this.suppressTaskRunSignal(taskRun.id);
-    this.persistState();
+    await this.checkpointState(checkpointContext);
     this.updateUI(ctx ?? this.lastContext);
     return { edited: true, taskRunId: taskRun.id, groupId: nextGroup.id, errors: [], dispatchScheduled: true };
   }
@@ -961,7 +1157,8 @@ export class TaskedSubagentsController {
   ): Promise<string | undefined> {
     const ctx = options.ctx;
     if (ctx) this.lastContext = ctx;
-    return this.lock.withLock(() => {
+    const checkpointContext = this.checkpointContext(ctx);
+    return this.lock.withLock(async () => {
       if (this.clearAllInProgress) return undefined;
       const target = this.resolveTargetMutable(targetId);
       if (!target) return undefined;
@@ -969,9 +1166,32 @@ export class TaskedSubagentsController {
       if (tasks.length === 0) return undefined;
       const timestamp = Date.now();
       const taskIds = new Set(tasks.map((task) => task.id));
+      const continuations = new Map(tasks.map((task) => [task.id, continuationForTask(target.taskRun, task).trim()]));
+      const candidateState = cloneState(this.state);
+      const candidateTaskRun = candidateState.taskRuns.find((item) => item.id === target.taskRun.id)!;
+      for (const task of candidateTaskRun.tasks) {
+        if (!taskIds.has(task.id)) continue;
+        task.status = "ready";
+        task.continuation = continuations.get(task.id) ?? "";
+        task.completedAt = undefined;
+        task.updatedAt = timestamp;
+      }
+      for (const group of candidateTaskRun.groups) {
+        if (!candidateTaskRun.tasks.some((task) => task.groupId === group.id && taskIds.has(task.id))) continue;
+        group.status = "ready";
+        group.completedAt = undefined;
+        group.updatedAt = timestamp;
+      }
+      candidateTaskRun.status = "running";
+      candidateTaskRun.completedAt = undefined;
+      candidateTaskRun.updatedAt = timestamp;
+      deriveTaskRunStatus(candidateTaskRun, timestamp);
+      candidateState.currentTaskRunId = candidateTaskRun.id;
+      if (this.preflightCheckpoint(candidateState)) return undefined;
+
       for (const task of tasks) {
         task.status = "ready";
-        task.continuation = continuationForTask(target.taskRun, task).trim();
+        task.continuation = continuations.get(task.id) ?? "";
         task.completedAt = undefined;
         task.updatedAt = timestamp;
       }
@@ -987,7 +1207,7 @@ export class TaskedSubagentsController {
       target.taskRun.updatedAt = timestamp;
       deriveTaskRunStatus(target.taskRun, timestamp);
       this.state.currentTaskRunId = target.taskRun.id;
-      this.persistState();
+      await this.checkpointState(checkpointContext);
       this.updateUI(ctx ?? this.lastContext);
       return target.taskRun.id;
     });
@@ -1027,9 +1247,9 @@ export class TaskedSubagentsController {
     return work;
   }
 
-  private async rollbackUncommittedLaunch(taskRunId: string, assignments: TaskAssignmentRecord[], ctx?: ExtensionContext): Promise<void> {
+  private async rollbackUncommittedLaunch(taskRunId: string, assignments: TaskAssignmentRecord[], ctx: ExtensionContext | undefined, checkpointContext: CheckpointContext): Promise<void> {
     const staleAssignments = new Set(assignments);
-    await this.lock.withLock(() => {
+    await this.lock.withLock(async () => {
       const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
       if (!taskRun) return;
       const removable = taskRun.assignments.filter((assignment) => staleAssignments.has(assignment) && assignment.status === "queued" && !assignment.runId && !assignment.launchRef);
@@ -1046,7 +1266,7 @@ export class TaskedSubagentsController {
         }
       }
       deriveTaskRunStatus(taskRun, timestamp);
-      this.persistState();
+      await this.checkpointState(checkpointContext);
       this.updateUI(ctx ?? this.lastContext);
     });
   }
@@ -1060,8 +1280,12 @@ export class TaskedSubagentsController {
       const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
       if (!taskRun) return;
       if (!applyAssignmentProgress(taskRun, snapshot)) return;
+      for (const step of snapshot.steps) {
+        if (step.status === "completed" && step.id) this.terminalProgressAssignmentIds.add(step.id);
+      }
       this.runProgressSignatures.set(key, signature);
-      this.persistState();
+      // Progress is display-only. Terminal assignment state comes only from
+      // controls or the authoritative terminal runner result.
       this.updateUI(ctx ?? this.lastContext);
     });
   }
@@ -1072,11 +1296,12 @@ export class TaskedSubagentsController {
     status: RunStatus,
     raw: string | undefined,
     expectedEpoch: number | undefined,
-    ctx?: ExtensionContext,
+    ctx: ExtensionContext | undefined,
+    checkpointContext: CheckpointContext,
     emitTerminalSignal = true,
   ): Promise<void> {
     let taskRunForSignal: TaskRunRecord | undefined;
-    await this.lock.withLock(() => {
+    await this.lock.withLock(async () => {
       if (expectedEpoch !== undefined && this.stateEpoch !== expectedEpoch) return;
       const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
       if (!taskRun) return;
@@ -1122,9 +1347,10 @@ export class TaskedSubagentsController {
         else assignment.completedAt = undefined;
       }
       deriveTaskRunStatus(taskRun, timestamp);
+      for (const assignment of assignments) this.terminalProgressAssignmentIds.delete(assignment.id);
 
       taskRunForSignal = cloneState({ version: 4, taskRuns: [taskRun], currentTaskRunId: taskRun.id, updatedAt: taskRun.updatedAt }).taskRuns[0];
-      this.persistState();
+      await this.checkpointState(checkpointContext);
       this.updateUI(ctx ?? this.lastContext);
     });
     const taskRunIsTerminal = taskRunForSignal?.status !== "running" && taskRunForSignal?.status !== "pending";
@@ -1133,8 +1359,8 @@ export class TaskedSubagentsController {
     }
   }
 
-  private async markRunStatus(runId: string, status: RunStatus): Promise<void> {
-    await this.lock.withLock(() => {
+  private async markRunStatus(runId: string, status: RunStatus, checkpointContext: CheckpointContext): Promise<void> {
+    await this.lock.withLock(async () => {
       for (const taskRun of this.state.taskRuns) {
         const assignments = taskRun.assignments.filter((assignment) => assignment.runId === runId);
         if (assignments.length === 0) continue;
@@ -1147,7 +1373,7 @@ export class TaskedSubagentsController {
         }
         deriveTaskRunStatus(taskRun);
       }
-      this.persistState();
+      await this.checkpointState(checkpointContext);
       this.updateUI(this.lastContext);
     });
   }

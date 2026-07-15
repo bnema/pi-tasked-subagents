@@ -1,115 +1,209 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { TaskedSubagentsController } from "../src/orchestration/controller.js";
-import type { RunProgressSnapshot, TaskedSubagentsState } from "../src/types.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { MAX_POINTER_BYTES } from "../src/defaults.js";
 import {
-  syntheticProgress,
-  syntheticState,
-} from "./persistence-fixtures.js";
+  PersistenceCoordinator,
+  type CheckpointContext,
+  type PointerAppender,
+} from "../src/state/persistence-coordinator.js";
+import { DurableObjectStore } from "../src/state/object-store.js";
+import type { StatePointerV5 } from "../src/state/durable-types.js";
+import { sessionStoragePaths } from "../src/state/storage-paths.js";
+import type { TaskedSubagentsState } from "../src/types.js";
+import { syntheticState, syntheticTaskRun } from "./persistence-fixtures.js";
 
-const MAX_POINTER_BYTES = 4 * 1024;
-const TASK_RUN_COUNT = 100;
-const PROGRESS_UPDATES_PER_RUN = 20;
-const FIXED_TIME = 1_800_000_000_000;
+const SESSION_ID = "generic-session";
+const context = (visiblePointers: readonly StatePointerV5[] = [], sessionId = SESSION_ID): CheckpointContext => ({
+  sessionId,
+  visiblePointers,
+  now: 1_800_000_000_000,
+});
 
-interface PersistenceProbe {
-  restoreState(state: TaskedSubagentsState): void;
-  persistState(): void;
-  applyRunProgressUpdate(
-    taskRunId: string,
-    snapshot: RunProgressSnapshot,
-    expectedEpoch: number | undefined,
-  ): Promise<void>;
+class CapturingAppender implements PointerAppender {
+  readonly pointers: StatePointerV5[] = [];
+  fail = false;
+
+  append(pointer: StatePointerV5): void {
+    if (this.fail) throw new Error("append unavailable");
+    this.pointers.push(pointer);
+  }
 }
 
-interface CapturedEntry {
-  bytes: number;
-  data: unknown;
+class TracingStore {
+  readonly calls: string[] = [];
+  private nextId = 0;
+  gate?: Promise<void>;
+
+  async put(kind: "checkpoint" | "task-run" | "assignment", _payload: unknown, _maxBytes: number): Promise<string> {
+    this.calls.push(kind);
+    await this.gate;
+    this.nextId += 1;
+    return `${this.nextId}`.padStart(64, "0");
+  }
 }
 
-function createCapture(): { pi: ExtensionAPI; entries: CapturedEntry[] } {
-  const entries: CapturedEntry[] = [];
-  const pi = {
-    appendEntry: vi.fn((_customType: string, data: unknown) => {
-      entries.push({
-        bytes: Buffer.byteLength(JSON.stringify(data), "utf8"),
-        data,
-      });
-    }),
-    sendMessage: vi.fn(),
-    sendUserMessage: vi.fn(),
-  } as unknown as ExtensionAPI;
-  return { pi, entries };
+let roots: string[] = [];
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function coordinator(appender = new CapturingAppender()) {
+  const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-coordinator-"));
+  roots.push(root);
+  return { root, appender, coordinator: new PersistenceCoordinator(new DurableObjectStore(root), appender) };
 }
 
-function asPersistenceProbe(controller: TaskedSubagentsController): PersistenceProbe {
-  return controller as unknown as PersistenceProbe;
-}
+describe("PersistenceCoordinator", () => {
+  it("deduplicates unchanged projections and appends no pointer for pure progress projections", async () => {
+    const { coordinator: subject, appender } = await coordinator();
+    const state = syntheticState(100);
 
-function entryVersion(data: unknown): unknown {
-  return typeof data === "object" && data !== null
-    ? (data as { version?: unknown }).version
-    : undefined;
-}
+    await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: true, deduplicated: false });
+    await expect(subject.checkpoint(structuredClone(state), context())).resolves.toMatchObject({ committed: true, deduplicated: true });
 
-describe("bounded session-state persistence", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  test("keeps v5 pointers bounded while transient progress does not amplify retained history", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(FIXED_TIME);
-
-    const state = syntheticState(TASK_RUN_COUNT);
-    const { pi, entries } = createCapture();
-    const controller = asPersistenceProbe(new TaskedSubagentsController(pi));
-    controller.restoreState(state);
-
-    const beforeUnchangedRequests = entries.length;
-    controller.persistState();
-    controller.persistState();
-    const unchangedProjectionAppendCount = entries.length - beforeUnchangedRequests;
-
-    const beforeProgress = entries.length;
-    let globalSequence = 0;
-    for (const taskRun of state.taskRuns) {
-      const assignment = taskRun.assignments[0];
-      for (let sequence = 1; sequence <= PROGRESS_UPDATES_PER_RUN; sequence += 1) {
-        globalSequence += 1;
-        vi.setSystemTime(FIXED_TIME + globalSequence);
-        await controller.applyRunProgressUpdate(
-          taskRun.id,
-          syntheticProgress(assignment.runId!, assignment.id, sequence),
-          undefined,
-        );
-      }
+    for (const run of state.taskRuns) {
+      run.assignments[0].currentTool = "display-only-progress";
+      run.assignments[0].lastActionAt = 1_800_000_000_123;
+      run.assignments[0].recentActivity = ["generic activity"];
+      await expect(subject.checkpoint(structuredClone(state), context())).resolves.toMatchObject({ committed: true, deduplicated: true });
     }
 
-    const progressOnlyAppendCount = entries.length - beforeProgress;
-    const entryBytes = entries.map((entry) => entry.bytes);
-    const totalPointerBytes = entryBytes.reduce((total, bytes) => total + bytes, 0);
-    const versions = new Set(entries.map((entry) => entryVersion(entry.data)));
+    expect(appender.pointers).toHaveLength(1);
+    expect(Buffer.byteLength(JSON.stringify(appender.pointers[0]), "utf8")).toBeLessThanOrEqual(MAX_POINTER_BYTES);
+  });
 
-    // Target v5 invariants: compact pointers only, durable-projection deduplication,
-    // and no append for display-only progress updates.
-    expect.soft(versions).toEqual(new Set([5]));
-    expect.soft(Math.max(...entryBytes)).toBeLessThanOrEqual(MAX_POINTER_BYTES);
-    expect.soft(unchangedProjectionAppendCount).toBe(0);
-    expect.soft(progressOnlyAppendCount).toBe(0);
-    expect.soft(totalPointerBytes).toBeLessThan(
-      TASK_RUN_COUNT * PROGRESS_UPDATES_PER_RUN * MAX_POINTER_BYTES,
-    );
-  }, 30_000);
+  it("writes task-run objects and manifest before refs and the Pi pointer", async () => {
+    const store = new TracingStore();
+    const appender = new CapturingAppender();
+    const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-coordinator-"));
+    roots.push(root);
+    const subject = new PersistenceCoordinator(store, appender, { dataRoot: root, onRefsWritten: () => store.calls.push("refs") });
+    const state = syntheticState(0);
+    state.taskRuns = [syntheticTaskRun(1, "running")];
 
-  test("demonstrates cumulative full snapshots grow faster than bounded pointers", () => {
-    const fullSnapshotBytes = Array.from({ length: TASK_RUN_COUNT }, (_, index) =>
-      Buffer.byteLength(JSON.stringify(syntheticState(index + 1)), "utf8"));
-    const cumulativeFullSnapshotBytes = fullSnapshotBytes.reduce((total, bytes) => total + bytes, 0);
-    const cumulativePointerBudget = TASK_RUN_COUNT * MAX_POINTER_BYTES;
+    await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: true });
+    expect(store.calls).toEqual(["task-run", "checkpoint", "refs"]);
+    expect(appender.pointers).toHaveLength(1);
+  });
 
-    expect(fullSnapshotBytes.at(-1)).toBeGreaterThan(fullSnapshotBytes[0] * 90);
-    expect(cumulativeFullSnapshotBytes).toBeGreaterThan(cumulativePointerBudget * 10);
+  it("retains the exact dirty snapshot after append failure and retries it", async () => {
+    const { root, coordinator: subject, appender } = await coordinator();
+    const state = syntheticState(0);
+    state.taskRuns = [syntheticTaskRun(1, "running")];
+    await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: true });
+    const previousAuthority = appender.pointers[0];
+    state.taskRuns[0].title = "durable title";
+    appender.fail = true;
+
+    await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: false, dirty: true });
+    expect(appender.pointers).toEqual([previousAuthority]);
+    state.taskRuns[0].title = "mutated after failed durability";
+    appender.fail = false;
+
+    const retried = await subject.retryDirty(context());
+    expect(retried).toMatchObject({ committed: true, deduplicated: false });
+    if (!retried.committed) throw new Error("retry should commit");
+    const store = new DurableObjectStore(root);
+    const manifest = await store.get<{ recoverableRuns: Array<{ objectId: string }> }>(retried.pointer.checkpointId, "checkpoint", 256 * 1024);
+    const run = await store.get<{ title: string }>(manifest.recoverableRuns[0].objectId, "task-run", 2 * 1024 * 1024);
+    expect(run.title).toBe("durable title");
+    await expect(subject.flush(context())).resolves.toBeUndefined();
+  });
+
+  it("unions all visible branch references and fences stale invalidated writes", async () => {
+    const { root, coordinator: subject } = await coordinator();
+    const oldPointer: StatePointerV5 = { version: 5, checkpointId: "a".repeat(64), sequence: 7, writtenAt: 1 };
+    const first = await subject.checkpoint(syntheticState(0), context([oldPointer]));
+    if (!first.committed) throw new Error("first checkpoint should commit");
+    const changed = syntheticState(0);
+    changed.currentTaskRunId = "next-task-run";
+    const second = await subject.checkpoint(changed, context([oldPointer]));
+    if (!second.committed) throw new Error("second checkpoint should commit");
+    const refs = JSON.parse(await readFile(sessionStoragePaths(root, SESSION_ID).refsPath, "utf8")) as { checkpointIds: string[] };
+    expect(refs.checkpointIds).toEqual(expect.arrayContaining([oldPointer.checkpointId, first.pointer.checkpointId, second.pointer.checkpointId]));
+
+    const tracingStore = new TracingStore();
+    let release!: () => void;
+    tracingStore.gate = new Promise<void>((resolve) => { release = resolve; });
+    const staleRoot = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-coordinator-"));
+    roots.push(staleRoot);
+    const staleAppender = new CapturingAppender();
+    const stale = new PersistenceCoordinator(tracingStore, staleAppender, { dataRoot: staleRoot, onRefsWritten: () => tracingStore.calls.push("refs") });
+    const pending = stale.checkpoint(syntheticState(0), context([oldPointer]));
+    await vi.waitFor(() => expect(tracingStore.calls).toContain("checkpoint"));
+    stale.invalidate(1);
+    release();
+
+    await expect(pending).resolves.toMatchObject({ committed: false, dirty: true });
+    expect(tracingStore.calls).not.toContain("refs");
+    expect(staleAppender.pointers).toHaveLength(0);
+  });
+
+  it("fences dirty snapshots captured before an invalidated epoch", async () => {
+    const { coordinator: subject, appender } = await coordinator();
+    const state = syntheticState(0);
+    appender.fail = true;
+
+    await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: false, dirty: true, error: { code: "pointer_append" } });
+    subject.invalidate(1);
+    appender.fail = false;
+
+    await expect(subject.retryDirty(context())).resolves.toMatchObject({ committed: false, dirty: true, error: { code: "stale_generation" } });
+    expect(appender.pointers).toHaveLength(0);
+  });
+
+  it("rejects dirty retries from a different session", async () => {
+    const { coordinator: subject, appender } = await coordinator();
+    appender.fail = true;
+    await expect(subject.checkpoint(syntheticState(0), context())).resolves.toMatchObject({ committed: false, dirty: true });
+    appender.fail = false;
+
+    await expect(subject.retryDirty(context([], "other-session"))).resolves.toMatchObject({
+      committed: false,
+      dirty: true,
+      error: { code: "session_mismatch" },
+    });
+    expect(appender.pointers).toHaveLength(0);
+  });
+
+  it("resets session-scoped dedupe and references after a generation change", async () => {
+    const store = new TracingStore();
+    const appender = new CapturingAppender();
+    const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-coordinator-"));
+    roots.push(root);
+    const subject = new PersistenceCoordinator(store, appender, { dataRoot: root });
+    const state = syntheticState(0);
+
+    await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: true, deduplicated: false });
+    subject.invalidate(1);
+    await expect(subject.checkpoint(structuredClone(state), context())).resolves.toMatchObject({ committed: true, deduplicated: false });
+
+    expect(store.calls.filter((call) => call === "checkpoint")).toHaveLength(2);
+    const refs = JSON.parse(await readFile(sessionStoragePaths(root, SESSION_ID).refsPath, "utf8")) as { checkpointIds: string[] };
+    expect(refs.checkpointIds).toEqual(["0000000000000000000000000000000000000000000000000000000000000002"]);
+  });
+
+  it("fails closed when session context is missing", async () => {
+    const { coordinator: subject, appender } = await coordinator();
+    const missingSession = { sessionId: "", visiblePointers: [] } as CheckpointContext;
+
+    await expect(subject.checkpoint(syntheticState(0), missingSession)).resolves.toMatchObject({
+      committed: false,
+      dirty: true,
+      error: { code: "session_mismatch" },
+    });
+    expect(appender.pointers).toHaveLength(0);
+  });
+
+  it("never appends a pointer above 4 KiB", async () => {
+    const { coordinator: subject, appender } = await coordinator();
+    const state: TaskedSubagentsState = { version: 4, taskRuns: [], currentTaskRunId: "x".repeat(MAX_POINTER_BYTES), updatedAt: 1 };
+
+    await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: false, dirty: true });
+    expect(appender.pointers).toHaveLength(0);
   });
 });
