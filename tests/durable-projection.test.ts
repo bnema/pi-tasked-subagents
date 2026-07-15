@@ -22,6 +22,7 @@ import {
   MAX_TASK_RUN_OBJECT_BYTES,
 } from "../src/defaults.js";
 import { canonicalJson, utf8Bytes } from "../src/state/canonical-json.js";
+import type { AssignmentArchiveV1 } from "../src/state/durable-types.js";
 import { syntheticState, syntheticTaskRun } from "./persistence-fixtures.js";
 
 function archiveRef(index: number, completedAt = index): ArchiveRef {
@@ -36,8 +37,14 @@ function archiveRef(index: number, completedAt = index): ArchiveRef {
 }
 
 describe("durable projection", () => {
+  it("keeps non-completed synthetic fixtures internally consistent", () => {
+    const running = syntheticTaskRun(1, "running");
+    expect(running.tasks[0].criteria[0].evidence).toEqual([]);
+    expect(running.assignments[0].result).toBeUndefined();
+  });
+
   it("strips transient fields without mutating runtime state", () => {
-    const run = syntheticTaskRun(1, "running");
+    const run = syntheticTaskRun(1, "completed");
     const before = structuredClone(run);
     const result = projectTaskRun(run);
 
@@ -87,6 +94,44 @@ describe("durable projection", () => {
       archiveId: `archive-${MAX_RECENT_ASSIGNMENT_REFS + 5}`,
       resultId: `result-${MAX_RECENT_ASSIGNMENT_REFS + 5}`,
     });
+  });
+
+  it("merges restored and live completed summaries, retaining a selected restored run within the bound", () => {
+    const state = syntheticState(0);
+    state.taskRuns = [syntheticTaskRun(21, "completed")];
+    state.completedHistory = Array.from({ length: MAX_RECENT_COMPLETED }, (_, index) => ({
+      taskRunId: `restored-${index + 1}`,
+      title: `Restored ${index + 1}`,
+      status: "completed" as const,
+      createdAt: index + 1,
+      updatedAt: index + 1,
+      completedAt: index + 1,
+      groupCount: 0,
+      taskCount: 0,
+      assignmentCount: 0,
+      assignmentArchiveIds: [],
+      archives: [],
+    }));
+    state.currentTaskRunId = "restored-20";
+
+    const result = buildCheckpointProjection(state, []);
+
+    expect(result).toMatchObject({ ok: true });
+    if (!result.ok) return;
+    expect(result.value.completedRuns).toHaveLength(MAX_RECENT_COMPLETED);
+    expect(result.value.completedRuns.map((summary) => summary.taskRunId)).toEqual([
+      "task-run-021",
+      ...Array.from({ length: MAX_RECENT_COMPLETED - 1 }, (_, index) => `restored-${MAX_RECENT_COMPLETED - index}`),
+    ]);
+    expect(result.value.currentTaskRunId).toBe("restored-20");
+  });
+
+  it("encodes only terminal archive statuses and exactly one result availability state", () => {
+    // @ts-expect-error archives cannot encode non-terminal assignment statuses
+    const nonTerminal: AssignmentArchiveV1 = { assignmentId: "a", taskRunId: "r", taskId: "t", status: "running", runId: "run", resultId: "a".repeat(32), completedAt: 1, detailOmitted: true };
+    // @ts-expect-error archives must have exactly one of resultId and resultUnavailableReason
+    const ambiguous: AssignmentArchiveV1 = { assignmentId: "a", taskRunId: "r", taskId: "t", status: "completed", runId: "run", resultId: "a".repeat(32), resultUnavailableReason: "missing-legacy-result", completedAt: 1, detailOmitted: true };
+    expect([nonTerminal, ambiguous]).toHaveLength(2);
   });
 
   it("normalizes archive detail by UTF-8 bytes deterministically", () => {

@@ -722,6 +722,38 @@ describe("task-run state store", () => {
     expect(malformedFallback.diagnostics).toContainEqual(expect.objectContaining({ code: "pointer_invalid" }));
   });
 
+  test("falls back from a manifest/task-run reference mismatch without quarantining the valid shared task object", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
+    storageRoots.push(root);
+    const store = new DurableObjectStore(root);
+    const earlierPointer = await v5Checkpoint(store, currentState, 1);
+    const sharedRunId = await store.put("task-run", { ...taskRun, title: "Shared valid task run" }, 2 * 1024 * 1024);
+    const malformedPointer: StatePointerV5 = {
+      version: 5,
+      checkpointId: await store.put("checkpoint", {
+        checkpointVersion: 1,
+        sessionId: "generic-session",
+        sequence: 2,
+        currentTaskRunId: "manifest-run-id",
+        recoverableRuns: [{ taskRunId: "manifest-run-id", status: "running", objectId: sharedRunId, updatedAt: 1 }],
+        recentCompleted: [],
+        recentAssignmentRefs: [],
+        updatedAt: 2,
+      }, 256 * 1024),
+      currentTaskRunId: "manifest-run-id",
+      sequence: 2,
+      writtenAt: 2,
+    };
+
+    const restored = await restoreBranchState([v5Entry(earlierPointer), v5Entry(malformedPointer)], store, {
+      sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined,
+    });
+
+    expect(restored).toMatchObject({ restored: true, pointer: earlierPointer });
+    expect(restored.diagnostics).toContainEqual(expect.objectContaining({ code: "checkpoint_invalid", checkpointId: malformedPointer.checkpointId }));
+    await expect(store.get(sharedRunId, "task-run", 2 * 1024 * 1024)).resolves.toMatchObject({ id: "task-run-1" });
+  });
+
   test("pins every fully valid v5 checkpoint across branches after restoring the active branch", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
     storageRoots.push(root);

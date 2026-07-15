@@ -5,7 +5,18 @@ import path from "node:path";
 import { openPinnedDirectory, safeBasename } from "../state/pinned-directory.mjs";
 
 const MAX_RESERVATION_BYTES = 4 * 1024;
-const RESULT_ID = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/;
+// Kept byte-for-byte aligned with state/storage-paths.ts's canonical SAFE_PATH_ID:
+// this runner dependency must remain directly executable by Node (not a TS loader).
+const CANONICAL_SESSION_ID = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
+const CANONICAL_RESULT_ID = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/;
+
+function isCanonicalSessionId(value) {
+  return typeof value === "string" && CANONICAL_SESSION_ID.test(value);
+}
+
+function isCanonicalResultId(value) {
+  return typeof value === "string" && CANONICAL_RESULT_ID.test(value);
+}
 
 function hasExpectedIdentity(value, expected) {
   return value
@@ -25,7 +36,8 @@ function reservationError() {
 }
 
 function resultNames(expected) {
-  if (!expected || typeof expected.sessionId !== "string" || !RESULT_ID.test(expected.resultId)) {
+  if (!expected || !isCanonicalSessionId(expected.sessionId) || !isCanonicalResultId(expected.resultId) ||
+    typeof expected.runId !== "string" || !expected.runId.trim()) {
     throw new Error("Unsafe durable result identity");
   }
   return {
@@ -105,11 +117,16 @@ async function removeMatchingReservation(directory, reservationName, expected) {
   try {
     await verifyPinnedReservation(directory, reservationName, expected);
   } catch {
-    return;
+    return false;
   }
-  await directory.unlink(reservationName).catch((error) => {
-    if (error?.code !== "ENOENT") throw error;
-  });
+  try {
+    await directory.unlink(reservationName);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  await directory.sync();
+  return true;
 }
 
 /** Create one reservation through the same pinned durable-storage boundary. */
@@ -120,6 +137,7 @@ export async function reserveResultReservation(root, resultsDir, expected, optio
   if (path.resolve(resultsDir) !== location.directory) throw new Error("Result directory does not match durable identity");
   const directory = await openPinnedDirectory(location.root, location.directory, options);
   let handle;
+  let retained = false;
   try {
     await options.beforeMutation?.("reserve-result");
     handle = await directory.openFile(location.reservation, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
@@ -127,11 +145,13 @@ export async function reserveResultReservation(root, resultsDir, expected, optio
     await handle.sync();
     await handle.close();
     handle = undefined;
+    await directory.sync();
     // A reservation never grants an identity that already has a terminal file.
     try {
       const existing = await directory.openFile(location.result, constants.O_RDONLY | constants.O_NOFOLLOW);
       await existing.close();
       await directory.unlink(location.reservation);
+      await directory.sync();
       const collision = new Error("Result identity is already published");
       collision.code = "EEXIST";
       throw collision;
@@ -139,10 +159,25 @@ export async function reserveResultReservation(root, resultsDir, expected, optio
       if (error?.code !== "ENOENT") throw error;
     }
     await directory.assert();
+    if (options.retainDirectory) {
+      retained = true;
+      return {
+        resultPath,
+        resultReservationPath: reservationPath,
+        close: () => directory.close(),
+        release: async () => {
+          try {
+            await removeMatchingReservation(directory, location.reservation, expected);
+          } finally {
+            await directory.close();
+          }
+        },
+      };
+    }
     return { resultPath, resultReservationPath: reservationPath };
   } finally {
     await handle?.close();
-    await directory.close();
+    if (!retained) await directory.close();
   }
 }
 

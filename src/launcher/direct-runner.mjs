@@ -272,6 +272,17 @@ async function updateStatus(statusPath, status) {
   await writeJson(statusPath, status);
 }
 
+/** Terminal status is derived from the immutable result winner, never a loser. */
+export function applyPublishedTerminalResult(status, result, fallbackTimestamp = now()) {
+  const timestamp = typeof result?.timestamp === "number" ? result.timestamp : fallbackTimestamp;
+  status.state = result?.state;
+  status.success = result?.success;
+  status.summary = result?.summary;
+  status.endedAt = timestamp;
+  status.lastUpdate = timestamp;
+  return status;
+}
+
 export function getDependencyBlockedSkip(child, failedIds, skippedIds) {
   const dependencyIds = child.dependsOn ?? [];
   if (dependencyIds.some((dependencyId) => failedIds.has(dependencyId))) {
@@ -369,6 +380,14 @@ export function prepareStepForStart(status, step) {
   markStepAction(status, step, "child started");
 }
 
+/** Register error handling synchronously: spawn can fail while identity I/O awaits. */
+export function waitForChildExit(childProcess) {
+  return new Promise((resolve, reject) => {
+    childProcess.once("error", reject);
+    childProcess.once("close", (code) => resolve(code ?? 1));
+  });
+}
+
 async function runChild(config, statusPath, status, child, index, promptOverride, attemptNumber = 1) {
   const step = status.steps[index];
   prepareStepForStart(status, step);
@@ -384,6 +403,10 @@ async function runChild(config, statusPath, status, child, index, promptOverride
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  // This promise must exist before the first await after spawn (notably procfs).
+  const childExit = waitForChildExit(childProcess);
+  // Keep a pre-await rejection from becoming unhandled before it is consumed below.
+  void childExit.catch(() => undefined);
   step.pid = childProcess.pid;
   step.pidStartTime = childProcess.pid === undefined ? undefined : (await captureProcessIdentity(childProcess.pid))?.startTime;
   await updateStatus(statusPath, status);
@@ -456,10 +479,7 @@ async function runChild(config, statusPath, status, child, index, promptOverride
     stderrBuffer += chunk.toString();
   });
 
-  const exitCode = await new Promise((resolve, reject) => {
-    childProcess.once("error", reject);
-    childProcess.once("close", (code) => resolve(code ?? 1));
-  });
+  const exitCode = await childExit;
 
   const trailingStdout = stdoutBuffer;
   stdoutBuffer = "";
@@ -643,7 +663,7 @@ async function writeResult(config, status, results) {
   const summary = buildResultSummary(results);
   const rawOutput = results.length === 1 ? results[0]?.rawOutput || results[0]?.output : undefined;
 
-  await publishTerminalResult(config.resultPath, config.resultReservationPath, {
+  const publication = await publishTerminalResult(config.resultPath, config.resultReservationPath, {
     sessionId: config.sessionId,
     runId: config.runId,
     resultId: config.resultId,
@@ -656,10 +676,8 @@ async function writeResult(config, status, results) {
     results,
   }, { root: config.storageRoot });
 
-  status.state = success ? "complete" : "failed";
-  status.endedAt = timestamp;
-  status.lastUpdate = timestamp;
-  await writeJson(config.statusPath, status);
+  // A concurrent SIGTERM may have won publication; its immutable fields win here too.
+  await writeJson(config.statusPath, applyPublishedTerminalResult(status, publication.value, timestamp));
 }
 
 async function runTaskGraph(config, status) {
@@ -825,12 +843,13 @@ if (isMain) {
 
         const existingResult = JSON.parse(await fs.readFile(resultPath, "utf8").catch(() => "{}"));
         const signal = renderTerminationSignal(existingStatus, existingResult, timestamp);
-        await writeJson(statusPath, signal.status);
-        await publishTerminalResult(resultPath, config.resultReservationPath, {
+        const publication = await publishTerminalResult(resultPath, config.resultReservationPath, {
           sessionId: config.sessionId,
           runId: config.runId,
           resultId: config.resultId,
         }, signal.result, { root: config.storageRoot });
+        // Publish first so a completion/SIGTERM race cannot let the loser write status.
+        await writeJson(statusPath, applyPublishedTerminalResult(signal.status, publication.value, timestamp));
       } catch (error) {
         console.error("[direct-runner] Failed to write termination state", error);
       } finally {
@@ -842,7 +861,7 @@ if (isMain) {
       const message = error instanceof Error ? error.stack ?? error.message : String(error);
       console.error("[direct-runner] Failed", message);
       const timestamp = now();
-      await writeJson(config.statusPath, {
+      const failureStatus = {
         runId: config.runId,
         mode: config.mode,
         pid: process.pid,
@@ -860,19 +879,23 @@ if (isMain) {
           error: message,
           outputFile: child.outputFile,
         })),
-      });
-      await publishTerminalResult(config.resultPath, config.resultReservationPath, {
-        sessionId: config.sessionId,
-        runId: config.runId,
-        resultId: config.resultId,
-      }, {
-        state: "failed",
-        success: false,
-        summary: message,
-        timestamp,
-      }, { root: config.storageRoot }).catch((publishError) => {
+      };
+      try {
+        const publication = await publishTerminalResult(config.resultPath, config.resultReservationPath, {
+          sessionId: config.sessionId,
+          runId: config.runId,
+          resultId: config.resultId,
+        }, {
+          state: "failed",
+          success: false,
+          summary: message,
+          timestamp,
+        }, { root: config.storageRoot });
+        await writeJson(config.statusPath, applyPublishedTerminalResult(failureStatus, publication.value, timestamp));
+      } catch (publishError) {
         console.error("[direct-runner] Failed to publish terminal result", toErrorMessage(publishError));
-      });
+        await writeJson(config.statusPath, failureStatus);
+      }
       process.exitCode = 1;
     });
   }

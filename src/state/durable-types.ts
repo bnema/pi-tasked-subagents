@@ -1,5 +1,7 @@
 import type { ArtifactRef, AssignmentStatus, TaskResultRecord } from "../types.js";
 
+export type TerminalAssignmentArchiveStatus = Extract<AssignmentStatus, "completed" | "failed" | "skipped" | "cancelled">;
+
 /** Compact immutable record appended to Pi session history. */
 export interface StatePointerV5 {
   version: 5;
@@ -59,26 +61,36 @@ interface AssignmentArchiveIdentityV1 {
   taskRunId: string;
   groupId?: string;
   taskId: string;
-  status: AssignmentStatus;
+  status: TerminalAssignmentArchiveStatus;
   runId: string;
-  resultId?: string;
-  resultUnavailableReason?: "missing-legacy-result";
   completedAt: number;
 }
 
+type AssignmentArchiveResultAvailableV1 = {
+  resultId: string;
+  resultUnavailableReason?: never;
+};
+
+type AssignmentArchiveResultUnavailableV1 = {
+  resultId?: never;
+  resultUnavailableReason: "missing-legacy-result";
+};
+
+type AssignmentArchiveResultStateV1 = AssignmentArchiveResultAvailableV1 | AssignmentArchiveResultUnavailableV1;
+
 /** Normal bounded terminal metadata. */
-export interface AssignmentArchiveDetailV1 extends AssignmentArchiveIdentityV1 {
+export type AssignmentArchiveDetailV1 = AssignmentArchiveIdentityV1 & AssignmentArchiveResultStateV1 & {
   summary: string;
   criteriaEvidence: TaskResultRecord["criteriaEvidence"];
   artifacts: ArtifactRef[];
   followUps: string[];
   detailOmitted?: never;
-}
+};
 
 /** Last-resort archive that retains exact identities but no unbounded detail. */
-export interface AssignmentArchiveMetadataOnlyV1 extends AssignmentArchiveIdentityV1 {
+export type AssignmentArchiveMetadataOnlyV1 = AssignmentArchiveIdentityV1 & AssignmentArchiveResultStateV1 & {
   detailOmitted: true;
-}
+};
 
 export type AssignmentArchiveV1 = AssignmentArchiveDetailV1 | AssignmentArchiveMetadataOnlyV1;
 

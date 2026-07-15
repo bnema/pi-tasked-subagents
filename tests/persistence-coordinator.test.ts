@@ -84,7 +84,7 @@ describe("PersistenceCoordinator", () => {
 
   it("writes task-run objects and manifest before refs and the Pi pointer", async () => {
     const store = new TracingStore();
-    const appender = new CapturingAppender();
+    const appender: PointerAppender = { append: () => store.calls.push("append") };
     const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-coordinator-"));
     roots.push(root);
     const subject = new PersistenceCoordinator(store, appender, { dataRoot: root, onRefsWritten: () => store.calls.push("refs") });
@@ -92,8 +92,7 @@ describe("PersistenceCoordinator", () => {
     state.taskRuns = [syntheticTaskRun(1, "running")];
 
     await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: true });
-    expect(store.calls).toEqual(["task-run", "checkpoint", "refs"]);
-    expect(appender.pointers).toHaveLength(1);
+    expect(store.calls).toEqual(["task-run", "checkpoint", "refs", "append"]);
   });
 
   it("returns a non-dirty projection failure for an uncloneable state without scheduling a retry", async () => {
@@ -172,7 +171,7 @@ describe("PersistenceCoordinator", () => {
     expect(staleAppender.pointers).toHaveLength(0);
   });
 
-  it("fences dirty snapshots captured before an invalidated epoch", async () => {
+  it("clears dirty snapshots captured before an invalidated epoch", async () => {
     const { coordinator: subject, appender } = await coordinator();
     const state = syntheticState(0);
     appender.fail = true;
@@ -181,7 +180,7 @@ describe("PersistenceCoordinator", () => {
     subject.invalidate(1);
     appender.fail = false;
 
-    await expect(subject.retryDirty(context())).resolves.toMatchObject({ committed: false, dirty: true, error: { code: "stale_generation" } });
+    await expect(subject.retryDirty(context())).resolves.toMatchObject({ committed: false, dirty: false, error: { code: "projection", message: "No durable checkpoint is available" } });
     expect(appender.pointers).toHaveLength(0);
   });
 

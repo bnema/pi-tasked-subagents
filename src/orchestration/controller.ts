@@ -46,7 +46,7 @@ import {
   projectAssignmentArchive,
   type ArchiveRef,
 } from "../state/durable-projection.js";
-import type { AssignmentArchiveV1 } from "../state/durable-types.js";
+import type { AssignmentArchiveV1, TerminalAssignmentArchiveStatus } from "../state/durable-types.js";
 import { resultFilePath, sessionStoragePaths } from "../state/storage-paths.js";
 import {
   PersistenceCoordinator,
@@ -135,7 +135,7 @@ function completedStatus(status: RunStatus): boolean {
   return status === "completed" || status === "skipped";
 }
 
-function finalAssignmentStatus(status: TaskAssignmentRecord["status"]): boolean {
+function finalAssignmentStatus(status: TaskAssignmentRecord["status"]): status is TerminalAssignmentArchiveStatus {
   return status === "completed" || status === "failed" || status === "skipped" || status === "cancelled";
 }
 
@@ -564,21 +564,31 @@ export class TaskedSubagentsController {
           return aggregate;
         }
 
-        let failedLaunchCommit: Array<{ stored: TaskAssignmentRecord; status: TaskAssignmentRecord["status"]; runId: string | undefined; launchRef: SubagentRunHandle | undefined; updatedAt: number }> | undefined;
+        let failedLaunchCommit: Array<{ assignmentId: string; status: TaskAssignmentRecord["status"]; runId: string | undefined; launchRef: SubagentRunHandle | undefined; updatedAt: number }> | undefined;
         const commit = await this.lock.withLock(async () => {
           if (this.cancellationRequestedRunIds.delete(launchedRef.runId)) return "cancelled" as const;
           if (this.stateEpoch !== dispatchEpoch) return "stale" as const;
           const current = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
           if (!current) return "stale" as const;
+          // Keep immutable compensation data. The live assignments can be
+          // replaced while cancellation is in flight after a failed checkpoint.
           const previous = launch.assignments.map((assignment) => {
             const stored = current.assignments.find((candidate) => candidate.id === assignment.id);
-            return stored ? { stored, status: stored.status, runId: stored.runId, launchRef: stored.launchRef, updatedAt: stored.updatedAt } : undefined;
-          }).filter((entry): entry is { stored: TaskAssignmentRecord; status: TaskAssignmentRecord["status"]; runId: string | undefined; launchRef: SubagentRunHandle | undefined; updatedAt: number } => Boolean(entry));
+            return stored ? {
+              assignmentId: stored.id,
+              status: stored.status,
+              runId: stored.runId,
+              launchRef: stored.launchRef ? structuredClone(stored.launchRef) : undefined,
+              updatedAt: stored.updatedAt,
+            } : undefined;
+          }).filter((entry): entry is { assignmentId: string; status: TaskAssignmentRecord["status"]; runId: string | undefined; launchRef: SubagentRunHandle | undefined; updatedAt: number } => Boolean(entry));
           for (const entry of previous) {
-            entry.stored.status = "running";
-            entry.stored.runId = launchedRef.runId;
-            entry.stored.launchRef = launchedRef;
-            entry.stored.updatedAt = Date.now();
+            const stored = current.assignments.find((candidate) => candidate.id === entry.assignmentId);
+            if (!stored) continue;
+            stored.status = "running";
+            stored.runId = launchedRef.runId;
+            stored.launchRef = launchedRef;
+            stored.updatedAt = Date.now();
           }
           deriveTaskRunStatus(current);
           try {
@@ -615,11 +625,14 @@ export class TaskedSubagentsController {
                 const current = this.state.taskRuns.find((candidate) => candidate.id === launch.taskRunId);
                 if (!current || this.stateEpoch !== dispatchEpoch) return;
                 for (const entry of failedLaunchCommit ?? []) {
-                  if (entry.stored.runId !== launchedRef.runId) continue;
-                  entry.stored.status = entry.status;
-                  entry.stored.runId = entry.runId;
-                  entry.stored.launchRef = entry.launchRef;
-                  entry.stored.updatedAt = entry.updatedAt;
+                  // Re-resolve by ID under this lock. Never mutate the stale
+                  // object captured before an intervening state transition.
+                  const stored = current.assignments.find((candidate) => candidate.id === entry.assignmentId);
+                  if (!stored || stored.runId !== launchedRef.runId) continue;
+                  stored.status = entry.status;
+                  stored.runId = entry.runId;
+                  stored.launchRef = entry.launchRef ? structuredClone(entry.launchRef) : undefined;
+                  stored.updatedAt = entry.updatedAt;
                 }
                 deriveTaskRunStatus(current);
                 await this.checkpointState(checkpointContext);
@@ -656,6 +669,14 @@ export class TaskedSubagentsController {
         const message = error instanceof Error ? error.message : String(error);
         aggregate.errors.push(message);
         aggregate.hasBlockingIssue = true;
+        // applyRunOutcome mutates the terminal snapshot before its archive and
+        // checkpoint durability boundary. A failure there is retryable dirty
+        // persistence, not a second runner failure.
+        const terminalOutcomeApplied = this.stateEpoch === dispatchEpoch && this.state.taskRuns
+          .find((candidate) => candidate.id === launch.taskRunId)?.assignments
+          .filter((assignment) => launch.assignments.some((launched) => launched.id === assignment.id))
+          .every((assignment) => finalAssignmentStatus(assignment.status)) === true;
+        if (terminalOutcomeApplied) continue;
         if (this.stateEpoch !== dispatchEpoch) await this.rollbackUncommittedLaunch(launch.taskRunId, launch.assignments, options.ctx ?? this.lastContext, checkpointContext);
         let failureSignal: TaskRunRecord | undefined;
         if (this.stateEpoch === dispatchEpoch) await this.lock.withLock(async () => {
@@ -684,8 +705,16 @@ export class TaskedSubagentsController {
           this.updateUI(options.ctx ?? this.lastContext);
         });
         const failureIsTerminal = failureSignal?.status !== "running" && failureSignal?.status !== "pending";
-        if (options.emitTerminalSignal !== false && failureSignal && failureIsTerminal && !this.taskRunSignalSuppressed(launch.taskRunId)) {
-          this.emitRunSignal(failureSignal, ref?.runId ?? launch.runId, "failed");
+        if (failureSignal && failureIsTerminal) {
+          // The snapshot is populated before the awaited checkpoint and is
+          // emitted only after that durable boundary succeeds.
+          this.handleTerminalSignal(
+            failureSignal,
+            ref?.runId ?? launch.runId,
+            "failed",
+            options.emitTerminalSignal !== false,
+            launch.assignments.map((assignment) => assignment.id),
+          );
         }
       } finally {
         this.launchingRuns.delete(launch.runId);
@@ -915,13 +944,14 @@ export class TaskedSubagentsController {
           const removed = this.state.taskRuns.length;
           this.stateEpoch += 1;
           this.state = createEmptyState();
+          this.archiveRefs = [];
           this.runProgressSignatures.clear();
           this.liveRunIds.clear();
           this.signalSuppressionCounts.clear();
           this.scheduledDispatches.clear();
           this.lastDispatchWork = Promise.resolve();
           this.clearAllInProgress = false;
-          await this.checkpointState(checkpointContext);
+          await this.checkpointState({ ...checkpointContext, archiveRefs: [] });
           this.updateUI(this.lastContext);
           return removed;
         });
@@ -945,10 +975,16 @@ export class TaskedSubagentsController {
         if (!active && taskRunId) {
           this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.id !== taskRunId);
           this.state.completedHistory = this.state.completedHistory?.filter((summary) => summary.taskRunId !== taskRunId);
+          this.archiveRefs = this.archiveRefs.filter((ref) => ref.taskRunId !== taskRunId);
         }
       } else {
-        this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.status !== "completed" && taskRun.status !== "cancelled");
+        const removedTaskRunIds = new Set(this.state.taskRuns
+          .filter((taskRun) => taskRun.status === "completed" || taskRun.status === "cancelled")
+          .map((taskRun) => taskRun.id));
+        for (const summary of this.state.completedHistory ?? []) removedTaskRunIds.add(summary.taskRunId);
+        this.state.taskRuns = this.state.taskRuns.filter((taskRun) => !removedTaskRunIds.has(taskRun.id));
         this.state.completedHistory = [];
+        this.archiveRefs = this.archiveRefs.filter((ref) => !removedTaskRunIds.has(ref.taskRunId));
       }
 
       if (this.state.currentTaskRunId && !this.state.taskRuns.some((taskRun) => taskRun.id === this.state.currentTaskRunId)) {
@@ -956,7 +992,7 @@ export class TaskedSubagentsController {
       }
       this.state.updatedAt = Date.now();
       const removed = before - this.state.taskRuns.length - (this.state.completedHistory?.length ?? 0);
-      await this.checkpointState(checkpointContext);
+      await this.checkpointState({ ...checkpointContext, archiveRefs: structuredClone(this.archiveRefs) });
       this.updateUI(this.lastContext);
       return removed;
     });
@@ -1484,9 +1520,23 @@ export class TaskedSubagentsController {
       this.updateUI(ctx ?? this.lastContext);
     });
     const taskRunIsTerminal = taskRunForSignal?.status !== "running" && taskRunForSignal?.status !== "pending";
-    if (emitTerminalSignal && taskRunForSignal && !this.taskRunSignalSuppressed(taskRunId) && taskRunIsTerminal && terminalStatus(status) && (expectedEpoch === undefined || this.stateEpoch === expectedEpoch)) {
-      this.emitRunSignal(taskRunForSignal, runId, status);
+    if (taskRunForSignal && taskRunIsTerminal && terminalStatus(status) && (expectedEpoch === undefined || this.stateEpoch === expectedEpoch)) {
+      this.handleTerminalSignal(taskRunForSignal, runId, status, emitTerminalSignal);
     }
+  }
+
+  private handleTerminalSignal(
+    taskRun: TaskRunRecord,
+    runId: string,
+    status: RunStatus,
+    enabled: boolean,
+    assignmentIds?: readonly string[],
+  ): void {
+    const suppressed = this.taskRunSignalSuppressed(taskRun.id);
+    // A wait-mode token represents one terminal handling, even when signals
+    // are disabled. This keeps suppression exact-once across background waves.
+    if (suppressed) this.releaseTaskRunSignal(taskRun.id);
+    if (enabled && !suppressed) this.emitRunSignal(taskRun, runId, status, assignmentIds);
   }
 
   private async markRunStatus(runId: string, status: RunStatus, checkpointContext: CheckpointContext): Promise<void> {
@@ -1503,12 +1553,22 @@ export class TaskedSubagentsController {
         }
         deriveTaskRunStatus(taskRun);
       }
-      await this.checkpointState(checkpointContext);
+      for (const taskRun of this.state.taskRuns) {
+        const terminalAssignments = taskRun.assignments.filter((assignment) => assignment.runId === runId && finalAssignmentStatus(assignment.status));
+        if (terminalAssignments.length > 0) {
+          // Use the same archive-before-checkpoint ordering as runner outcomes.
+          await this.archiveTerminalAssignments(taskRun, terminalAssignments, checkpointContext.sessionId);
+        }
+      }
+      await this.checkpointState({
+        ...checkpointContext,
+        ...(this.archiveRefs.length > 0 ? { archiveRefs: structuredClone(this.archiveRefs) } : {}),
+      });
       this.updateUI(this.lastContext);
     });
   }
 
-  private emitRunSignal(taskRun: TaskRunRecord, runId: string, status: RunStatus): void {
+  private emitRunSignal(taskRun: TaskRunRecord, runId: string, status: RunStatus, expectedAssignmentIds?: readonly string[]): void {
     const label = taskRun.status === "cancelled" || status === "cancelled"
       ? "cancelled"
       : taskRun.status === "failed" || status === "failed"
@@ -1517,7 +1577,9 @@ export class TaskedSubagentsController {
           ? "attention"
           : "completed";
     const customType = label === "completed" ? ENTRY_TYPE_COMPLETION : label === "attention" ? ENTRY_TYPE_ATTENTION : ENTRY_TYPE_FAILURE;
-    const assignments = taskRun.assignments.filter((assignment) => assignment.runId === runId);
+    const assignments = expectedAssignmentIds
+      ? taskRun.assignments.filter((assignment) => expectedAssignmentIds.includes(assignment.id))
+      : taskRun.assignments.filter((assignment) => assignment.runId === runId);
     const assignmentIds = assignments.map((assignment) => assignment.id);
     const assignmentLines = assignments.map((assignment) => {
       const summary = assignment.result?.summary.replace(/\s+/gu, " ").trim();

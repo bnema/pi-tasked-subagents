@@ -344,6 +344,7 @@ export class PersistenceCoordinator {
     this.sequence = 0;
     this.projectionDigest = undefined;
     this.lastCommitted = undefined;
+    this.dirty = undefined;
     this.committedIds.clear();
   }
 

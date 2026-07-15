@@ -33,6 +33,7 @@ import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 import { routeInput } from "../src/orchestration/input-router.js";
 import type { SessionEntry } from "../src/state/persistence.js";
 import { restoreBranchState } from "../src/state/restore.js";
+import { createEmptyState } from "../src/state/store.js";
 import { DurableObjectStore } from "../src/state/object-store.js";
 import { resolveStorageRoot } from "../src/state/storage-paths.js";
 import { registerMessageRenderers, statusLabel } from "../src/ui/messages.js";
@@ -191,6 +192,7 @@ const ToolParamsSchema = Type.Object({
   groupId: Type.Optional(NonEmptyString),
   taskId: Type.Optional(NonEmptyString),
   assignmentId: Type.Optional(NonEmptyString),
+  archiveId: Type.Optional(NonEmptyString),
   request: Type.Optional(NonEmptyString),
   title: Type.Optional(NonEmptyString),
   context: Type.Optional(NonEmptyString),
@@ -240,6 +242,9 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     const installed = restored.restored && controller.installRestoredState(restored.state, restored.archiveRefs, restoreEpoch);
     if (!restored.restored && restored.diagnostics.length > 0) {
       ctx.ui.notify("Tasked subagents persistence could not restore this branch; existing state was retained.", "error");
+    } else if (!restored.restored && !restored.hasV4Candidate) {
+      // An empty branch must not inherit live state from the previously selected branch.
+      controller.installRestoredState(createEmptyState(), [], restoreEpoch);
     }
     controller.updateUI(ctx);
     if (installed) controller.reconcileRestoredRuns(ctx);
@@ -336,7 +341,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             break;
           }
           const assignmentId = resolveResultAssignmentId(controller.getState(), target);
-          text = assignmentId ? await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), target);
+          text = assignmentId ? await controller.getRunResult(assignmentId, params.archiveId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), target);
           break;
         }
         case "attach": {

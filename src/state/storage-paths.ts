@@ -107,7 +107,8 @@ export function resultFilePath(paths: SessionStoragePaths, resultId: string): st
 }
 
 export function resultReservationPath(paths: SessionStoragePaths, resultId: string): string {
-  return `${resultFilePath(paths, resultId)}.reservation`;
+  if (!isResultId(resultId)) unsafeId("result ID");
+  return containedPath(paths.root, "results", sessionIdFromPaths(paths), `${resultId}.json.reservation`);
 }
 
 /** Return a contained, non-symlinked durable runner directory. */
@@ -129,6 +130,7 @@ export function assignmentArchiveDir(paths: SessionStoragePaths, assignmentId: s
 }
 
 export function assignmentArchiveLinkPath(paths: SessionStoragePaths, assignmentId: string, archiveId: string): string {
+  if (!assignmentId) unsafeId("assignment ID");
   assertId(archiveId, DIGEST_ID, "archive ID");
   return containedPath(paths.root, "assignments", sessionIdFromPaths(paths), sha256Hex(assignmentId), `${archiveId}.json`);
 }

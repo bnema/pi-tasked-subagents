@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,15 +8,24 @@ import { describe, expect, test } from "vitest";
 
 import { publishTerminalResult, verifyResultReservation } from "../src/launcher/result-files.mjs";
 import {
+  applyPublishedTerminalResult,
   evaluateTaskGraphCondition,
   getReadyTaskGraphStepIds,
   parseStructuredStepOutput,
   renderTaskGraphTemplate,
   renderTerminationSignal,
   terminateTrackedSteps,
+  waitForChildExit,
 } from "../src/launcher/direct-runner.mjs";
 
 describe("runner process identities", () => {
+  test("registers a child error listener before awaiting process identity I/O", async () => {
+    const child = new EventEmitter();
+    const exit = waitForChildExit(child);
+    child.emit("error", new Error("spawn failed"));
+    await expect(exit).rejects.toThrow("spawn failed");
+  });
+
   test("does not signal a PID whose stored start identity is missing or stale", async () => {
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100000)"], { stdio: "ignore" });
     try {
@@ -48,6 +58,22 @@ describe("immutable terminal result publication", () => {
       await rm(root, { recursive: true, force: true });
     }
   }
+
+  test("rejects noncanonical session IDs and empty run IDs before durable I/O", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-result-"));
+    const resultId = "0123456789abcdef0123456789abcdef";
+    const resultPath = path.join(root, "results", "session-test", `${resultId}.json`);
+    try {
+      await expect(publishTerminalResult(resultPath, `${resultPath}.reservation`, {
+        sessionId: "../escape", runId: "run-test", resultId,
+      }, { state: "failed" })).rejects.toThrow("Unsafe durable result identity");
+      await expect(publishTerminalResult(resultPath, `${resultPath}.reservation`, {
+        sessionId: "session-test", runId: " ", resultId,
+      }, { state: "failed" })).rejects.toThrow("Unsafe durable result identity");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("requires the adapter-owned reservation and never creates one", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-result-"));
@@ -148,6 +174,12 @@ describe("direct runner task graph internals", () => {
       { id: "b", status: "pending", dependsOn: ["a"] },
       { id: "c", status: "pending", dependsOn: ["b"] },
     ], 2)).toEqual(["b"]);
+  });
+
+  test("uses the immutable terminal winner when writing terminal status", () => {
+    expect(applyPublishedTerminalResult({ state: "paused", summary: "loser" }, {
+      state: "complete", success: true, summary: "winner", timestamp: 7,
+    }, 1)).toMatchObject({ state: "complete", success: true, summary: "winner", endedAt: 7, lastUpdate: 7 });
   });
 
   test("preserves terminal step statuses on cancellation", () => {

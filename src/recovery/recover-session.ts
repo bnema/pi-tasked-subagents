@@ -1,11 +1,13 @@
-import { createReadStream } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { constants, createReadStream } from "node:fs";
 import * as fs from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 
 import { MAX_RECOVERY_RECORD_BYTES } from "../defaults.js";
 import { migrateV4State } from "../state/v4-migration.js";
 import { DurableObjectStore } from "../state/object-store.js";
 import { stateFromEntryData } from "../state/persistence.js";
+import { pinDirectory, safeBasename, type PinnedDirectory } from "../state/pinned-directory.mjs";
 import { resolveStorageRoot, sessionStoragePaths } from "../state/storage-paths.js";
 
 export interface RecoverSessionOptions {
@@ -13,9 +15,11 @@ export interface RecoverSessionOptions {
   output: string;
   dataRoot?: string;
   /** Test/monitoring hook; recovery itself retains exactly one JSONL record. */
-  onRecordProcessed?: (recordsRetained: number) => void;
-  /** Test hook for simulating output-handle failures. */
+  onRecordProcessed?: (recordsRetained: number) => unknown;
+  /** Test hook for simulating temporary output-handle failures. */
   openOutput?: (path: string) => Promise<fs.FileHandle>;
+  /** Test hook for simulating publication-directory failures. */
+  openOutputDirectory?: (path: string) => Promise<PinnedDirectory>;
 }
 
 /** Counts and byte totals only: this report deliberately contains no session content or paths. */
@@ -35,6 +39,10 @@ function fail(message: string): never {
 
 function recoveryFailure(error: unknown): RecoveryError {
   return error instanceof RecoveryError ? error : new RecoveryError("session recovery failed", { cause: error });
+}
+
+function retainFailure(primary: unknown | undefined, cleanup: unknown): unknown {
+  return primary === undefined ? cleanup : new AggregateError([primary, cleanup], "session recovery failed");
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -139,17 +147,25 @@ export async function recoverSession(options: RecoverSessionOptions): Promise<Re
     fail("input is not readable");
   }
 
+  const outputDirectoryPath = dirname(output);
+  const outputName = safeBasename(basename(output));
+  const temporaryName = safeBasename(`.${outputName}.${process.pid}.${randomUUID()}.tmp`);
+  let outputDirectory: PinnedDirectory | undefined;
   let outputHandle: fs.FileHandle | undefined;
-  let createdOutput = false;
+  let temporaryExists = false;
   let failure: unknown;
-  let failed = false;
   let report: RecoveryReport | undefined;
 
   try {
-    await fs.mkdir(dirname(output), { recursive: true });
+    await fs.mkdir(outputDirectoryPath, { recursive: true });
+    outputDirectory = options.openOutputDirectory
+      ? await options.openOutputDirectory(outputDirectoryPath)
+      : await pinDirectory(outputDirectoryPath);
     try {
-      outputHandle = options.openOutput ? await options.openOutput(output) : await fs.open(output, "wx", 0o600);
-      createdOutput = true;
+      outputHandle = options.openOutput
+        ? await options.openOutput(outputDirectory.path(temporaryName))
+        : await outputDirectory.openFile(temporaryName, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      temporaryExists = true;
     } catch {
       fail("output cannot be created");
     }
@@ -160,8 +176,13 @@ export async function recoverSession(options: RecoverSessionOptions): Promise<Re
     let inputRecords = 0;
     let convertedStateEntries = 0;
     let copiedRecords = 0;
+    let outputBytes = 0;
     let first = true;
     const source = createReadStream(input);
+    const writeOutput = async (value: string): Promise<void> => {
+      await outputHandle!.writeFile(value, "utf8");
+      outputBytes += Buffer.byteLength(value);
+    };
 
     try {
       for await (const { line, delimiter } of jsonlRecords(source)) {
@@ -174,8 +195,8 @@ export async function recoverSession(options: RecoverSessionOptions): Promise<Re
             // Validate the ID before any durable object write.
             sessionStoragePaths(store.root, parsed.id);
             sessionId = parsed.id;
-            await outputHandle.writeFile(line, "utf8");
-            if (delimiter) await outputHandle.writeFile(delimiter, "utf8");
+            await writeOutput(line);
+            if (delimiter) await writeOutput(delimiter);
             continue;
           }
 
@@ -192,15 +213,15 @@ export async function recoverSession(options: RecoverSessionOptions): Promise<Re
             if (!migrated.migrated) fail("v4 state entry cannot be recovered");
             sequence += 1;
             entry.data = migrated.pointer;
-            await outputHandle.writeFile(JSON.stringify(entry), "utf8");
+            await writeOutput(JSON.stringify(entry));
             convertedStateEntries += 1;
           } else {
-            await outputHandle.writeFile(line, "utf8");
+            await writeOutput(line);
             copiedRecords += 1;
           }
-          if (delimiter) await outputHandle.writeFile(delimiter, "utf8");
+          if (delimiter) await writeOutput(delimiter);
         } finally {
-          options.onRecordProcessed?.(1);
+          await options.onRecordProcessed?.(1);
         }
       }
     } finally {
@@ -208,39 +229,49 @@ export async function recoverSession(options: RecoverSessionOptions): Promise<Re
     }
     if (first) fail("invalid session header");
     await outputHandle.sync();
-    report = {
-      inputRecords,
-      convertedStateEntries,
-      copiedRecords,
-      inputBytes,
-      outputBytes: (await fs.stat(output)).size,
-    };
+    const completedOutputHandle = outputHandle;
+    outputHandle = undefined;
+    await completedOutputHandle.close();
+
+    try {
+      // link(2) is the atomic no-replace publication gate for sibling files.
+      await outputDirectory.link(temporaryName, outputDirectory, outputName);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") fail("output already exists");
+      throw error;
+    }
+    await outputDirectory.sync();
+    await outputDirectory.unlink(temporaryName);
+    temporaryExists = false;
+    // Persist both the final link and removal of the private staging name.
+    await outputDirectory.sync();
+    report = { inputRecords, convertedStateEntries, copiedRecords, inputBytes, outputBytes };
   } catch (error) {
     failure = error;
-    failed = true;
   } finally {
-    try {
-      if (outputHandle) await outputHandle.close();
-    } catch (error) {
-      // A conversion error is more actionable than a cleanup failure; otherwise retain close causality.
-      if (!failed) {
-        failure = error;
-        failed = true;
+    if (outputHandle) {
+      try {
+        await outputHandle.close();
+      } catch (error) {
+        failure = retainFailure(failure, error);
       }
-    } finally {
-      if (createdOutput && failed) {
-        try {
-          await fs.rm(output, { force: true });
-        } catch (error) {
-          if (!failed) {
-            failure = error;
-            failed = true;
-          }
-        }
+    }
+    if (temporaryExists && outputDirectory) {
+      try {
+        await outputDirectory.unlink(temporaryName);
+      } catch (error) {
+        failure = retainFailure(failure, error);
+      }
+    }
+    if (outputDirectory) {
+      try {
+        await outputDirectory.close();
+      } catch (error) {
+        failure = retainFailure(failure, error);
       }
     }
   }
 
-  if (failed) throw recoveryFailure(failure);
+  if (failure !== undefined) throw recoveryFailure(failure);
   return report!;
 }

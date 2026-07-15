@@ -10,6 +10,15 @@ import { readProcessStartTime } from "../src/launcher/process-identity.mjs";
 import { PiRunnerAdapter } from "../src/launcher/pi-runner-adapter.js";
 import type { SubagentRunHandle } from "../src/types.js";
 
+async function pollUntil(check: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms`);
+}
+
 async function withLaunchedAdapter(runId: string, result: unknown, testBody: (adapter: PiRunnerAdapter, handle: SubagentRunHandle) => Promise<void>) {
   const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
   try {
@@ -57,7 +66,9 @@ describe("PiRunnerAdapter task graph boundary", () => {
       expect(JSON.parse(await readFile(path.join(first.asyncDir, "config.json"), "utf8"))).toMatchObject({ resultId: first.resultId, resultPath: first.resultPath });
       expect(JSON.parse(await readFile(path.join(second.asyncDir, "config.json"), "utf8"))).toMatchObject({ resultId: second.resultId, resultPath: second.resultPath });
 
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await pollUntil(() => adapter.isRunAlive(first));
+      await pollUntil(() => adapter.isRunAlive(second));
+      await pollUntil(async () => await readFile(path.join(second.asyncDir, "status.json"), "utf8").then(() => true, () => false));
       await expect(adapter.stopRun(first, ctx)).resolves.toBe(true);
       expect(JSON.parse(await readFile(first.resultPath, "utf8"))).toMatchObject({ resultId: first.resultId, state: "paused" });
       await expect(readFile(first.resultReservationPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
@@ -136,7 +147,9 @@ describe("PiRunnerAdapter task graph boundary", () => {
       }, { cwd: process.cwd(), sessionId: "session-a", pi: {} as never })).rejects.toThrow(/symlink|storage/i);
 
       expect(await readdir(outside)).toEqual([]);
-      await expect(readFile(path.join(`${sessionDirectory}-real`, "0123456789abcdef0123456789abcdef.json.reservation"), "utf8")).resolves.toContain("0123456789abcdef0123456789abcdef");
+      // Failure cleanup retains the original dirfd and removes its reservation,
+      // rather than following the swapped session-directory spelling.
+      await expect(readFile(path.join(`${sessionDirectory}-real`, "0123456789abcdef0123456789abcdef.json.reservation"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
@@ -192,8 +205,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
         runId: "run-cleanup", title: "Run", taskSummary: "Run",
         tasks: [{ assignmentId: "a1", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
       }, { cwd: process.cwd(), sessionId: "test", pi: {} as never });
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      expect((adapter as unknown as { trackedLaunches: Map<string, unknown> }).trackedLaunches.size).toBe(0);
+      await pollUntil(() => (adapter as unknown as { trackedLaunches: Map<string, unknown> }).trackedLaunches.size === 0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

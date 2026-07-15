@@ -5,6 +5,9 @@
   "license": "MIT",
   "author": "bnema",
   "type": "module",
+  "os": [
+    "linux"
+  ],
   "keywords": [
     "pi",
     "pi-extension",

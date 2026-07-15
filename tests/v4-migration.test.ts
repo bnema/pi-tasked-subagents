@@ -160,6 +160,18 @@ describe("v4 bounded migration", () => {
     expect(reloaded).toMatchObject({ restored: true, migrated: false, pointer: migrated.pointer });
   });
 
+  test("ignores malformed v5 pointer records when reserving a migration sequence", async () => {
+    const dataRoot = await root();
+    const migrated = await restoreBranchState([
+      { type: "custom", customType: ENTRY_TYPE_STATE, data: state("running") },
+      { type: "custom", customType: ENTRY_TYPE_STATE, data: { version: 5, checkpointId: "not-a-digest", sequence: Number.MAX_SAFE_INTEGER, writtenAt: 10 } },
+    ], new DurableObjectStore(dataRoot), {
+      sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined,
+    });
+
+    expect(migrated).toMatchObject({ restored: true, migrated: true, pointer: { sequence: 1 } });
+  });
+
   test("rejects Number.MAX_SAFE_INTEGER as an exhausted migration sequence before writing", async () => {
     const dataRoot = await root();
     const appended: unknown[] = [];

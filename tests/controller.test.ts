@@ -36,7 +36,7 @@ interface TaskRunControllerApi {
   editTask(input: EditTaskInput, ctx?: unknown): Promise<EditTaskResult>;
   editGroup(input: EditGroupInput, ctx?: unknown): Promise<EditGroupResult>;
   patchTaskRun(input: { taskRunId?: string; groups?: SetTasksInput["groups"]; tasks?: SetTasksInput["tasks"]; wait?: boolean }, ctx?: unknown): Promise<{ patched: boolean; taskRunId?: string; errors: string[]; dispatchScheduled: boolean }>;
-  dispatchReady(options?: { taskRunId?: string; ctx?: unknown }): Promise<{ launched: number; skipped: number; errors: string[]; hasBlockingIssue: boolean }>;
+  dispatchReady(options?: { taskRunId?: string; ctx?: unknown; emitTerminalSignal?: boolean }): Promise<{ launched: number; skipped: number; errors: string[]; hasBlockingIssue: boolean }>;
   attachTarget(targetId?: string, ctx?: unknown): Promise<AttachResult>;
   continueTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
   resolveTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
@@ -378,6 +378,27 @@ class LaunchControlledRuntime extends CompletingRuntime {
   }
 }
 
+class PostSpawnCancelControlledRuntime extends LaunchControlledRuntime {
+  private cancelStartedResolve!: () => void;
+  private releaseCancelResolve!: () => void;
+  readonly cancelStarted = new Promise<void>((resolve) => {
+    this.cancelStartedResolve = resolve;
+  });
+  private readonly releaseCancel = new Promise<void>((resolve) => {
+    this.releaseCancelResolve = resolve;
+  });
+
+  override async cancelRun(handle: SubagentRunHandle): Promise<boolean> {
+    this.cancelStartedResolve();
+    await this.releaseCancel;
+    return super.cancelRun(handle);
+  }
+
+  finishCancel(): void {
+    this.releaseCancelResolve();
+  }
+}
+
 class LaunchRejectControlledRuntime extends CompletingRuntime {
   private launchStartedResolve!: () => void;
   private launchReject: ((error: Error) => void) | undefined;
@@ -714,6 +735,15 @@ class ToggleFailingPersistence extends RecordingPersistence {
   }
 }
 
+class ArchiveRefRecordingPersistence extends RecordingPersistence {
+  readonly checkpointContexts: CheckpointContext[] = [];
+
+  override async checkpoint(state: TaskedSubagentsState, context: CheckpointContext): Promise<CheckpointResult> {
+    this.checkpointContexts.push(structuredClone(context));
+    return super.checkpoint(state, context);
+  }
+}
+
 class ContextRecordingPersistence extends RecordingPersistence {
   readonly checkpointContexts: CheckpointContext[] = [];
   readonly flushContexts: CheckpointContext[] = [];
@@ -918,7 +948,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(archives[0].archive).toMatchObject({ assignmentId, resultId: runtime.resultId, runId: expect.any(String) });
   });
 
-  test("flush retries a failed terminal archive checkpoint with its original branch-local result reference", async () => {
+  test("flush retries a failed clear checkpoint with pruned archive references", async () => {
     const dataRoot = await createControllerDataRoot("tasked-dirty-terminal-");
     const sessionId = "pi-tasked-subagents";
     const assignmentId = "assignment-001";
@@ -972,9 +1002,8 @@ describe("TaskedSubagentsController TaskRun public API", () => {
       controller.restoreState(state, [archiveRef]);
 
       await expect(controller.clear("completed")).rejects.toThrow("append unavailable");
-      // A later lifecycle can have no current archives; retry must use the
-      // immutable terminal snapshot rather than this empty live context.
-      (controller as unknown as { archiveRefs: ArchiveRef[] }).archiveRefs = [];
+      // Clear removes archive references before checkpointing, so a retry
+      // cannot revive a result that the user explicitly cleared.
       failAppend = false;
       await controller.flushPersistence();
 
@@ -986,12 +1015,12 @@ describe("TaskedSubagentsController TaskRun public API", () => {
         store,
         { sessionId, allEntries: [], appendMigratedPointer: () => undefined },
       );
-      expect(restored).toMatchObject({ restored: true, archiveRefs: [{ archiveId: selected.archiveId, resultId: selectedResultId }] });
+      expect(restored).toMatchObject({ restored: true, archiveRefs: [] });
       if (!restored.restored) throw new Error("terminal checkpoint should restore");
 
       const restarted = asTaskRunApi(new TaskedSubagentsController(fakePi(), { dataRoot }));
       restarted.restoreState(restored.state, restored.archiveRefs);
-      await expect(restarted.getRunResult(assignmentId)).resolves.toBe("selected branch result");
+      await expect(restarted.getRunResult(assignmentId)).resolves.toContain(`Ambiguous result for ${assignmentId}`);
     } finally {
       await rm(dataRoot, { recursive: true, force: true });
     }
@@ -1903,7 +1932,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(assignment.completedAt).toBeUndefined();
   });
 
-  test("background launch failure emits one terminal failure signal", async () => {
+  test("background launch failure emits one terminal failure signal after its populated failure checkpoint", async () => {
     const pi = fakePi();
     const runtime = new LaunchRejectControlledRuntime();
     const controller = asTaskRunApi(new TaskedSubagentsController(pi, { runtime }));
@@ -1916,7 +1945,10 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(controller.getState().taskRuns[0].status).toBe("failed");
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ details: expect.objectContaining({ status: "failed" }) }),
+      expect.objectContaining({
+        content: expect.stringContaining(controller.getState().taskRuns[0].assignments[0].id),
+        details: expect.objectContaining({ status: "failed" }),
+      }),
       { triggerTurn: true, deliverAs: "followUp" },
     );
   });
@@ -1963,6 +1995,56 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(signalSuppressionCounts(controller)).toEqual(new Map());
     await expect(controller.editGroup({ taskRunId: "task-run-1", targetId: "main", group: { title: "Retry group" }, wait: true })).rejects.toThrow("durability unavailable");
     expect(signalSuppressionCounts(controller)).toEqual(new Map());
+  });
+
+  test("terminal control archives assignments before checkpointing", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-control-archive-");
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { runtime: new CancelSpyRuntime(), dataRoot }));
+    controller.restoreState(recoverableState("attention"));
+
+    await expect(controller.cancelRun("a1")).resolves.toBe(true);
+
+    const archives = await new DurableObjectStore(dataRoot).listAssignmentArchives("pi-tasked-subagents", "a1");
+    expect(archives).toHaveLength(1);
+    expect(archives[0].archive).toMatchObject({ assignmentId: "a1", status: "cancelled", runId: "run-1" });
+  });
+
+  test("terminal handling consumes wait suppression without emitting when signals are disabled", async () => {
+    const pi = fakePi();
+    const controllerWithPi = asTaskRunApi(new TaskedSubagentsController(pi, { runtime: new CompletingRuntime() }));
+    controllerWithPi.restoreState({
+      version: 4, currentTaskRunId: "task-run-1", updatedAt: 1,
+      taskRuns: [{
+        id: "task-run-1", title: "Task run", request: "Do it", context: "Context", status: "pending",
+        groups: [{ id: "main", title: "Main", status: "ready", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 }],
+        tasks: [{ id: "task", groupId: "main", text: "Do it", status: "ready", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 }],
+        assignments: [], artifacts: [], createdAt: 1, updatedAt: 1,
+      }],
+    });
+    signalSuppressionCounts(controllerWithPi).set("task-run-1", 1);
+
+    await controllerWithPi.dispatchReady({ taskRunId: "task-run-1", emitTerminalSignal: false });
+
+    expect(signalSuppressionCounts(controllerWithPi)).toEqual(new Map());
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("clear checkpoints only archive refs retained by the resulting state", async () => {
+    const persistence = new ArchiveRefRecordingPersistence();
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { persistence }));
+    const state = recoverableState("attention");
+    const refs: ArchiveRef[] = [
+      { assignmentId: "a1", assignmentIdHash: sha256Hex("a1"), archiveId: "a".repeat(64), taskRunId: "task-run-1", completedAt: 1 },
+      { assignmentId: "other", assignmentIdHash: sha256Hex("other"), archiveId: "b".repeat(64), taskRunId: "other-run", completedAt: 1 },
+    ];
+    controller.restoreState(state, refs);
+
+    await expect(controller.clear("completed", "task-run-1")).resolves.toBe(1);
+    expect(persistence.checkpointContexts.at(-1)?.archiveRefs).toEqual([refs[1]]);
+
+    controller.restoreState(state, refs);
+    await expect(controller.clear("all")).resolves.toBe(1);
+    expect(persistence.checkpointContexts.at(-1)?.archiveRefs).toEqual([]);
   });
 
   test("clear removes completed task runs", async () => {
@@ -2075,6 +2157,34 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(assignment).toMatchObject({ status: "queued" });
     expect(assignment.launchRef).toBeUndefined();
     expect(pi.appendEntry).not.toHaveBeenCalled();
+  });
+
+  test("launch durability compensation re-resolves a replaced live assignment by id", async () => {
+    const runtime = new PostSpawnCancelControlledRuntime();
+    const persistence = new RecordingPersistence();
+    persistence.failAt = 3;
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { runtime, persistence } as never));
+
+    const request = controller.setTasks({ ...baseSetTasks, wait: true });
+    await runtime.launchStarted;
+    runtime.releaseLaunch();
+    await runtime.cancelStarted;
+
+    const live = (controller as unknown as { state: TaskedSubagentsState }).state.taskRuns[0].assignments[0];
+    (controller as unknown as { state: TaskedSubagentsState }).state.taskRuns[0].assignments[0] = {
+      ...live,
+      status: "running",
+      runId: runtime.requests[0].runId,
+      updatedAt: 999,
+    };
+    runtime.finishCancel();
+    await request;
+
+    const assignment = controller.getState().taskRuns[0].assignments[0];
+    expect(assignment).toMatchObject({ status: "queued" });
+    expect(assignment.updatedAt).not.toBe(999);
+    expect(assignment.runId).toBeUndefined();
+    expect(assignment.launchRef).toBeUndefined();
   });
 
   test("does not claim cancellation or checkpoint queued compensation when post-spawn cancellation fails", async () => {

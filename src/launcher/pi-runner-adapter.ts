@@ -4,6 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -25,7 +26,8 @@ import type {
 import { getAgentProfile, listAvailableAgentProfiles } from "./agent-profiles.js";
 import { ensureTaskGraphRequest, type LaunchResult, type RunnerRuntimeContext, type RunnerChildConfig, type RunnerConfig } from "./interface.js";
 import { captureProcessIdentity, isProcessIdentityAlive, signalProcessIdentity } from "./process-identity.mjs";
-import { publishTerminalResult, releaseResultReservation, reserveResultReservation } from "./result-files.mjs";
+import { openPinnedDirectory } from "../state/pinned-directory.mjs";
+import { publishTerminalResult, reserveResultReservation } from "./result-files.mjs";
 
 function now(): number {
   return Date.now();
@@ -47,6 +49,40 @@ async function readJsonFile<T>(filePath: string | undefined): Promise<T | undefi
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   await fsp.writeFile(filePath, JSON.stringify(value, null, 2), "utf8");
+}
+
+/** Durable runner files are read and written only relative to a live dirfd. */
+async function readPinnedJsonFile<T>(root: string, directoryPath: string, name: string, procDirectoryPath?: (fd: number) => string): Promise<T | undefined> {
+  const directory = await openPinnedDirectory(root, directoryPath, { procDirectoryPath });
+  let handle;
+  try {
+    handle = await directory.openFile(name, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) return undefined;
+    const content = await handle.readFile("utf8");
+    const after = await handle.stat();
+    if (!after.isFile() || after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size) return undefined;
+    return JSON.parse(content) as T;
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close();
+    await directory.close();
+  }
+}
+
+async function writePinnedJsonFile(root: string, directoryPath: string, name: string, value: unknown, procDirectoryPath?: (fd: number) => string): Promise<void> {
+  const directory = await openPinnedDirectory(root, directoryPath, { procDirectoryPath });
+  let handle;
+  try {
+    handle = await directory.openFile(name, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    await handle.writeFile(JSON.stringify(value, null, 2), "utf8");
+    await handle.sync();
+    await directory.sync();
+  } finally {
+    await handle?.close();
+    await directory.close();
+  }
 }
 
 function tempRoot(): string {
@@ -95,6 +131,8 @@ interface ProcessIdentity {
 interface RunnerStatusFile {
   runId?: string;
   state?: "queued" | "running" | "complete" | "failed" | "paused" | "cancelled" | "skipped";
+  success?: boolean;
+  summary?: string;
   pid?: number;
   pidStartTime?: string;
   steps?: Array<{
@@ -112,6 +150,7 @@ interface RunnerStatusFile {
 
 interface RunnerResultFile {
   runId?: string;
+  timestamp?: number;
   state?: "complete" | "failed" | "paused" | "cancelled" | "skipped";
   success?: boolean;
   summary?: string;
@@ -271,13 +310,10 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
         })),
       };
     } finally {
-      if (!launched) {
-        await releaseResultReservation(this.dataRoot, resultsDir, {
-          sessionId,
-          runId: request.runId,
-          resultId: reservation.resultId,
-        }, { procDirectoryPath: this.procDirectoryPath }).catch(() => undefined);
-      }
+      // The reservation retains its dirfd, so a renamed/symlink-swapped spelling
+      // cannot redirect failure cleanup outside the directory that owns it.
+      if (!launched) await reservation.release().catch(() => undefined);
+      else await reservation.close();
     }
   }
 
@@ -309,11 +345,15 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     let terminalResultSeenAt: number | undefined;
     while (now() < deadline) {
       if (options?.signal?.aborted) return "cancelled";
-      const statusFile = await readJsonFile<RunnerStatusFile>(paths.statusPath);
+      const statusFile = handle.legacy
+        ? await readJsonFile<RunnerStatusFile>(paths.statusPath)
+        : await this.readDurableStatus(paths);
       if (statusFile?.state) {
         await options?.onUpdate?.(buildProgressSnapshot(runId, statusFile));
       }
-      const result = await readJsonFile<RunnerResultFile>(launch.resultPath ?? paths.resultPath);
+      const result = handle.legacy
+        ? await readJsonFile<RunnerResultFile>(launch.resultPath ?? paths.resultPath)
+        : await this.readDurableResult(paths);
       if (result?.state) {
         const status = mapRunnerState(result.state);
         if (isTerminalStatus(status)) {
@@ -331,7 +371,9 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     const { runId } = handle;
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return undefined;
-    const result = await readJsonFile<RunnerResultFile>(resolved.launch.resultPath);
+    const result = handle.legacy
+      ? await readJsonFile<RunnerResultFile>(resolved.launch.resultPath)
+      : await this.readDurableResult(resolved.paths);
     if (!result) return undefined;
     if (typeof result.rawOutput === "string" && result.rawOutput.trim()) return result.rawOutput;
     if (Array.isArray(result.results) && result.results.length > 1) {
@@ -353,7 +395,9 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   async isRunAlive(handle: SubagentRunHandle): Promise<boolean> {
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return false;
-    const statusFile = await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath);
+    const statusFile = handle.legacy
+      ? await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath)
+      : await this.readDurableStatus(resolved.paths);
     const identities = this.processIdentities(handle, statusFile);
     for (const identity of identities) if (await isProcessIdentityAlive(identity)) return true;
     return false;
@@ -361,6 +405,18 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
 
   getSnapshot(): { assignments: TaskAssignmentRecord[]; counts: RunCounts } {
     return { assignments: [], counts: emptyCounts() };
+  }
+
+  private async readDurableStatus(paths: RunPaths): Promise<RunnerStatusFile | undefined> {
+    return readPinnedJsonFile<RunnerStatusFile>(this.dataRoot, paths.asyncDir, "status.json", this.procDirectoryPath);
+  }
+
+  private async readDurableResult(paths: RunPaths): Promise<RunnerResultFile | undefined> {
+    return readPinnedJsonFile<RunnerResultFile>(this.dataRoot, paths.resultsDir, path.basename(paths.resultPath), this.procDirectoryPath);
+  }
+
+  private async writeDurableStatus(paths: RunPaths, value: unknown): Promise<void> {
+    await writePinnedJsonFile(this.dataRoot, paths.asyncDir, "status.json", value, this.procDirectoryPath);
   }
 
   private requireResultsDir(sessionId: string): string {
@@ -408,6 +464,8 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     resultId: string;
     resultPath: string;
     resultReservationPath: string;
+    close: () => Promise<void>;
+    release: () => Promise<void>;
   }> {
     if (!sessionId) throw new Error("Unsafe session ID");
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -417,8 +475,15 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
         const reservation = await reserveResultReservation(this.dataRoot, resultsDir, { sessionId, runId, resultId }, {
           beforeMutation: this.storageMutationHook,
           procDirectoryPath: this.procDirectoryPath,
+          retainDirectory: true,
         });
-        return { resultId, ...reservation };
+        return { resultId, ...reservation } as {
+          resultId: string;
+          resultPath: string;
+          resultReservationPath: string;
+          close: () => Promise<void>;
+          release: () => Promise<void>;
+        };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
         throw error;
@@ -555,13 +620,15 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     if (!resolved) return false;
     const { paths, launch } = resolved;
     const tracked = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId));
-    const existingStatus = await readJsonFile<RunnerStatusFile>(paths.statusPath);
+    const existingStatus = handle.legacy
+      ? await readJsonFile<RunnerStatusFile>(paths.statusPath)
+      : await this.readDurableStatus(paths);
     const resultPath = launch.resultPath ?? paths.resultPath;
 
     const identities = this.processIdentities(handle, existingStatus, tracked);
 
     const timestamp = now();
-    const terminalStatus = {
+    const terminalStatus: RunnerStatusFile & { endedAt?: number; lastUpdate?: number } = {
       ...(existingStatus ?? {}),
       runId,
       state,
@@ -572,7 +639,9 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
         status: preservedStepStatus(step.status) ? step.status : state,
       })),
     };
-    const existingResult = await readJsonFile<RunnerResultFile>(resultPath);
+    const existingResult = handle.legacy
+      ? await readJsonFile<RunnerResultFile>(resultPath)
+      : await this.readDurableResult(paths);
     const terminalResult = {
       ...(existingResult ?? {}),
       runId,
@@ -588,13 +657,13 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       if (await isProcessIdentityAlive(identity) && !await signalProcessIdentity(identity)) allSignaled = false;
     }
 
-    await writeJsonFile(paths.statusPath, terminalStatus);
     if (handle.legacy) {
+      await writeJsonFile(paths.statusPath, terminalStatus);
       await writeJsonFile(resultPath, terminalResult);
       return allSignaled;
     }
     try {
-      await publishTerminalResult(resultPath, handle.resultReservationPath, {
+      const publication = await publishTerminalResult(resultPath, handle.resultReservationPath, {
         sessionId,
         runId,
         resultId: handle.resultId,
@@ -603,6 +672,13 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
         beforeMutation: this.storageMutationHook,
         procDirectoryPath: this.procDirectoryPath,
       });
+      const winner = publication.value as RunnerResultFile;
+      terminalStatus.state = winner.state ?? terminalStatus.state;
+      terminalStatus.success = winner.success;
+      terminalStatus.summary = winner.summary;
+      terminalStatus.endedAt = typeof winner.timestamp === "number" ? winner.timestamp : timestamp;
+      terminalStatus.lastUpdate = terminalStatus.endedAt;
+      await this.writeDurableStatus(paths, terminalStatus);
     } catch {
       return false;
     }

@@ -1,4 +1,4 @@
-import { chmodSync, constants, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, constants, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -19,7 +19,7 @@ import {
 import { canonicalJson, canonicalJsonBounded, sha256Hex, utf8Bytes } from "../src/state/canonical-json.js";
 import type { AssignmentArchiveV1 } from "../src/state/durable-types.js";
 import { DurableObjectStore } from "../src/state/object-store.js";
-import { PinnedDirectory } from "../src/state/pinned-directory.mjs";
+import { PinnedDirectory, pinExistingDirectory } from "../src/state/pinned-directory.mjs";
 import { rewriteSessionRefs } from "../src/state/persistence-coordinator.js";
 import {
   assignmentArchiveDir,
@@ -107,11 +107,18 @@ describe("bounded durable storage primitives", () => {
     expect(() => sessionStoragePaths(root, "../escape")).toThrow(/unsafe/i);
     expect(() => resultFilePath(paths, "../escape")).toThrow(/unsafe/i);
     expect(() => assignmentArchiveLinkPath(paths, "assignment", "../escape")).toThrow(/unsafe/i);
+    expect(() => assignmentArchiveLinkPath(paths, "", "a".repeat(64))).toThrow(/unsafe/i);
 
     const outside = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-outside-"));
     mkdirSync(join(paths.root, "results"), { recursive: true });
     symlinkSync(outside, paths.resultsDir);
     expect(() => resultFilePath(paths, "0123456789abcdef0123456789abcdef")).toThrow(/symlink|contain/i);
+
+    rmSync(paths.resultsDir, { recursive: true });
+    mkdirSync(paths.resultsDir, { recursive: true });
+    const resultId = "0123456789abcdef0123456789abcdef";
+    symlinkSync(join(outside, "reservation-target"), join(paths.resultsDir, `${resultId}.json.reservation`));
+    expect(() => resultReservationPath(paths, resultId)).toThrow(/symlink|contain/i);
   });
 
   test("closes an acquired child handle when its post-open pin assertion fails", async () => {
@@ -133,6 +140,18 @@ describe("bounded durable storage primitives", () => {
       stat.mockRestore();
       await parent.close();
     }
+  });
+
+  test("rejects a pin whose procfs capability resolves outside its expected contained directory", async () => {
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-pinned-root-"));
+    const child = join(root, "child");
+    const outside = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-pinned-outside-"));
+    mkdirSync(child);
+    const expected = await fs.stat(child);
+
+    await expect(pinExistingDirectory(root, child, { dev: expected.dev, ino: expected.ino, realpath: realpathSync(child) }, {
+      procDirectoryPath: (fd) => realpathSync(`/proc/self/fd/${fd}`) === realpathSync(child) ? outside : `/proc/self/fd/${fd}`,
+    })).rejects.toThrow(/escapes|identity/i);
   });
 
   test("canonicalizes JSON and SHA-256 deterministically", () => {
@@ -219,6 +238,53 @@ describe("bounded durable storage primitives", () => {
     } finally {
       readFile.mockRestore();
     }
+  });
+
+  test.each(["EIO", "EMFILE", "EACCES"])("does not quarantine an archive link after an operational %s read failure", async (code) => {
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const store = new DurableObjectStore(root);
+    const sessionId = "session-123";
+    const assignmentId = "assignment-1";
+    const archiveId = await store.put("assignment", { assignmentId }, MAX_ASSIGNMENT_ARCHIVE_BYTES);
+    await store.linkAssignmentArchive(sessionId, assignmentId, archiveId);
+    const link = assignmentArchiveLinkPath(sessionStoragePaths(root, sessionId), assignmentId, archiveId);
+    const probe = await fs.open(link, "r");
+    const prototype = Object.getPrototypeOf(probe) as fs.FileHandle;
+    await probe.close();
+    const readFile = vi.spyOn(prototype, "readFile").mockRejectedValueOnce(Object.assign(new Error("injected I/O error"), { code }));
+
+    try {
+      await expect(store.listAssignmentArchives(sessionId, assignmentId)).rejects.toMatchObject({ code });
+      expect(lstatSync(link).isFile()).toBe(true);
+    } finally {
+      readFile.mockRestore();
+    }
+  });
+
+  test("bounds verify before reading and enforces the configured kind limit", async () => {
+    const root = temporaryRoot(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const store = new DurableObjectStore(root);
+    const bytes = "x".repeat(MAX_TASK_RUN_OBJECT_BYTES + 1);
+    const id = sha256Hex(bytes);
+    const path = join(root, "objects", `${id}.json`);
+    mkdirSync(join(root, "objects"), { recursive: true });
+    writeFileSync(path, bytes);
+    const probe = await fs.open(path, "r");
+    const prototype = Object.getPrototypeOf(probe) as fs.FileHandle;
+    await probe.close();
+    const readFile = vi.spyOn(prototype, "readFile");
+
+    try {
+      await expect(store.verify(id)).resolves.toBe(false);
+      expect(readFile).not.toHaveBeenCalled();
+    } finally {
+      readFile.mockRestore();
+    }
+
+    const checkpointBytes = canonicalJson({ storeVersion: 1, kind: "checkpoint", payload: { text: "x".repeat(MAX_CHECKPOINT_BYTES) } });
+    const checkpointId = sha256Hex(checkpointBytes);
+    writeFileSync(join(root, "objects", `${checkpointId}.json`), checkpointBytes);
+    await expect(store.verify(checkpointId)).resolves.toBe(false);
   });
 
   test("never overwrites a corrupt immutable destination and verifies digests and kinds on read", async () => {

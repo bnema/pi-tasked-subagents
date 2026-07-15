@@ -8,7 +8,6 @@ import {
 } from "../defaults.js";
 import type {
   ArtifactRef,
-  AssignmentStatus,
   TaskResultRecord,
   TaskRunRecord,
   TaskRunStatus,
@@ -21,6 +20,7 @@ import type {
   CompletedRunSummary,
   RecentAssignmentReference,
   RecoverableRunReference,
+  TerminalAssignmentArchiveStatus,
 } from "./durable-types.js";
 
 /** Text appended whenever a detail field is reduced to its byte budget. */
@@ -45,21 +45,25 @@ export interface ArchiveRef extends RecentAssignmentReference {
   completedAt: number;
 }
 
-export interface AssignmentArchiveInput {
+interface AssignmentArchiveInputBase {
   assignmentId: string;
   taskRunId: string;
   groupId?: string;
   taskId: string;
-  status: AssignmentStatus;
+  status: TerminalAssignmentArchiveStatus;
   summary: string;
   criteriaEvidence: TaskResultRecord["criteriaEvidence"];
   artifacts: ArtifactRef[];
   followUps: string[];
   runId: string;
-  resultId?: string;
-  resultUnavailableReason?: "missing-legacy-result";
   completedAt: number;
 }
+
+type AssignmentArchiveInputResult =
+  | { resultId: string; resultUnavailableReason?: never }
+  | { resultId?: never; resultUnavailableReason: "missing-legacy-result" };
+
+export type AssignmentArchiveInput = AssignmentArchiveInputBase & AssignmentArchiveInputResult;
 
 /** The bounded data from which the coordinator writes task-run objects and a manifest. */
 export interface CheckpointProjection {
@@ -197,20 +201,24 @@ function normalizeArtifacts(artifacts: ArtifactRef[]): ArtifactRef[] {
   }));
 }
 
+function archiveResultState(input: AssignmentArchiveInput): AssignmentArchiveInputResult {
+  return input.resultId === undefined
+    ? { resultUnavailableReason: input.resultUnavailableReason }
+    : { resultId: input.resultId };
+}
+
 function archiveMetadata(input: AssignmentArchiveInput): AssignmentArchiveV1 {
-  const archive: AssignmentArchiveV1 = {
+  return {
     assignmentId: input.assignmentId,
     taskRunId: input.taskRunId,
     ...(input.groupId === undefined ? {} : { groupId: input.groupId }),
     taskId: input.taskId,
     status: input.status,
     runId: input.runId,
-    ...(input.resultId === undefined ? {} : { resultId: input.resultId }),
-    ...(input.resultUnavailableReason === undefined ? {} : { resultUnavailableReason: input.resultUnavailableReason }),
+    ...archiveResultState(input),
     completedAt: input.completedAt,
     detailOmitted: true,
   };
-  return archive;
 }
 
 /**
@@ -231,8 +239,7 @@ export function projectAssignmentArchive(input: AssignmentArchiveInput): Assignm
       .slice(0, MAX_ARCHIVE_FOLLOW_UPS)
       .map((followUp) => truncateUtf8(followUp, MAX_ARCHIVE_FOLLOW_UP_BYTES)),
     runId: input.runId,
-    ...(input.resultId === undefined ? {} : { resultId: input.resultId }),
-    ...(input.resultUnavailableReason === undefined ? {} : { resultUnavailableReason: input.resultUnavailableReason }),
+    ...archiveResultState(input),
     completedAt: input.completedAt,
   };
   try {
@@ -296,12 +303,27 @@ export function buildCheckpointProjection(
     archiveId,
     ...(resultId === undefined ? {} : { resultId }),
   }));
+  // Restored terminal history is not rehydrated as a schedulable TaskRun.
+  // Preserve it alongside newly completed live runs, with the latter taking
+  // precedence when a run appears in both sources.
+  const completedById = new Map<string, CompletedRunSummary>();
+  for (const summary of state.completedHistory ?? []) {
+    const { archives: _archives, ...restored } = summary;
+    completedById.set(restored.taskRunId, restored);
+  }
+  for (const run of state.taskRuns) {
+    if (COMPLETED_STATUSES.has(run.status)) completedById.set(run.id, completedSummary(run, newestArchives));
+  }
   const completedRuns = newestFirst(
-    state.taskRuns.filter((run) => COMPLETED_STATUSES.has(run.status)),
-    (run) => run.completedAt ?? run.updatedAt,
-  )
-    .slice(0, MAX_RECENT_COMPLETED)
-    .map((run) => completedSummary(run, newestArchives));
+    [...completedById.values()],
+    (summary) => summary.completedAt ?? summary.updatedAt,
+  ).slice(0, MAX_RECENT_COMPLETED);
+  // The active selection may deliberately inspect a completed run. Retain it
+  // even when newer history would otherwise displace it from the bounded set.
+  const selectedCompleted = state.currentTaskRunId === undefined ? undefined : completedById.get(state.currentTaskRunId);
+  if (selectedCompleted && !completedRuns.some((summary) => summary.taskRunId === selectedCompleted.taskRunId)) {
+    completedRuns[MAX_RECENT_COMPLETED - 1] = selectedCompleted;
+  }
 
   return {
     ok: true,

@@ -18,6 +18,7 @@ interface CapturedTool {
   parameters: unknown;
   renderCall: (args: unknown, theme: { fg(color: string, text: string): string }) => { render(width?: number): string[] };
   renderResult: (result: { content?: Array<{ type: string; text: string }> }, options: { expanded: boolean; isPartial: boolean }, theme: { fg(color: string, text: string): string }) => { render(width?: number): string[] };
+  execute: (toolCallId: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: unknown, ctx: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
 }
 
 interface CapturedCommand {
@@ -57,6 +58,7 @@ describe("tasked_subagents extension rendering", () => {
     let sessionTree: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
     let sessionShutdown: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
     const fenceRestore = vi.spyOn(TaskedSubagentsController.prototype, "fenceRestore");
+    const installRestoredState = vi.spyOn(TaskedSubagentsController.prototype, "installRestoredState");
     const flushPersistence = vi.spyOn(TaskedSubagentsController.prototype, "flushPersistence");
     const context = {
       cwd: "/tmp/project", mode: "tui",
@@ -75,7 +77,8 @@ describe("tasked_subagents extension rendering", () => {
     } as never);
 
     await sessionTree?.({}, context);
-    expect(fenceRestore).toHaveBeenCalledTimes(1);
+    expect(fenceRestore).toHaveBeenCalled();
+    expect(installRestoredState).toHaveBeenCalledWith(expect.objectContaining({ taskRuns: [] }), [], expect.any(Number));
     await sessionShutdown?.({}, context);
     expect(flushPersistence).toHaveBeenCalledWith(context);
   });
@@ -130,6 +133,7 @@ describe("tasked_subagents extension rendering", () => {
       expect(refsAtInstall?.checkpointIds).toEqual([active.pointer.checkpointId, inactive.pointer.checkpointId].sort());
       expect(JSON.parse(await readFile(paths.refsPath, "utf8"))).toEqual(refsAtInstall);
       expect(pi.appendEntry).not.toHaveBeenCalled();
+      restoreState.mockRestore();
     } finally {
       if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
       else process.env.XDG_DATA_HOME = previousXdgDataHome;
@@ -225,6 +229,7 @@ describe("tasked_subagents extension rendering", () => {
     expect(publicSurface).toContain("wait");
     expect(publicSurface).toContain("taskRunId");
     expect(publicSurface).toContain("groupId");
+    expect(publicSurface).toContain("archiveId");
     expect(guidance).toContain("complete plan");
     expect(guidance).toContain("upfront");
     expect(guidance).toContain("groups plus flat tasks");
@@ -235,6 +240,22 @@ describe("tasked_subagents extension rendering", () => {
     expect(publicSurface).not.toContain("planId");
     expect(publicSurface).not.toContain("phaseId");
     expect(publicSurface).not.toContain("phases");
+  });
+
+  test("result tool accepts archiveId and forwards it to the controller", async () => {
+    const archiveId = "a".repeat(64);
+    const getRunResult = vi.spyOn(TaskedSubagentsController.prototype, "getRunResult").mockResolvedValue("selected archive result");
+
+    const result = await captureExtension().tool.execute(
+      "tool-call",
+      { action: "result", assignmentId: "assignment-1", archiveId },
+      new AbortController().signal,
+      undefined,
+      {},
+    );
+
+    expect(getRunResult).toHaveBeenCalledWith("assignment-1", archiveId);
+    expect(result.content).toEqual([{ type: "text", text: "selected archive result" }]);
   });
 
   test("collapsed tool calls show the action and target", () => {

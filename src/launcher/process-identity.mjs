@@ -1,5 +1,9 @@
 import fs from "node:fs/promises";
 
+// Node 22-25 exposes no stable in-process pidfd_open/pidfd_send_signal API.
+// This package deliberately has no native addon, shell, or Python fallback, so
+// procfs start-time comparison remains the strongest supported termination guard.
+
 function validPid(pid) {
   return Number.isSafeInteger(pid) && pid > 0;
 }

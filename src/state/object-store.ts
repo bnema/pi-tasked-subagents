@@ -3,11 +3,11 @@ import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
-import { MAX_ASSIGNMENT_ARCHIVE_BYTES, STORE_VERSION } from "../defaults.js";
+import { MAX_ASSIGNMENT_ARCHIVE_BYTES, MAX_CHECKPOINT_BYTES, MAX_TASK_RUN_OBJECT_BYTES, STORE_VERSION } from "../defaults.js";
 import { canonicalJson, canonicalJsonBounded, sha256Hex } from "./canonical-json.js";
 import type { StoredObject } from "./durable-types.js";
 import { assignmentArchiveDir, assignmentArchiveLinkPath, sessionStoragePaths } from "./storage-paths.js";
-import { pinExistingDirectory } from "./pinned-directory.mjs";
+import { PinnedDirectory as PinnedDirectoryCapability, pinExistingDirectory } from "./pinned-directory.mjs";
 
 const DIGEST_ID = /^[a-f0-9]{64}$/;
 type ObjectKind = StoredObject<unknown>["kind"];
@@ -26,10 +26,14 @@ export interface DurableObjectStoreOptions {
 }
 
 interface PinnedDirectory {
+  capability: PinnedDirectoryCapability;
   handle: fs.FileHandle;
   identity: PathIdentity;
   procPath: string;
 }
+
+/** Corruption and immutable-identity failures that archive discovery may quarantine. */
+class ObjectIntegrityError extends Error {}
 
 function assertDigest(id: string): void {
   if (!DIGEST_ID.test(id)) throw new Error("Invalid object digest");
@@ -62,13 +66,9 @@ export class DurableObjectStore {
     const id = sha256Hex(bytes);
     await this.ensureStoreDirectories();
     const destination = this.objectPath(id);
-
-    try {
-      await this.installNoReplace(destination, bytes);
-    } catch (error) {
-      if (!this.isAlreadyExists(error)) throw error;
-      await this.readVerifiedObject(destination, id, kind, maxBytes);
-    }
+    await this.installNoReplace(destination, bytes, async (directory, name) => {
+      await this.readVerifiedPinnedObject(directory, name, id, kind, maxBytes);
+    });
     return id;
   }
 
@@ -81,7 +81,9 @@ export class DurableObjectStore {
   async verify(id: string): Promise<boolean> {
     try {
       assertDigest(id);
-      await this.readVerifiedObject(this.objectPath(id), id);
+      // A kind is not known until the envelope is parsed, so cap the initial
+      // read at the largest configured object and then enforce its own limit.
+      await this.readVerifiedObject(this.objectPath(id), id, undefined, MAX_TASK_RUN_OBJECT_BYTES);
       return true;
     } catch {
       return false;
@@ -112,7 +114,7 @@ export class DurableObjectStore {
         await this.assertPinnedDirectory(destinationDirectory, true);
         await this.beforePathOperation("link-assignment-archive-install");
         try {
-          await fs.link(this.pinnedPath(sourceDirectory, sourceName), this.pinnedPath(destinationDirectory, destinationName));
+          await sourceDirectory.capability.link(sourceName, destinationDirectory.capability, destinationName);
           const linked = await this.regularFileIdentity(this.pinnedPath(destinationDirectory, destinationName));
           if (linked.dev !== sourceIdentity.dev || linked.ino !== sourceIdentity.ino) {
             throw new Error("Archive link identity is uncertain");
@@ -120,9 +122,9 @@ export class DurableObjectStore {
           await this.syncPinnedDirectory(destinationDirectory);
         } catch (error) {
           if (!this.isAlreadyExists(error)) throw error;
-          const record = await this.readVerifiedObject(destination, archiveId, "assignment", MAX_ASSIGNMENT_ARCHIVE_BYTES);
+          const record = await this.readVerifiedPinnedObject(destinationDirectory, destinationName, archiveId, "assignment", MAX_ASSIGNMENT_ARCHIVE_BYTES);
           if (this.assignmentId(record.payload) !== assignmentId) {
-            throw new Error("Immutable archive link has a different assignment identity", { cause: error });
+            throw new ObjectIntegrityError("Immutable archive link has a different assignment identity", { cause: error });
           }
         }
       } finally {
@@ -157,9 +159,12 @@ export class DurableObjectStore {
       }
       try {
         const record = await this.readVerifiedObject(path, archiveId, "assignment", MAX_ASSIGNMENT_ARCHIVE_BYTES);
-        if (this.assignmentId(record.payload) !== assignmentId) throw new Error("Archive assignment identity mismatch");
+        if (this.assignmentId(record.payload) !== assignmentId) throw new ObjectIntegrityError("Archive assignment identity mismatch");
         results.push({ archiveId, archive: record.payload as T });
-      } catch {
+      } catch (error) {
+        // Filesystem failures (EIO, EMFILE, EACCES, unavailable procfs, …)
+        // are not evidence of corrupt data and must never delete an archive.
+        if (!(error instanceof ObjectIntegrityError)) throw error;
         await this.quarantineArchiveLink(path, archiveId);
       }
     }
@@ -191,29 +196,31 @@ export class DurableObjectStore {
     if (!Number.isFinite(olderThan)) throw new Error("Invalid orphan cleanup cutoff");
     const directory = this.objectDirectory();
     const directoryIdentity = await this.ensureDirectory(directory, false);
+    const pinnedDirectory = await this.pinDirectory(directory, directoryIdentity);
     let removed = 0;
-    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
-      if (!entry.isFile() || !DIGEST_ID.test(entry.name.replace(/\.json$/, "")) || !entry.name.endsWith(".json")) continue;
-      const id = entry.name.slice(0, -".json".length);
-      if (referenced.has(id)) continue;
-      const candidate = this.objectPath(id);
-      let identity: PathIdentity;
-      try {
-        identity = await this.regularFileIdentity(candidate);
-        const stat = await fs.stat(candidate);
-        if (stat.mtimeMs >= olderThan) continue;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        throw error;
+    try {
+      for (const entry of await fs.readdir(pinnedDirectory.procPath, { withFileTypes: true })) {
+        if (!entry.isFile() || !DIGEST_ID.test(entry.name.replace(/\.json$/, "")) || !entry.name.endsWith(".json")) continue;
+        const id = entry.name.slice(0, -".json".length);
+        if (referenced.has(id)) continue;
+        let identity: PathIdentity;
+        try {
+          identity = await this.regularFileIdentity(this.pinnedPath(pinnedDirectory, entry.name));
+          const stat = await fs.stat(this.pinnedPath(pinnedDirectory, entry.name));
+          if (stat.mtimeMs >= olderThan) continue;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
+        }
+        await this.assertPinnedFileIdentity(pinnedDirectory, entry.name, identity, true);
+        await pinnedDirectory.capability.unlink(entry.name);
+        removed += 1;
       }
-      await this.assertIdentity(candidate, identity, false);
-      await this.assertIdentity(directory, directoryIdentity, true);
-      await fs.unlink(candidate);
-      removed += 1;
+      if (removed > 0) await this.syncPinnedDirectory(pinnedDirectory);
+      return removed;
+    } finally {
+      await pinnedDirectory.handle.close();
     }
-    await this.assertIdentity(directory, directoryIdentity, true);
-    if (removed > 0) await this.syncDirectory(directory);
-    return removed;
   }
 
   private objectDirectory(): string {
@@ -314,44 +321,68 @@ export class DurableObjectStore {
     assertDigest(id);
     this.assertBound(maxBytes);
     const parent = await this.ensureDirectory(dirname(path), false);
-    const before = await this.regularFileIdentity(path);
-    const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const directory = await this.pinDirectory(dirname(path), parent);
+    try {
+      return await this.readVerifiedPinnedObject(directory, this.safeBasename(basename(path)), id, expectedKind, maxBytes);
+    } finally {
+      await directory.handle.close();
+    }
+  }
+
+  /** Read an immutable collision through an already-live destination capability. */
+  private async readVerifiedPinnedObject(directory: PinnedDirectory, name: string, id: string, expectedKind: ObjectKind | undefined, maxBytes: number): Promise<StoredObject<unknown>> {
+    assertDigest(id);
+    this.assertBound(maxBytes);
+    await this.assertPinnedDirectory(directory, true);
+    const handle = await directory.capability.openFile(name, constants.O_RDONLY | constants.O_NOFOLLOW);
     let bytes: string;
     try {
       const opened = await handle.stat();
-      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("Object identity changed before open");
-      if (opened.size > maxBytes) throw new Error("Object exceeds its byte limit");
+      if (!opened.isFile()) throw new ObjectIntegrityError("Object is not a regular file");
+      if (opened.size > maxBytes) throw new ObjectIntegrityError("Object exceeds its byte limit");
       bytes = await handle.readFile({ encoding: "utf8" });
       const after = await handle.stat();
       if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size) {
-        throw new Error("Object identity changed while reading");
+        throw new ObjectIntegrityError("Object identity changed while reading");
       }
     } finally {
       await handle.close();
     }
-    await this.assertIdentity(path, before, false);
-    await this.assertIdentity(dirname(path), parent, true);
+    await this.assertPinnedDirectory(directory, true);
+    return this.parseVerifiedObject(bytes, id, expectedKind, maxBytes);
+  }
+
+  private parseVerifiedObject(bytes: string, id: string, expectedKind: ObjectKind | undefined, maxBytes: number): StoredObject<unknown> {
     this.assertBytes(bytes, maxBytes);
-    if (sha256Hex(bytes) !== id) throw new Error("Object digest mismatch");
+    if (sha256Hex(bytes) !== id) throw new ObjectIntegrityError("Object digest mismatch");
     let parsed: unknown;
     try {
       parsed = JSON.parse(bytes);
     } catch {
-      throw new Error("Object contains invalid JSON");
+      throw new ObjectIntegrityError("Object contains invalid JSON");
     }
-    if (typeof parsed !== "object" || parsed === null) throw new Error("Object envelope is invalid");
+    if (typeof parsed !== "object" || parsed === null) throw new ObjectIntegrityError("Object envelope is invalid");
     const envelope = parsed as Partial<StoredObject<unknown>>;
     if (envelope.storeVersion !== STORE_VERSION || !isObjectKind(envelope.kind) || !("payload" in envelope)) {
-      throw new Error("Object envelope is invalid");
+      throw new ObjectIntegrityError("Object envelope is invalid");
     }
-    if (canonicalJson(envelope) !== bytes) throw new Error("Object is not canonically encoded");
-    if (expectedKind !== undefined && envelope.kind !== expectedKind) throw new Error("Object kind mismatch");
+    this.assertBytes(bytes, this.objectKindMaxBytes(envelope.kind));
+    if (canonicalJson(envelope) !== bytes) throw new ObjectIntegrityError("Object is not canonically encoded");
+    if (expectedKind !== undefined && envelope.kind !== expectedKind) throw new ObjectIntegrityError("Object kind mismatch");
     return envelope as StoredObject<unknown>;
+  }
+
+  private objectKindMaxBytes(kind: ObjectKind): number {
+    switch (kind) {
+      case "checkpoint": return MAX_CHECKPOINT_BYTES;
+      case "task-run": return MAX_TASK_RUN_OBJECT_BYTES;
+      case "assignment": return MAX_ASSIGNMENT_ARCHIVE_BYTES;
+    }
   }
 
   private async regularFileIdentity(path: string): Promise<PathIdentity> {
     const stat = await fs.lstat(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Object is not a regular file");
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new ObjectIntegrityError("Object is not a regular file");
     return { dev: stat.dev, ino: stat.ino, realpath: await fs.realpath(path) };
   }
 
@@ -370,7 +401,7 @@ export class DurableObjectStore {
     await this.options.beforePathOperation?.(operation);
   }
 
-  private async installNoReplace(destination: string, bytes: string): Promise<void> {
+  private async installNoReplace(destination: string, bytes: string, verifyExisting: (directory: PinnedDirectory, name: string) => Promise<void>): Promise<void> {
     const directory = dirname(destination);
     const directoryIdentity = await this.ensureDirectory(directory);
     const destinationName = this.safeBasename(basename(destination));
@@ -378,17 +409,27 @@ export class DurableObjectStore {
     const pinnedDirectory = await this.pinDirectory(directory, directoryIdentity);
     let handle: fs.FileHandle | undefined;
     try {
-      const temporary = this.pinnedPath(pinnedDirectory, temporaryName);
-      handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      handle = await pinnedDirectory.capability.openFile(temporaryName, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
       await handle.writeFile(bytes, "utf8");
       await handle.sync();
+      const temporaryIdentity = await handle.stat();
       await handle.close();
       handle = undefined;
       await this.assertPinnedDirectory(pinnedDirectory, true);
       await this.beforePathOperation("install-object");
       // link(2) is the no-replace final-install winner gate.
-      await fs.link(temporary, this.pinnedPath(pinnedDirectory, destinationName));
-      await this.regularFileIdentity(this.pinnedPath(pinnedDirectory, destinationName));
+      try {
+        await pinnedDirectory.capability.link(temporaryName, pinnedDirectory.capability, destinationName);
+      } catch (error) {
+        if (!this.isAlreadyExists(error)) throw error;
+        // Verify the collision through this live capability before it can close.
+        await verifyExisting(pinnedDirectory, destinationName);
+        return;
+      }
+      const destinationIdentity = await this.regularFileIdentity(this.pinnedPath(pinnedDirectory, destinationName));
+      if (destinationIdentity.dev !== temporaryIdentity.dev || destinationIdentity.ino !== temporaryIdentity.ino) {
+        throw new Error("Immutable object install identity is uncertain");
+      }
       await this.syncPinnedDirectory(pinnedDirectory);
     } finally {
       await handle?.close();
@@ -406,7 +447,7 @@ export class DurableObjectStore {
       const identity = await this.regularFileIdentity(path);
       await this.assertPinnedDirectory(directory, false);
       await this.assertPinnedFileIdentity(directory, name, identity, false);
-      await fs.unlink(path);
+      await directory.capability.unlink(name);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -428,19 +469,29 @@ export class DurableObjectStore {
 
   /** Link-then-unlink is a no-replace move and never follows a final target. */
   private async moveNoReplace(source: string, target: string, sourceIdentity: PathIdentity, sourceParent: PathIdentity, targetParent: PathIdentity): Promise<void> {
-    await this.assertIdentity(source, sourceIdentity, false);
-    await this.assertIdentity(dirname(source), sourceParent, true);
-    await this.assertIdentity(dirname(target), targetParent, true);
-    await fs.link(source, target);
-    const targetIdentity = await this.regularFileIdentity(target);
-    if (targetIdentity.dev !== sourceIdentity.dev || targetIdentity.ino !== sourceIdentity.ino) {
-      throw new Error("Quarantine target identity is uncertain");
+    const sourceName = this.safeBasename(basename(source));
+    const targetName = this.safeBasename(basename(target));
+    const sourceDirectory = await this.pinDirectory(dirname(source), sourceParent);
+    try {
+      const targetDirectory = await this.pinDirectory(dirname(target), targetParent);
+      try {
+        await this.assertPinnedFileIdentity(sourceDirectory, sourceName, sourceIdentity, true);
+        await this.assertPinnedDirectory(targetDirectory, true);
+        await sourceDirectory.capability.link(sourceName, targetDirectory.capability, targetName);
+        const targetIdentity = await this.regularFileIdentity(this.pinnedPath(targetDirectory, targetName));
+        if (targetIdentity.dev !== sourceIdentity.dev || targetIdentity.ino !== sourceIdentity.ino) {
+          throw new Error("Quarantine target identity is uncertain");
+        }
+        await this.assertPinnedFileIdentity(sourceDirectory, sourceName, sourceIdentity, true);
+        await sourceDirectory.capability.unlink(sourceName);
+        await this.syncPinnedDirectory(sourceDirectory);
+        if (targetDirectory !== sourceDirectory) await this.syncPinnedDirectory(targetDirectory);
+      } finally {
+        await targetDirectory.handle.close();
+      }
+    } finally {
+      await sourceDirectory.handle.close();
     }
-    await this.assertIdentity(dirname(source), sourceParent, true);
-    await fs.unlink(source);
-    await this.assertIdentity(dirname(target), targetParent, true);
-    await this.syncDirectory(dirname(source));
-    if (dirname(target) !== dirname(source)) await this.syncDirectory(dirname(target));
   }
 
   private safeBasename(name: string): string {
@@ -458,7 +509,12 @@ export class DurableObjectStore {
     const pinned = await pinExistingDirectory(this.root, directory, expected, {
       procDirectoryPath: this.options.procDirectoryPath,
     });
-    return { handle: pinned.handle, identity: expected, procPath: pinned.procDirectoryPath };
+    return {
+      capability: pinned,
+      handle: pinned.handle,
+      identity: expected,
+      procPath: pinned.procDirectoryPath,
+    };
   }
 
   private pinnedPath(directory: PinnedDirectory, name: string): string {
@@ -493,17 +549,6 @@ export class DurableObjectStore {
     await this.assertPinnedDirectory(directory);
     await directory.handle.sync();
     await this.assertPinnedDirectory(directory);
-  }
-
-  private async syncDirectory(directory: string): Promise<void> {
-    const identity = await this.ensureDirectory(directory, false);
-    const handle = await fs.open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-    try {
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await this.assertIdentity(directory, identity, true);
   }
 
   private isAlreadyExists(error: unknown): boolean {

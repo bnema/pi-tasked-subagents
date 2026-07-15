@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, open as openFile, readFile, readdir, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { link, mkdtemp, open as openFile, readFile, readdir, rm, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -109,6 +109,96 @@ describe("offline session recovery", () => {
     await expect(recoverSession({ input: invalid, output: failedOutput, dataRoot: join(directory, "failed-data") })).rejects.toThrow("invalid JSONL record");
     expect(await readFile(invalid)).toEqual(source);
     await expect(stat(failedOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("publishes only a fully synced and closed temporary file, then syncs its parent", async () => {
+    const directory = await root();
+    const input = join(directory, "source.jsonl");
+    const output = join(directory, "recovered.jsonl");
+    await writeFile(input, `${JSON.stringify(header())}\n`);
+    let fileSynced = false;
+    let fileClosed = false;
+    let linked = false;
+    let directorySyncs = 0;
+    const outputDirectory = {
+      path: (name: string) => join(directory, name),
+      openFile: async (name: string, flags: number, mode?: number) => openFile(join(directory, name), flags, mode),
+      link: async (name: string, destination: { path(name: string): string }, destinationName: string) => {
+        expect(fileSynced).toBe(true);
+        expect(fileClosed).toBe(true);
+        linked = true;
+        await link(join(directory, name), destination.path(destinationName));
+      },
+      sync: async () => { directorySyncs += 1; },
+      unlink: async (name: string) => { await unlink(join(directory, name)); },
+      close: async () => undefined,
+    };
+
+    await recoverSession({
+      input,
+      output,
+      dataRoot: join(directory, "data"),
+      openOutputDirectory: async () => outputDirectory as never,
+      openOutput: async (path) => {
+        const nativeHandle = await openFile(path, "wx", 0o600);
+        return {
+          writeFile: nativeHandle.writeFile.bind(nativeHandle),
+          sync: async () => { await nativeHandle.sync(); fileSynced = true; },
+          close: async () => { await nativeHandle.close(); fileClosed = true; },
+        } as unknown as FileHandle;
+      },
+    });
+
+    expect(linked).toBe(true);
+    expect(directorySyncs).toBe(2);
+    expect((await stat(output)).mode & 0o777).toBe(0o600);
+  });
+
+  test("does not replace an output created during conversion and removes its temporary sibling", async () => {
+    const directory = await root();
+    const input = join(directory, "source.jsonl");
+    const output = join(directory, "recovered.jsonl");
+    await writeFile(input, `${JSON.stringify(header())}\n`);
+
+    await expect(recoverSession({
+      input,
+      output,
+      dataRoot: join(directory, "data"),
+      onRecordProcessed: async () => { await writeFile(output, "winner"); },
+    })).rejects.toThrow("output already exists");
+
+    expect(await readFile(output, "utf8")).toBe("winner");
+    expect((await readdir(directory)).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
+
+  test("surfaces a temporary cleanup error alongside a conversion error", async () => {
+    const directory = await root();
+    const input = join(directory, "invalid.jsonl");
+    const output = join(directory, "recovered.jsonl");
+    await writeFile(input, `${JSON.stringify(header())}\n{not-json}\n`);
+    const outputDirectory = {
+      path: (name: string) => join(directory, name),
+      openFile: async (name: string, flags: number, mode?: number) => openFile(join(directory, name), flags, mode),
+      link: async (name: string, destination: { path(name: string): string }, destinationName: string) => link(join(directory, name), destination.path(destinationName)),
+      sync: async () => undefined,
+      unlink: async () => { throw new Error("synthetic temporary cleanup rejection"); },
+      close: async () => undefined,
+    };
+
+    const failure = await recoverSession({
+      input,
+      output,
+      dataRoot: join(directory, "data"),
+      openOutputDirectory: async () => outputDirectory as never,
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("session recovery failed");
+    expect((failure as Error & { cause?: AggregateError }).cause).toBeInstanceOf(AggregateError);
+    expect((failure as Error & { cause: AggregateError }).cause.errors.map((error) => (error as Error).message)).toContain("synthetic temporary cleanup rejection");
   });
 
   test("removes incomplete output when an injected output FileHandle close rejects", async () => {

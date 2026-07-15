@@ -159,19 +159,35 @@ export async function openPinnedDirectory(root, directory, options = {}) {
   }
 }
 
+/** Pin an arbitrary existing directory for sibling-only publication. */
+export async function pinDirectory(directory, options = {}) {
+  return pin(resolve(directory), undefined, options.procDirectoryPath);
+}
+
 /** Pin an already-created directory after its caller validated its identity. */
 export async function pinExistingDirectory(root, directory, expected, options = {}) {
   const resolvedRoot = resolve(root);
   const resolvedDirectory = resolve(directory);
   containedComponents(resolvedRoot, resolvedDirectory);
-  const pinned = await pin(resolvedDirectory, expected, options.procDirectoryPath);
+  const rootHandle = await pin(resolvedRoot, undefined, options.procDirectoryPath);
+  let pinned;
   try {
-    const rootHandle = await pin(resolvedRoot, undefined, options.procDirectoryPath);
-    await rootHandle.close();
+    pinned = await pin(resolvedDirectory, expected, options.procDirectoryPath);
+    // Resolve both live capabilities only after both handles are open. This
+    // prevents a path spelling or injected procfs alias from redirecting a
+    // caller outside the pinned root between validation and mutation.
+    const rootRealpath = await fs.realpath(rootHandle.procDirectoryPath);
+    const targetRealpath = await fs.realpath(pinned.procDirectoryPath);
+    containedComponents(rootRealpath, targetRealpath);
+    if (expected?.realpath !== undefined && targetRealpath !== expected.realpath) {
+      throw new Error("Pinned storage directory realpath changed before pinning");
+    }
     return pinned;
   } catch (error) {
-    await pinned.close();
+    await pinned?.close();
     throw error;
+  } finally {
+    await rootHandle.close();
   }
 }
 

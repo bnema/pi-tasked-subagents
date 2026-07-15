@@ -155,13 +155,15 @@ function validateManifest(value: unknown, sessionId: string): value is Checkpoin
   const completedIds = new Set(input.recentCompleted.map((summary) => (summary as CompletedRunSummary).taskRunId));
   if (completedIds.size !== input.recentCompleted.length || [...completedIds].some((id) => runIds.has(id))) return false;
   if (currentTaskRunId !== undefined && !runIds.has(currentTaskRunId as string) && !completedIds.has(currentTaskRunId as string)) return false;
+  const assignmentIds = new Set<string>();
   const archiveIds = new Set<string>();
   for (const ref of input.recentAssignmentRefs) {
     const item = record(ref);
     if (!item || !exactKeys(item, ["assignmentId", "assignmentIdHash", "archiveId", "resultId"]) || !boundedString(item.assignmentId) ||
       !DIGEST_ID.test(String(item.assignmentIdHash ?? "")) || sha256Hex(item.assignmentId as string) !== item.assignmentIdHash ||
       !DIGEST_ID.test(String(item.archiveId ?? "")) || (item.resultId !== undefined && !isResultId(item.resultId)) ||
-      archiveIds.has(item.archiveId as string)) return false;
+      assignmentIds.has(item.assignmentId as string) || archiveIds.has(item.archiveId as string)) return false;
+    assignmentIds.add(item.assignmentId as string);
     archiveIds.add(item.archiveId as string);
   }
   return true;
@@ -182,7 +184,7 @@ function validArchiveEvidence(value: unknown): boolean {
     boundedText(input.criterionId, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES) && boundedText(input.evidence, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES));
 }
 
-function validArchive(archive: unknown, assignmentId?: string, resultId?: string): archive is AssignmentArchiveV1 {
+function validArchive(archive: unknown): archive is AssignmentArchiveV1 {
   const input = record(archive);
   const identityKeys = ["assignmentId", "taskRunId", "groupId", "taskId", "status", "runId", "resultId", "resultUnavailableReason", "completedAt"];
   if (!input || !boundedString(input.assignmentId) || !boundedString(input.taskRunId) || !boundedString(input.taskId) ||
@@ -191,9 +193,7 @@ function validArchive(archive: unknown, assignmentId?: string, resultId?: string
     (input.groupId !== undefined && !boundedString(input.groupId)) ||
     (input.resultId !== undefined && !isResultId(input.resultId)) ||
     (input.resultUnavailableReason !== undefined && input.resultUnavailableReason !== "missing-legacy-result") ||
-    ((input.resultId === undefined) === (input.resultUnavailableReason === undefined)) ||
-    (assignmentId !== undefined && !optionalSame(assignmentId, input.assignmentId as string)) ||
-    (resultId !== undefined && input.resultId !== resultId)) return false;
+    ((input.resultId === undefined) === (input.resultUnavailableReason === undefined))) return false;
   if (input.detailOmitted === true) return exactKeys(input, [...identityKeys, "detailOmitted"]);
   if (!exactKeys(input, [...identityKeys, "summary", "criteriaEvidence", "artifacts", "followUps"]) ||
     !boundedText(input.summary, MAX_ARCHIVE_SUMMARY_BYTES) || !Array.isArray(input.criteriaEvidence) ||
@@ -275,6 +275,12 @@ class RestoreObjectError extends Error {
   }
 }
 
+/** A pointer/manifest relationship failed, not the immutable object it names. */
+class CheckpointInvalidError extends Error {}
+
+/** An immutable object was read successfully but its own payload is invalid. */
+class RestoreObjectInvalidError extends RestoreObjectError {}
+
 async function requiredObject<T>(
   store: DurableObjectStore,
   objectId: string,
@@ -291,14 +297,15 @@ async function requiredObject<T>(
 async function restorePointer(pointer: StatePointerV5, store: DurableObjectStore, sessionId: string): Promise<{ state: TaskedSubagentsState; archiveRefs: ArchiveRef[] }> {
   const manifest = await requiredObject<CheckpointManifestV1>(store, pointer.checkpointId, "checkpoint", MAX_CHECKPOINT_BYTES);
   if (!validateManifest(manifest, sessionId) || manifest.sequence !== pointer.sequence ||
-    !optionalSame(manifest.currentTaskRunId, pointer.currentTaskRunId)) throw new Error("Checkpoint manifest is invalid");
+    !optionalSame(manifest.currentTaskRunId, pointer.currentTaskRunId)) throw new CheckpointInvalidError("Checkpoint manifest does not match its pointer");
 
   const runs: TaskRunRecord[] = [];
   for (const ref of manifest.recoverableRuns) {
     const run = await requiredObject<TaskRunRecord>(store, ref.objectId, "task-run", MAX_TASK_RUN_OBJECT_BYTES);
-    if (run.id !== ref.taskRunId || run.status !== ref.status || run.updatedAt !== ref.updatedAt || !validateTaskRunGraph(run)) {
-      throw new Error(`Invalid task-run object:${ref.objectId}`);
+    if (run.id !== ref.taskRunId || run.status !== ref.status || run.updatedAt !== ref.updatedAt) {
+      throw new CheckpointInvalidError("Checkpoint task-run reference does not match its object");
     }
+    if (!validateTaskRunGraph(run)) throw new RestoreObjectInvalidError(ref.objectId, "Task-run object payload is invalid");
     runs.push(run);
   }
 
@@ -309,7 +316,7 @@ async function restorePointer(pointer: StatePointerV5, store: DurableObjectStore
   for (const summary of manifest.recentCompleted) {
     for (const archiveId of summary.assignmentArchiveIds) {
       const existing = archives.get(archiveId);
-      if (existing?.summaryTaskRunId && existing.summaryTaskRunId !== summary.taskRunId) throw new Error(`Invalid assignment object:${archiveId}`);
+      if (existing?.summaryTaskRunId && existing.summaryTaskRunId !== summary.taskRunId) throw new CheckpointInvalidError("Checkpoint assignment references conflict");
       archives.set(archiveId, { ...existing, summaryTaskRunId: summary.taskRunId });
     }
   }
@@ -317,9 +324,11 @@ async function restorePointer(pointer: StatePointerV5, store: DurableObjectStore
   const restoredArchives = new Map<string, AssignmentArchiveV1 & { archiveId: string }>();
   for (const [archiveId, reference] of archives) {
     const archive = await requiredObject<AssignmentArchiveV1>(store, archiveId, "assignment", MAX_ASSIGNMENT_ARCHIVE_BYTES);
-    if (!validArchive(archive, reference.assignmentId, reference.resultId) ||
+    if (!validArchive(archive)) throw new RestoreObjectInvalidError(archiveId, "Assignment object payload is invalid");
+    if ((reference.assignmentId !== undefined && archive.assignmentId !== reference.assignmentId) ||
+      (reference.resultId !== undefined && archive.resultId !== reference.resultId) ||
       (reference.summaryTaskRunId !== undefined && archive.taskRunId !== reference.summaryTaskRunId)) {
-      throw new Error(`Invalid assignment object:${archiveId}`);
+      throw new CheckpointInvalidError("Checkpoint assignment reference does not match its object");
     }
     restoredArchives.set(archiveId, { ...archive, archiveId });
     archiveRefs.push({
@@ -412,12 +421,11 @@ export async function restoreBranchState(
       const restored = await restorePointer(pointer, store, context.sessionId);
       return finalizeSuccessfulRestore({ restored: true, state: restored.state, pointer, archiveRefs: restored.archiveRefs, diagnostics, migrated: false }, branchEntries, store, context);
     } catch (error) {
-      const text = error instanceof Error ? error.message : "";
-      const objectId = error instanceof RestoreObjectError
-        ? error.objectId
-        : text.startsWith("Invalid task-run object:") || text.startsWith("Invalid assignment object:")
-          ? text.slice(text.indexOf(":") + 1)
-          : pointer.checkpointId;
+      if (error instanceof CheckpointInvalidError) {
+        diagnostics.push({ code: "checkpoint_invalid", message: "A checkpoint relationship is invalid", checkpointId: pointer.checkpointId });
+        continue;
+      }
+      const objectId = error instanceof RestoreObjectError ? error.objectId : pointer.checkpointId;
       await diagnosticForObject(diagnostics, store, pointer.checkpointId, objectId, error);
     }
   }

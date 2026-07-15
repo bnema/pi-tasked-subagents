@@ -30,6 +30,9 @@ const RUN_STATUSES = new Set(["pending", "running", "attention", "completed", "f
 const GROUP_AND_TASK_STATUSES = new Set(["pending", "ready", "running", "blocked", "attention", "completed", "failed", "cancelled"]);
 const ASSIGNMENT_STATUSES = new Set(["queued", "running", "blocked", "attention", "completed", "failed", "cancelled", "paused", "skipped"]);
 const REPORT_STATUSES = new Set(["completed", "attention", "failed"]);
+const DIGEST_ID = /^[a-f0-9]{64}$/;
+/** Legacy runner status is advisory metadata, not an unbounded migration input. */
+const MAX_LEGACY_STATUS_BYTES = 64 * 1024;
 
 export interface V4MigrationContext {
   sessionId: string;
@@ -47,24 +50,19 @@ function missingResult(): { unavailable: "missing-legacy-result" } {
   return { unavailable: "missing-legacy-result" };
 }
 
-async function digestFile(path: string): Promise<string> {
-  const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("Durable result is not a regular file");
-    const hash = createHash("sha256");
-    const buffer = Buffer.allocUnsafe(64 * 1024);
-    let position = 0;
-    while (true) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
-      position += bytesRead;
-    }
-    return hash.digest("hex");
-  } finally {
-    await handle.close();
+async function digestOpenFile(handle: fs.FileHandle): Promise<string> {
+  const stat = await handle.stat();
+  if (!stat.isFile()) throw new Error("Durable result is not a regular file");
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (true) {
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+    if (bytesRead === 0) break;
+    hash.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
   }
+  return hash.digest("hex");
 }
 
 /**
@@ -118,8 +116,13 @@ export async function ingestLegacyResult(
       await destinationDirectory.sync();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (await digestFile(destinationDirectory.path(finalName)) !== resultId) {
-        throw new Error("Existing durable result digest mismatch", { cause: error });
+      const existing = await destinationDirectory.openFile(finalName, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        if (await digestOpenFile(existing) !== resultId) {
+          throw new Error("Existing durable result digest mismatch", { cause: error });
+        }
+      } finally {
+        await existing.close();
       }
     }
     return { resultId };
@@ -189,7 +192,8 @@ async function hasLiveLegacyStatus(handle: MigratedLegacyHandle): Promise<boolea
     const status = await fs.open(statusPath, constants.O_RDONLY | constants.O_NOFOLLOW);
     let raw: string;
     try {
-      if (!(await status.stat()).isFile()) return false;
+      const statusInfo = await status.stat();
+      if (!statusInfo.isFile() || statusInfo.size > MAX_LEGACY_STATUS_BYTES) return false;
       raw = await status.readFile({ encoding: "utf8" });
     } finally {
       await status.close();
@@ -296,7 +300,7 @@ async function archiveTerminalAssignments(
         taskRunId: run.id,
         ...(assignment.groupId === undefined ? {} : { groupId: assignment.groupId }),
         taskId: assignment.taskId,
-        status: assignment.status,
+        status: assignment.status as "completed" | "failed" | "cancelled" | "skipped",
         summary: assignment.result?.summary ?? "",
         criteriaEvidence: assignment.result?.criteriaEvidence ?? [],
         artifacts: assignment.result?.artifacts ?? run.artifacts.filter((artifact) => artifact.assignmentId === assignment.id),
@@ -414,6 +418,20 @@ export async function migrateV4State(
     };
   } catch {
     return { migrated: false, reason: "write_failed", message: "Unable to write bounded migrated state" };
+  }
+}
+
+function validV5Pointer(value: unknown): value is StatePointerV5 {
+  const input = record(value);
+  if (!input) return false;
+  try {
+    return input.version === 5 && DIGEST_ID.test(String(input.checkpointId ?? "")) &&
+      Number.isSafeInteger(input.sequence) && (input.sequence as number) >= 0 &&
+      Number.isSafeInteger(input.writtenAt) &&
+      (input.currentTaskRunId === undefined || nonEmptyString(input.currentTaskRunId)) &&
+      utf8Bytes(value) <= MAX_POINTER_BYTES;
+  } catch {
+    return false;
   }
 }
 
@@ -588,11 +606,9 @@ export async function migrateNewestV4State(
     if (entry.type !== "custom" || entry.customType !== "pi-tasked-subagents:state") continue;
     try {
       const data = typeof entry.data === "string" ? JSON.parse(entry.data) : entry.data;
-      const candidate = data as { version?: unknown; sequence?: unknown } | undefined;
-      if (candidate?.version === 5 && typeof candidate.sequence === "number" &&
-        Number.isSafeInteger(candidate.sequence) && candidate.sequence >= 0) {
-        if (candidate.sequence >= Number.MAX_SAFE_INTEGER) sequenceExhausted = true;
-        else sequence = Math.max(sequence, candidate.sequence + 1);
+      if (validV5Pointer(data)) {
+        if (data.sequence >= Number.MAX_SAFE_INTEGER) sequenceExhausted = true;
+        else sequence = Math.max(sequence, data.sequence + 1);
       }
     } catch {
       // Malformed pointer-like records do not affect migration sequence.
