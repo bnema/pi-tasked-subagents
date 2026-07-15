@@ -18,6 +18,7 @@ import {
 import { canonicalJson, canonicalJsonBounded, sha256Hex, utf8Bytes } from "../src/state/canonical-json.js";
 import type { AssignmentArchiveV1 } from "../src/state/durable-types.js";
 import { DurableObjectStore } from "../src/state/object-store.js";
+import { rewriteSessionRefs } from "../src/state/persistence-coordinator.js";
 import {
   assignmentArchiveDir,
   assignmentArchiveLinkPath,
@@ -239,6 +240,7 @@ describe("bounded durable storage primitives", () => {
     const linkPath = assignmentArchiveLinkPath(paths, assignmentId, archiveId);
 
     expect(lstatSync(linkPath).nlink).toBeGreaterThanOrEqual(2);
+    expect(Buffer.byteLength(readFileSync(join(root, "objects", `${archiveId}.json`), "utf8"), "utf8")).toBeLessThanOrEqual(MAX_ASSIGNMENT_ARCHIVE_BYTES);
     await expect(store.listAssignmentArchives<AssignmentArchiveV1>(sessionId, assignmentId)).resolves.toEqual([{ archiveId, archive }]);
     await expect(store.get(archiveId, "assignment", 1)).rejects.toThrow(/limit/i);
 
@@ -301,6 +303,40 @@ describe("bounded durable storage primitives", () => {
 
     await expect(store.put("checkpoint", { value: "blocked" }, 1_024)).rejects.toThrow(/dirfd|procfs|pinned/i);
     expect(readdirSync(join(root, "objects"))).toEqual([]);
+  });
+
+  test("preserves every branch-pinned object and immutable result until its ref is explicitly cleared", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-tasked-subagents-store-"));
+    const store = new DurableObjectStore(root);
+    const branchOne = await store.put("checkpoint", { branch: "one" }, 1_024);
+    const branchTwo = await store.put("checkpoint", { branch: "two" }, 1_024);
+    const cleared = await store.put("checkpoint", { branch: "cleared" }, 1_024);
+    const objects = join(root, "objects");
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1_000 - 1);
+    for (const id of [branchOne, branchTwo, cleared]) utimesSync(join(objects, `${id}.json`), old, old);
+    const paths = sessionStoragePaths(root, "session-branches");
+    const resultId = "e".repeat(32);
+    mkdirSync(paths.resultsDir, { recursive: true });
+    writeFileSync(resultFilePath(paths, resultId), "immutable branch result");
+
+    await rewriteSessionRefs(root, "session-branches", new Set([branchOne, branchTwo]));
+    const initialRefs = JSON.parse(readFileSync(paths.refsPath, "utf8")) as { checkpointIds: string[] };
+    expect(await store.cleanupOrphans(new Set(initialRefs.checkpointIds), Date.now() - 24 * 60 * 60 * 1_000)).toBe(1);
+    expect(lstatSync(join(objects, `${branchOne}.json`)).isFile()).toBe(true);
+    expect(lstatSync(join(objects, `${branchTwo}.json`)).isFile()).toBe(true);
+    expect(readFileSync(resultFilePath(paths, resultId), "utf8")).toBe("immutable branch result");
+
+    await rewriteSessionRefs(root, "session-branches", new Set([branchTwo]));
+    const clearedRefs = JSON.parse(readFileSync(paths.refsPath, "utf8")) as { checkpointIds: string[] };
+    expect(await store.cleanupOrphans(new Set(clearedRefs.checkpointIds), Date.now() - 24 * 60 * 60 * 1_000)).toBe(1);
+    expect(() => lstatSync(join(objects, `${branchOne}.json`))).toThrow();
+    expect(lstatSync(join(objects, `${branchTwo}.json`)).isFile()).toBe(true);
+
+    const outside = join(root, "outside-result.json");
+    writeFileSync(outside, "outside root");
+    symlinkSync(outside, join(objects, `${"f".repeat(64)}.json`));
+    await store.cleanupOrphans(new Set([branchTwo]), Date.now() + 1);
+    expect(readFileSync(outside, "utf8")).toBe("outside root");
   });
 
   test("quarantines corrupt objects and only cleans unreferenced objects older than 24 hours without following links", async () => {

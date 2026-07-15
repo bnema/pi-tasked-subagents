@@ -4,7 +4,12 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { MAX_POINTER_BYTES } from "../src/defaults.js";
+import {
+  MAX_CHECKPOINT_BYTES,
+  MAX_POINTER_BYTES,
+  MAX_RECENT_COMPLETED,
+  MAX_TASK_RUN_OBJECT_BYTES,
+} from "../src/defaults.js";
 import {
   PersistenceCoordinator,
   type CheckpointContext,
@@ -13,6 +18,7 @@ import {
 import { DurableObjectStore } from "../src/state/object-store.js";
 import type { StatePointerV5 } from "../src/state/durable-types.js";
 import { sessionStoragePaths } from "../src/state/storage-paths.js";
+import { restoreBranchState } from "../src/state/restore.js";
 import type { TaskedSubagentsState } from "../src/types.js";
 import { syntheticState, syntheticTaskRun } from "./persistence-fixtures.js";
 
@@ -206,4 +212,65 @@ describe("PersistenceCoordinator", () => {
     await expect(subject.checkpoint(state, context())).resolves.toMatchObject({ committed: false, dirty: true });
     expect(appender.pointers).toHaveLength(0);
   });
+
+  it("keeps 100-run branch resume stress bounded while 2,000 transient progress updates append zero pointers", async () => {
+    const { root, coordinator: subject, appender } = await coordinator();
+    const originalBranch = syntheticState(100);
+    const original = await subject.checkpoint(originalBranch, context());
+    if (!original.committed) throw new Error("original branch checkpoint should commit");
+
+    const resumedBranch = structuredClone(originalBranch);
+    const active = syntheticTaskRun(101, "running");
+    resumedBranch.taskRuns.push(active);
+    resumedBranch.currentTaskRunId = active.id;
+    resumedBranch.updatedAt += 1;
+    const resumed = await subject.checkpoint(resumedBranch, context([original.pointer]));
+    if (!resumed.committed) throw new Error("resumed branch checkpoint should commit");
+    const pointerCountBeforeProgress = appender.pointers.length;
+
+    for (let run = 0; run < 100; run += 1) {
+      for (let update = 0; update < 20; update += 1) {
+        active.assignments[0].currentTool = `generic-tool-${run}-${update}`;
+        active.assignments[0].lastActionAt = 1_800_000_000_000 + run * 20 + update;
+        active.assignments[0].lastActionSummary = `generic progress ${run}-${update}`;
+        active.assignments[0].recentActivity = [`generic activity ${run}-${update}`];
+        await expect(subject.checkpoint(resumedBranch, context([original.pointer, resumed.pointer])))
+          .resolves.toMatchObject({ committed: true, deduplicated: true });
+      }
+    }
+
+    expect(appender.pointers).toHaveLength(pointerCountBeforeProgress);
+    expect(appender.pointers.every((pointer) => Buffer.byteLength(JSON.stringify(pointer), "utf8") <= MAX_POINTER_BYTES)).toBe(true);
+
+    const store = new DurableObjectStore(root);
+    const manifest = await store.get<{
+      recentCompleted: Array<{ taskRunId: string }>;
+      recoverableRuns: Array<{ objectId: string }>;
+    }>(resumed.pointer.checkpointId, "checkpoint", MAX_CHECKPOINT_BYTES);
+    expect(manifest.recentCompleted).toHaveLength(MAX_RECENT_COMPLETED);
+    expect(manifest.recentCompleted.map((summary) => summary.taskRunId)).toEqual(
+      Array.from({ length: MAX_RECENT_COMPLETED }, (_, index) => `task-run-${String(100 - index).padStart(3, "0")}`),
+    );
+    expect(manifest.recoverableRuns).toHaveLength(1);
+    const [activeObject] = manifest.recoverableRuns;
+    expect(Buffer.byteLength(await readFile(join(root, "objects", `${resumed.pointer.checkpointId}.json`)), "utf8")).toBeLessThanOrEqual(MAX_CHECKPOINT_BYTES);
+    expect(Buffer.byteLength(await readFile(join(root, "objects", `${activeObject.objectId}.json`)), "utf8")).toBeLessThanOrEqual(MAX_TASK_RUN_OBJECT_BYTES);
+
+    const entry = (pointer: StatePointerV5) => ({ type: "custom" as const, customType: "pi-tasked-subagents:state", data: pointer });
+    const restoreContext = {
+      sessionId: SESSION_ID,
+      allEntries: [entry(original.pointer), entry(resumed.pointer)],
+      appendMigratedPointer: () => { throw new Error("v5 stress branches must not migrate"); },
+    };
+    const originalRestore = await restoreBranchState([entry(original.pointer)], store, restoreContext);
+    const resumedRestore = await restoreBranchState([entry(original.pointer), entry(resumed.pointer)], store, restoreContext);
+
+    expect(originalRestore).toMatchObject({ restored: true });
+    expect(resumedRestore).toMatchObject({ restored: true });
+    if (!originalRestore.restored || !resumedRestore.restored) throw new Error("both immutable branch checkpoints should restore");
+    expect(originalRestore.state.taskRuns).toHaveLength(0);
+    expect(originalRestore.state.completedHistory).toHaveLength(MAX_RECENT_COMPLETED);
+    expect(resumedRestore.state.taskRuns).toMatchObject([{ id: "task-run-101", status: "running" }]);
+    expect(resumedRestore.state.completedHistory).toHaveLength(MAX_RECENT_COMPLETED);
+  }, 30_000);
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -2245,6 +2245,80 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(runtime.aliveCalls).toBeGreaterThanOrEqual(2);
     expect(runtime.resultCalls).toBe(1);
     expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("completed");
+  });
+
+  test("restored lifecycle retains dependency and attention context for attach, status, inspect, results, and controls", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-restored-lifecycle-"));
+    try {
+      const assignmentId = "archived-assignment";
+      const resultId = "d".repeat(32);
+      const store = new DurableObjectStore(dataRoot);
+      const archive = projectAssignmentArchive({
+        assignmentId,
+        taskRunId: "archived-run",
+        taskId: "archived-task",
+        status: "completed",
+        summary: "archived lifecycle result",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        runId: "archived-dispatch",
+        resultId,
+        completedAt: 1,
+      });
+      const archiveId = await store.put("assignment", archive, 256 * 1024);
+      await store.linkAssignmentArchive("pi-tasked-subagents", assignmentId, archiveId);
+      await mkdir(join(dataRoot, "results", "pi-tasked-subagents"), { recursive: true });
+      await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${resultId}.json`), "restored authoritative result");
+
+      const runtime = new StopSpyRuntime();
+      const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { runtime, dataRoot }));
+      const restored = recoverableState("attention");
+      restored.taskRuns[0].groups.unshift({
+        id: "setup",
+        title: "Setup",
+        status: "completed",
+        dependsOn: [],
+        maxConcurrency: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        completedAt: 1,
+      });
+      restored.taskRuns[0].groups.find((group) => group.id === "main")!.dependsOn = ["setup"];
+      controller.restoreState(restored, [{
+        assignmentId,
+        assignmentIdHash: sha256Hex(assignmentId),
+        archiveId,
+        resultId,
+        taskRunId: "archived-run",
+        completedAt: 1,
+      }]);
+
+      await expect(controller.attachTarget("attention")).resolves.toMatchObject({ attached: true, taskRunId: "task-run-1" });
+      expect(formatStatusReport(controller.getState(), "attention")).toMatch(/attention/i);
+      expect(formatInspectReport(controller.getState(), "main")).toContain("depends on: setup");
+      await expect(controller.getRunResult(assignmentId)).resolves.toBe("restored authoritative result");
+
+      await expect(controller.cancelRun("a1")).resolves.toBe(true);
+      expect(controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === "a1")?.status).toBe("cancelled");
+
+      controller.restoreState(recoverableState("attention"));
+      await expect(controller.continueTarget("attention", "resume restored attention")).resolves.toBe(true);
+      await controller.awaitLastWork();
+      expect(controller.getState().taskRuns[0].assignments.some((assignment) => assignment.status === "completed")).toBe(true);
+
+      controller.restoreState(recoverableState("attention"));
+      await expect(controller.resolveTarget("attention", "verify restored recovery")).resolves.toBe(true);
+      await controller.awaitLastWork();
+      expect(controller.getState().taskRuns[0].tasks.find((task) => task.id === "attention")?.status).toBe("completed");
+
+      controller.restoreState(recoverableState("running"));
+      markRunLive(controller, "run-1");
+      await expect(controller.stopRun("a1")).resolves.toBe(true);
+      expect(runtime.stopped).toContainEqual(expect.objectContaining({ runId: "run-1" }));
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true });
+    }
   });
 
   test("session_tree restore re-attaches an in-flight run and applies the outcome exactly once", async () => {
