@@ -13,6 +13,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { publishTerminalResult } from "./result-files.mjs";
 
 // ── Helpers ────────────────────────────────────
 
@@ -630,8 +631,11 @@ async function writeResult(config, status, results) {
   const summary = buildResultSummary(results);
   const rawOutput = results.length === 1 ? results[0]?.rawOutput || results[0]?.output : undefined;
 
-  await writeJson(config.resultPath, {
+  await publishTerminalResult(config.resultPath, config.resultReservationPath, {
+    sessionId: config.sessionId,
     runId: config.runId,
+    resultId: config.resultId,
+  }, {
     state: success ? "complete" : "failed",
     success,
     summary,
@@ -815,7 +819,11 @@ if (isMain) {
         const existingResult = JSON.parse(await fs.readFile(resultPath, "utf8").catch(() => "{}"));
         const signal = renderTerminationSignal(existingStatus, existingResult, timestamp);
         await writeJson(statusPath, signal.status);
-        await writeJson(resultPath, signal.result);
+        await publishTerminalResult(resultPath, config.resultReservationPath, {
+          sessionId: config.sessionId,
+          runId: config.runId,
+          resultId: config.resultId,
+        }, signal.result);
       } catch (error) {
         console.error("[direct-runner] Failed to write termination state", error);
       } finally {
@@ -845,12 +853,17 @@ if (isMain) {
           outputFile: child.outputFile,
         })),
       });
-      await writeJson(config.resultPath, {
+      await publishTerminalResult(config.resultPath, config.resultReservationPath, {
+        sessionId: config.sessionId,
         runId: config.runId,
+        resultId: config.resultId,
+      }, {
         state: "failed",
         success: false,
         summary: message,
         timestamp,
+      }).catch((publishError) => {
+        console.error("[direct-runner] Failed to publish terminal result", toErrorMessage(publishError));
       });
       process.exitCode = 1;
     });

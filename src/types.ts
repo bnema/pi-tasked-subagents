@@ -314,15 +314,34 @@ export interface SubagentRunAssignmentHandle {
   resultPath?: string;
 }
 
-export interface SubagentRunHandle {
+interface SubagentRunHandleBase {
   runId: string;
   asyncId: string;
   asyncDir?: string;
-  resultPath?: string;
   sessionFile?: string;
   artifactPath?: string;
   assignments: SubagentRunAssignmentHandle[];
 }
+
+/** A v5 launch handle. New launches always have an immutable result identity. */
+export interface DurableSubagentRunHandle extends SubagentRunHandleBase {
+  legacy?: never;
+  asyncDir: string;
+  resultId: string;
+  resultPath: string;
+  resultReservationPath: string;
+}
+
+/** A bounded v4 compatibility shape, explicitly marked at migration. */
+export interface LegacySubagentRunHandle extends SubagentRunHandleBase {
+  legacy: true;
+  resultId?: never;
+  resultPath?: string;
+  resultReservationPath?: never;
+}
+
+/** Only explicitly marked legacy handles may omit durable result identity. */
+export type SubagentRunHandle = DurableSubagentRunHandle | LegacySubagentRunHandle;
 
 export interface RunProgressStepSnapshot {
   id?: string;
@@ -378,7 +397,7 @@ export interface LaunchTaskGraphRequest {
 }
 
 export interface SubagentRuntime<Context = unknown> {
-  launchTaskGraph(request: LaunchTaskGraphRequest, ctx: Context): Promise<SubagentRunHandle>;
+  launchTaskGraph(request: LaunchTaskGraphRequest, ctx: Context): Promise<DurableSubagentRunHandle>;
   stopRun(handle: SubagentRunHandle, ctx: Context): Promise<boolean>;
   cancelRun(handle: SubagentRunHandle, ctx: Context): Promise<boolean>;
   waitForRunSignal(

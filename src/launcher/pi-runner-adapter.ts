@@ -3,24 +3,28 @@
 // ──────────────────────────────────────────────
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_WAIT_TIMEOUT_MS } from "../defaults.js";
+import { resolveStorageRoot, sessionStoragePaths } from "../state/storage-paths.js";
 import type {
   LaunchTaskEntry,
   LaunchTaskGraphRequest,
   RunCounts,
   RunProgressSnapshot,
   RunStatus,
+  DurableSubagentRunHandle,
   SubagentRunHandle,
   SubagentRuntime,
   TaskAssignmentRecord,
 } from "../types.js";
 import { getAgentProfile, listAvailableAgentProfiles } from "./agent-profiles.js";
 import { ensureTaskGraphRequest, type LaunchResult, type RunnerRuntimeContext, type RunnerChildConfig, type RunnerConfig } from "./interface.js";
+import { publishTerminalResult } from "./result-files.mjs";
 
 function now(): number {
   return Date.now();
@@ -75,7 +79,9 @@ function childOutputFile(index: number): string {
 
 interface RunPaths {
   asyncDir: string;
+  resultsDir: string;
   resultPath: string;
+  resultReservationPath: string;
   statusPath: string;
   eventsPath: string;
 }
@@ -155,12 +161,14 @@ function emptyCounts(): RunCounts {
   };
 }
 
-function toRunHandleBase(launch: LaunchResult): Omit<SubagentRunHandle, "assignments"> {
+function toRunHandleBase(launch: LaunchResult): Omit<DurableSubagentRunHandle, "assignments"> {
   return {
     runId: launch.runId,
     asyncId: launch.asyncId,
     asyncDir: launch.asyncDir,
+    resultId: launch.resultId,
     resultPath: launch.resultPath,
+    resultReservationPath: launch.resultReservationPath,
     sessionFile: launch.sessionFile,
     artifactPath: launch.artifactPath,
   };
@@ -186,44 +194,71 @@ function isPidAlive(pid: number): boolean {
 
 export interface PiRunnerAdapterOptions {
   piBin?: string;
+  /** Application-data root override for tests and embedders. */
+  dataRoot?: string;
+  /** @deprecated Test-only compatibility override for pre-v5 run directories. */
   asyncDirRootOverride?: string;
+  /** @deprecated Test-only compatibility override for pre-v5 result directories. */
   resultsDirOverride?: string;
+  /** Injectable only for deterministic tests; production uses cryptographic random bytes. */
+  resultIdFactory?: () => string;
 }
 
 export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   private readonly piBin: string;
+  private readonly dataRoot: string | undefined;
   private readonly asyncRoot: string;
   private readonly resultsRoot: string;
-  private readonly trackedRuns = new Map<string, { launch: LaunchResult; pid?: number }>();
+  private readonly resultIdFactory: () => string;
+  /** Each launch is keyed by immutable identity, never by report-oriented runId. */
+  private readonly trackedLaunches = new Map<string, { launch: LaunchResult; pid?: number }>();
 
   constructor(options: PiRunnerAdapterOptions = {}) {
     this.piBin = options.piBin ?? "pi";
+    // Explicit legacy directory overrides are retained solely for old restored-handle tests.
+    this.dataRoot = options.dataRoot !== undefined
+      ? resolveStorageRoot({ dataRoot: options.dataRoot })
+      : options.asyncDirRootOverride === undefined && options.resultsDirOverride === undefined
+        ? resolveStorageRoot()
+        : undefined;
     this.asyncRoot = options.asyncDirRootOverride ?? defaultAsyncRoot();
     this.resultsRoot = options.resultsDirOverride ?? defaultResultsRoot();
+    this.resultIdFactory = options.resultIdFactory ?? (() => randomBytes(16).toString("hex"));
   }
 
-  async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: RunnerRuntimeContext): Promise<SubagentRunHandle> {
+  async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: RunnerRuntimeContext): Promise<DurableSubagentRunHandle> {
     ensureTaskGraphRequest(request);
-    const paths = this.requireRunPaths(request.runId);
-    const runtimeCtx = ctx && typeof ctx === "object" ? ctx as Partial<RunnerRuntimeContext> : undefined;
+    const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : "";
     const requestCwd = typeof request.cwd === "string" && request.cwd.trim() ? request.cwd.trim() : undefined;
-    const contextCwd = typeof runtimeCtx?.cwd === "string" && runtimeCtx.cwd.trim() ? runtimeCtx.cwd.trim() : undefined;
+    const contextCwd = typeof ctx?.cwd === "string" && ctx.cwd.trim() ? ctx.cwd.trim() : undefined;
     const cwd = requestCwd ?? contextCwd;
     if (!cwd) throw new Error("Task graph cwd is required");
+    const resultsDir = this.requireResultsDir(sessionId);
+    const reservation = await this.reserveResultIdentity(sessionId, request.runId, resultsDir);
+    const paths = this.requireRunPaths(request.runId, sessionId, reservation.resultId);
     const children = this.buildChildren(request.tasks, cwd, paths.asyncDir);
     const config: RunnerConfig = {
       runId: request.runId,
+      sessionId,
       mode: "task_graph",
       maxConcurrency: request.maxConcurrency,
       piBin: this.piBin,
       asyncDir: paths.asyncDir,
-      resultsDir: this.resultsRoot,
-      resultPath: paths.resultPath,
+      resultsDir: paths.resultsDir,
+      resultId: reservation.resultId,
+      resultPath: reservation.resultPath,
+      resultReservationPath: reservation.resultReservationPath,
       statusPath: paths.statusPath,
       eventsPath: paths.eventsPath,
       children,
     };
-    const launch = await this.buildAndLaunch(config);
+    let launch: LaunchResult;
+    try {
+      launch = await this.buildAndLaunch(config);
+    } catch (error) {
+      await fsp.unlink(reservation.resultReservationPath).catch(() => undefined);
+      throw error;
+    }
     return {
       ...toRunHandleBase(launch),
       assignments: request.tasks.map((task) => ({
@@ -234,12 +269,12 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     };
   }
 
-  async stopRun(handle: SubagentRunHandle, _ctx: unknown): Promise<boolean> {
-    return this.terminate(handle, "paused", "Stopped by user; continuation available");
+  async stopRun(handle: SubagentRunHandle, ctx: RunnerRuntimeContext): Promise<boolean> {
+    return this.terminate(handle, "paused", "Stopped by user; continuation available", ctx);
   }
 
-  async cancelRun(handle: SubagentRunHandle, _ctx: unknown): Promise<boolean> {
-    return this.terminate(handle, "cancelled", "Cancelled by user");
+  async cancelRun(handle: SubagentRunHandle, ctx: RunnerRuntimeContext): Promise<boolean> {
+    return this.terminate(handle, "cancelled", "Cancelled by user", ctx);
   }
 
   async waitForRunSignal(
@@ -308,7 +343,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     if (!resolved) return false;
     const statusFile = await readJsonFile<RunnerStatusFile>(resolved.paths.statusPath);
     const pids = new Set<number>();
-    const trackedPid = this.trackedRuns.get(handle.runId)?.pid;
+    const trackedPid = handle.legacy ? undefined : this.trackedLaunches.get(handle.resultId)?.pid;
     if (trackedPid) pids.add(trackedPid);
     if (statusFile?.pid) pids.add(statusFile.pid);
     for (const step of statusFile?.steps ?? []) if (step.pid) pids.add(step.pid);
@@ -321,21 +356,97 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     return { assignments: [], counts: emptyCounts() };
   }
 
-  private runPaths(runId: string): RunPaths | undefined {
+  private requireResultsDir(sessionId: string): string {
+    if (!sessionId) throw new Error("Unsafe session ID");
+    const storage = sessionStoragePaths(this.dataRoot ?? resolveStorageRoot(), sessionId);
+    return this.dataRoot ? storage.resultsDir : this.resultsRoot;
+  }
+
+  private runPaths(runId: string, sessionId: string, resultId: string): RunPaths | undefined {
     if (!SAFE_RUN_ID_PATTERN.test(runId)) return undefined;
-    const asyncDir = safeJoin(this.asyncRoot, runId);
+    if (!/^[a-f0-9]{32}$/u.test(resultId)) return undefined;
+    const resultsDir = this.requireResultsDir(sessionId);
+    const asyncDir = this.dataRoot
+      ? safeJoin(sessionStoragePaths(this.dataRoot, sessionId).runsDir, resultId)
+      : safeJoin(this.asyncRoot, resultId);
+    const resultPath = safeJoin(resultsDir, `${resultId}.json`);
     return {
       asyncDir,
-      resultPath: safeJoin(this.resultsRoot, `${runId}.json`),
+      resultsDir,
+      resultPath,
+      resultReservationPath: `${resultPath}.reservation`,
       statusPath: safeJoin(asyncDir, "status.json"),
       eventsPath: safeJoin(asyncDir, "events.jsonl"),
     };
   }
 
-  private requireRunPaths(runId: string): RunPaths {
-    const paths = this.runPaths(runId);
+  private legacyRunPaths(runId: string): RunPaths | undefined {
+    if (!SAFE_RUN_ID_PATTERN.test(runId)) return undefined;
+    const asyncDir = safeJoin(this.asyncRoot, runId);
+    const resultPath = safeJoin(this.resultsRoot, `${runId}.json`);
+    return {
+      asyncDir,
+      resultsDir: this.resultsRoot,
+      resultPath,
+      resultReservationPath: `${resultPath}.reservation`,
+      statusPath: safeJoin(asyncDir, "status.json"),
+      eventsPath: safeJoin(asyncDir, "events.jsonl"),
+    };
+  }
+
+  private requireRunPaths(runId: string, sessionId: string, resultId: string): RunPaths {
+    const paths = this.runPaths(runId, sessionId, resultId);
     if (!paths) throw new Error("Unsafe run ID");
     return paths;
+  }
+
+  private async reserveResultIdentity(sessionId: string, runId: string, resultsDir: string): Promise<{
+    resultId: string;
+    resultPath: string;
+    resultReservationPath: string;
+  }> {
+    if (!sessionId) throw new Error("Unsafe session ID");
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const resultId = this.resultIdFactory();
+      if (!/^[a-f0-9]{32}$/u.test(resultId)) throw new Error("Result ID factory returned an invalid 128-bit identity");
+      const resultPath = safeJoin(resultsDir, `${resultId}.json`);
+      const reservationPath = `${resultPath}.reservation`;
+      try {
+        await fsp.access(resultPath);
+        continue;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await fsp.mkdir(path.dirname(reservationPath), { recursive: true });
+      let reservation: Awaited<ReturnType<typeof fsp.open>> | undefined;
+      let created = false;
+      try {
+        reservation = await fsp.open(reservationPath, "wx");
+        created = true;
+        const identity = JSON.stringify({ sessionId, runId, resultId });
+        await reservation.writeFile(identity, "utf8");
+        await reservation.sync();
+        // An old published result may have outlived its reservation. Do not
+        // hand that identity to a new child even if random generation collides.
+        try {
+          await fsp.access(resultPath);
+          await reservation.close();
+          reservation = undefined;
+          await fsp.unlink(reservationPath);
+          continue;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        return { resultId, resultPath, resultReservationPath: reservationPath };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+        if (created) await fsp.unlink(reservationPath).catch(() => undefined);
+        throw error;
+      } finally {
+        await reservation?.close();
+      }
+    }
+    throw new Error("Could not reserve a unique immutable result identity");
   }
 
   private buildChildren(entries: LaunchTaskEntry[], baseCwd: string, asyncDir: string): RunnerChildConfig[] {
@@ -371,14 +482,16 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
 
   private async buildAndLaunch(config: RunnerConfig): Promise<LaunchResult> {
     await fsp.mkdir(config.asyncDir, { recursive: true });
-    await fsp.mkdir(this.resultsRoot, { recursive: true });
+    await fsp.mkdir(config.resultsDir, { recursive: true });
     const configPath = safeJoin(config.asyncDir, "config.json");
     await writeJsonFile(configPath, config);
     const launch: LaunchResult = {
       runId: config.runId,
       asyncId: config.runId,
       asyncDir: config.asyncDir,
+      resultId: config.resultId,
       resultPath: config.resultPath,
+      resultReservationPath: config.resultReservationPath,
     };
     await new Promise<void>((resolve, reject) => {
       const child = spawn(process.execPath, [runnerPath(), configPath], {
@@ -388,7 +501,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       });
       child.once("error", reject);
       child.once("spawn", () => {
-        this.trackedRuns.set(config.runId, { launch, pid: child.pid ?? undefined });
+        this.trackedLaunches.set(config.resultId, { launch, pid: child.pid ?? undefined });
         child.unref();
         resolve();
       });
@@ -396,35 +509,41 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     return launch;
   }
 
-  private resolveRunHandle(handle: SubagentRunHandle): { paths: RunPaths; launch: LaunchResult } | undefined {
-    const fallback = this.runPaths(handle.runId);
-    if (!fallback) return undefined;
-    const asyncDir = handle.asyncDir ?? fallback.asyncDir;
-    const paths = {
+  private resolveRunHandle(handle: SubagentRunHandle): { paths: RunPaths; launch: { resultPath: string } } | undefined {
+    if (!SAFE_RUN_ID_PATTERN.test(handle.runId)) return undefined;
+    const tracked = handle.legacy ? undefined : this.trackedLaunches.get(handle.resultId)?.launch;
+    let fallback: RunPaths | undefined;
+    if (handle.legacy && (!handle.asyncDir || !handle.resultPath) && !tracked) {
+      fallback = this.legacyRunPaths(handle.runId);
+    }
+    const asyncDir = handle.asyncDir ?? tracked?.asyncDir ?? fallback?.asyncDir;
+    const resultPath = handle.resultPath ?? tracked?.resultPath ?? fallback?.resultPath;
+    if (!asyncDir || !resultPath) return undefined;
+    const paths: RunPaths = {
       asyncDir,
-      resultPath: handle.resultPath ?? fallback.resultPath,
+      resultsDir: path.dirname(resultPath),
+      resultPath,
+      resultReservationPath: handle.legacy
+        ? `${resultPath}.reservation`
+        : handle.resultReservationPath,
       statusPath: safeJoin(asyncDir, "status.json"),
       eventsPath: safeJoin(asyncDir, "events.jsonl"),
     };
-    const trackedLaunch = this.trackedRuns.get(handle.runId)?.launch;
-    const launch = {
-      ...trackedLaunch,
-      runId: handle.runId,
-      asyncId: handle.asyncId,
-      asyncDir: paths.asyncDir,
-      resultPath: paths.resultPath,
-      sessionFile: handle.sessionFile ?? trackedLaunch?.sessionFile,
-      artifactPath: handle.artifactPath ?? trackedLaunch?.artifactPath,
-    };
-    return { paths, launch };
+    return { paths, launch: { resultPath } };
   }
 
-  private async terminate(handle: SubagentRunHandle, state: "paused" | "cancelled", summary: string): Promise<boolean> {
+  private async terminate(
+    handle: SubagentRunHandle,
+    state: "paused" | "cancelled",
+    summary: string,
+    ctx: RunnerRuntimeContext,
+  ): Promise<boolean> {
     const { runId } = handle;
+    const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : "";
     const resolved = this.resolveRunHandle(handle);
     if (!resolved) return false;
     const { paths, launch } = resolved;
-    const tracked = this.trackedRuns.get(runId);
+    const tracked = handle.legacy ? undefined : this.trackedLaunches.get(handle.resultId);
     const existingStatus = await readJsonFile<RunnerStatusFile>(paths.statusPath);
     const resultPath = launch.resultPath ?? paths.resultPath;
 
@@ -466,7 +585,19 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     }
 
     await writeJsonFile(paths.statusPath, terminalStatus);
-    await writeJsonFile(resultPath, terminalResult);
+    if (handle.legacy) {
+      await writeJsonFile(resultPath, terminalResult);
+      return allSignaled;
+    }
+    try {
+      await publishTerminalResult(resultPath, handle.resultReservationPath, {
+        sessionId,
+        runId,
+        resultId: handle.resultId,
+      }, terminalResult);
+    } catch {
+      return false;
+    }
     return allSignaled;
   }
 }

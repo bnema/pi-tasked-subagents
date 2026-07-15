@@ -20,8 +20,10 @@ export type LauncherRuntimeContext = RunnerRuntimeContext;
 export interface LaunchResult {
   runId: string;
   asyncId: string;
-  asyncDir?: string;
-  resultPath?: string;
+  asyncDir: string;
+  resultId: string;
+  resultPath: string;
+  resultReservationPath: string;
   sessionFile?: string;
   artifactPath?: string;
   model?: string;
@@ -67,12 +69,16 @@ export interface RunnerChildConfig {
  */
 export interface RunnerConfig {
   runId: string;
+  /** Identity scope established by the adapter before the child starts. */
+  sessionId: string;
   mode: "task_graph";
   maxConcurrency?: number;
   piBin: string;
   asyncDir: string;
   resultsDir: string;
+  resultId: string;
   resultPath: string;
+  resultReservationPath: string;
   statusPath: string;
   eventsPath: string;
   children: RunnerChildConfig[];
