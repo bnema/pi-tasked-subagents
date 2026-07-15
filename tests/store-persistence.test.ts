@@ -1,7 +1,15 @@
-import { describe, expect, test } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, test } from "vitest";
 
 import { ENTRY_TYPE_STATE } from "../src/defaults.js";
+import type { CheckpointManifestV1, StatePointerV5 } from "../src/state/durable-types.js";
+import { DurableObjectStore } from "../src/state/object-store.js";
+import { sha256Hex } from "../src/state/canonical-json.js";
 import { buildStateEntryData, restoreStateFromSessionEntries, stateFromEntryData } from "../src/state/persistence.js";
+import { restoreBranchState } from "../src/state/restore.js";
 import { createEmptyState, deserializeState, ensureState, serializeState } from "../src/state/store.js";
 import type { TaskRunRecord, TaskedSubagentsState } from "../src/types.js";
 
@@ -81,6 +89,41 @@ function taskRunWithId(id: string): TaskRunRecord {
     assignments: [],
     artifacts: [],
   };
+}
+
+let storageRoots: string[] = [];
+afterEach(async () => {
+  await Promise.all(storageRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function v5Checkpoint(store: DurableObjectStore, state: TaskedSubagentsState, sequence: number): Promise<StatePointerV5> {
+  const recoverableRuns = await Promise.all(state.taskRuns.map(async (run) => ({
+    taskRunId: run.id,
+    status: run.status as "pending" | "running" | "attention" | "failed",
+    objectId: await store.put("task-run", run, 2 * 1024 * 1024),
+    updatedAt: run.updatedAt,
+  })));
+  const manifest: CheckpointManifestV1 = {
+    checkpointVersion: 1,
+    sessionId: "generic-session",
+    sequence,
+    ...(state.currentTaskRunId === undefined ? {} : { currentTaskRunId: state.currentTaskRunId }),
+    recoverableRuns,
+    recentCompleted: [],
+    recentAssignmentRefs: [],
+    updatedAt: state.updatedAt,
+  };
+  return {
+    version: 5,
+    checkpointId: await store.put("checkpoint", manifest, 256 * 1024),
+    ...(state.currentTaskRunId === undefined ? {} : { currentTaskRunId: state.currentTaskRunId }),
+    sequence,
+    writtenAt: sequence,
+  };
+}
+
+function v5Entry(pointer: StatePointerV5) {
+  return { type: "custom", customType: ENTRY_TYPE_STATE, data: pointer };
 }
 
 describe("task-run state store", () => {
@@ -574,6 +617,140 @@ describe("task-run state store", () => {
         resultPath: "local://results/assignment-1.json",
       }],
     });
+  });
+
+  test("restores the newest fully valid v5 checkpoint and falls back only to an earlier complete graph", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
+    storageRoots.push(root);
+    const store = new DurableObjectStore(root);
+    const earlier = { ...currentState, taskRuns: [{ ...taskRun, title: "earlier branch" }], updatedAt: 1 } satisfies TaskedSubagentsState;
+    const latest = {
+      ...currentState,
+      taskRuns: [{ ...taskRun, id: "task-run-2", title: "latest branch", assignments: [], tasks: [], artifacts: [] }],
+      currentTaskRunId: "task-run-2",
+      updatedAt: 2,
+    } satisfies TaskedSubagentsState;
+    const earlierPointer = await v5Checkpoint(store, earlier, 1);
+    const latestPointer = await v5Checkpoint(store, latest, 2);
+    const result = await restoreBranchState(
+      [v5Entry(earlierPointer), v5Entry(latestPointer)], store,
+      { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined },
+    );
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result).toMatchObject({ restored: true, pointer: latestPointer });
+    if (result.restored) expect(result.state.taskRuns).toMatchObject([{ id: "task-run-2", title: "latest branch" }]);
+    const divergentBranch = await restoreBranchState(
+      [v5Entry(earlierPointer)], store,
+      { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined },
+    );
+    expect(divergentBranch).toMatchObject({ restored: true, pointer: earlierPointer });
+    if (divergentBranch.restored) expect(divergentBranch.state.taskRuns).toMatchObject([{ title: "earlier branch" }]);
+
+    const corruptManifest: CheckpointManifestV1 = {
+      checkpointVersion: 1, sessionId: "generic-session", sequence: 3, currentTaskRunId: "missing-run",
+      recoverableRuns: [{ taskRunId: "missing-run", status: "running", objectId: "a".repeat(64), updatedAt: 3 }],
+      recentCompleted: [], recentAssignmentRefs: [], updatedAt: 3,
+    };
+    const corruptPointer: StatePointerV5 = {
+      version: 5, checkpointId: await store.put("checkpoint", corruptManifest, 256 * 1024), currentTaskRunId: "missing-run", sequence: 3, writtenAt: 3,
+    };
+    const fallback = await restoreBranchState(
+      [v5Entry(earlierPointer), v5Entry(corruptPointer)], store,
+      { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined },
+    );
+
+    expect(fallback).toMatchObject({ restored: true, pointer: earlierPointer });
+    expect(fallback.diagnostics).toContainEqual(expect.objectContaining({ code: "object_missing", objectId: "a".repeat(64) }));
+
+    const malformedFallback = await restoreBranchState(
+      [v5Entry(earlierPointer), { type: "custom", customType: ENTRY_TYPE_STATE, data: { version: 5, checkpointId: "not-a-digest" } }],
+      store,
+      { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined },
+    );
+    expect(malformedFallback).toMatchObject({ restored: true, pointer: earlierPointer });
+    expect(malformedFallback.diagnostics).toContainEqual(expect.objectContaining({ code: "pointer_invalid" }));
+  });
+
+  test("does not silently reset an all-invalid v5 branch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
+    storageRoots.push(root);
+    const result = await restoreBranchState(
+      [v5Entry({ version: 5, checkpointId: "f".repeat(64), sequence: 1, writtenAt: 1 })],
+      new DurableObjectStore(root),
+      { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined },
+    );
+
+    expect(result).toMatchObject({ restored: false, hasV4Candidate: false });
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({ code: "object_missing" }));
+  });
+
+  test("rejects a checkpoint when archive identities, terminal fields, or nested archive detail are malformed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
+    storageRoots.push(root);
+    const store = new DurableObjectStore(root);
+    const validArchive = {
+      assignmentId: "assignment-completed",
+      taskRunId: "completed-run",
+      groupId: "completed-group",
+      taskId: "completed-task",
+      status: "completed",
+      runId: "run-completed",
+      resultId: "result-completed",
+      completedAt: 4,
+      summary: "completed summary",
+      criteriaEvidence: [{ criteriaIndex: 0, criterionId: "C1", evidence: "proof" }],
+      artifacts: [{ label: "Report", path: "local://report", assignmentId: "assignment-completed", taskRunId: "completed-run", groupId: "completed-group", taskId: "completed-task" }],
+      followUps: ["none"],
+    };
+    const cases: Array<[string, (archive: Record<string, unknown>) => void]> = [
+      ["assignment id", (archive) => { archive.assignmentId = ""; }],
+      ["run id", (archive) => { archive.runId = 1; }],
+      ["terminal status", (archive) => { archive.status = "running"; }],
+      ["group id", (archive) => { archive.groupId = 1; }],
+      ["summary", (archive) => { archive.summary = 1; }],
+      ["criteria array", (archive) => { archive.criteriaEvidence = [{ criteriaIndex: "0", criterionId: "C1", evidence: "proof" }]; }],
+      ["artifact shape", (archive) => { archive.artifacts = [{ label: "Report", path: "local://report", assignmentId: "other", taskRunId: "completed-run", taskId: "completed-task" }]; }],
+      ["follow-up shape", (archive) => { archive.followUps = [1]; }],
+    ];
+    for (const [name, mutate] of cases) {
+      const archive = structuredClone(validArchive) as Record<string, unknown>;
+      mutate(archive);
+      const archiveId = await store.put("assignment", archive, 256 * 1024);
+      const manifest: CheckpointManifestV1 = {
+        checkpointVersion: 1, sessionId: "generic-session", sequence: 1,
+        recoverableRuns: [],
+        recentCompleted: [{ taskRunId: "completed-run", title: "Completed", status: "completed", createdAt: 1, updatedAt: 4, completedAt: 4, groupCount: 1, taskCount: 1, assignmentCount: 1, assignmentArchiveIds: [archiveId] }],
+        recentAssignmentRefs: [{ assignmentId: "assignment-completed", assignmentIdHash: sha256Hex("assignment-completed"), archiveId, resultId: "result-completed" }],
+        updatedAt: 4,
+      };
+      const pointer: StatePointerV5 = { version: 5, checkpointId: await store.put("checkpoint", manifest, 256 * 1024), sequence: 1, writtenAt: 4 };
+      const restored = await restoreBranchState([v5Entry(pointer)], store, { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined });
+      expect(restored, name).toMatchObject({ restored: false });
+    }
+
+    const archiveId = await store.put("assignment", validArchive, 256 * 1024);
+    const manifest: CheckpointManifestV1 = {
+      checkpointVersion: 1, sessionId: "generic-session", sequence: 2,
+      recoverableRuns: [],
+      recentCompleted: [{ taskRunId: "completed-run", title: "Completed", status: "completed", createdAt: 1, updatedAt: 4, completedAt: 4, groupCount: 3, taskCount: 5, assignmentCount: 7, assignmentArchiveIds: [archiveId] }],
+      recentAssignmentRefs: [{ assignmentId: "assignment-completed", assignmentIdHash: "f".repeat(64), archiveId, resultId: "result-completed" }],
+      updatedAt: 4,
+    };
+    const pointer: StatePointerV5 = { version: 5, checkpointId: await store.put("checkpoint", manifest, 256 * 1024), sequence: 2, writtenAt: 4 };
+    const rejected = await restoreBranchState([v5Entry(pointer)], store, { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined });
+    expect(rejected).toMatchObject({ restored: false });
+
+    manifest.recentAssignmentRefs[0].assignmentIdHash = sha256Hex("assignment-completed");
+    manifest.sequence = 3;
+    const validPointer: StatePointerV5 = { version: 5, checkpointId: await store.put("checkpoint", manifest, 256 * 1024), sequence: 3, writtenAt: 4 };
+    const restored = await restoreBranchState([v5Entry(validPointer)], store, { sessionId: "generic-session", allEntries: [], appendMigratedPointer: () => undefined });
+    expect(restored).toMatchObject({ restored: true });
+    if (restored.restored) {
+      expect(restored.state.taskRuns).toEqual([]);
+      expect(restored.state.completedHistory).toMatchObject([{ groupCount: 3, taskCount: 5, assignmentCount: 7, assignmentArchiveIds: [archiveId] }]);
+      expect(restored.archiveRefs).toMatchObject([{ assignmentId: "assignment-completed", archiveId, taskRunId: "completed-run" }]);
+    }
   });
 
   test("synthesizes launchRef for runId-only persisted assignments", () => {

@@ -94,6 +94,45 @@ describe("commands", () => {
     expect(formatInspectReport(state, "a1")).toContain("Assignment: a1");
   });
 
+  test("restored completed history preserves summary counts and archive inspection", () => {
+    const restored = structuredClone(state);
+    restored.taskRuns = [];
+    restored.completedHistory = [{
+      taskRunId: "completed-run", title: "Completed", status: "completed", createdAt: 1, updatedAt: 4, completedAt: 4,
+      groupCount: 3, taskCount: 5, assignmentCount: 7, assignmentArchiveIds: ["a".repeat(64)],
+      archives: [{
+        archiveId: "a".repeat(64), assignmentId: "archived-assignment", taskRunId: "completed-run", groupId: "group", taskId: "task",
+        status: "completed", runId: "run", resultId: "result", completedAt: 4, summary: "Archived result", criteriaEvidence: [], artifacts: [], followUps: [],
+      }],
+    }];
+
+    expect(formatStatusReport(restored, "completed-run")).toContain("tasks: 5");
+    expect(formatStatusReport(restored)).toContain("Task runs: 1 total");
+    expect(formatInspectReport(restored, "completed-run")).toContain("assignments: 7");
+    expect(formatInspectReport(restored, "archived-assignment")).toContain("Archived result");
+  });
+
+  test("normal status keeps only the newest 20 terminal runs", () => {
+    const history = structuredClone(state);
+    history.taskRuns = Array.from({ length: 25 }, (_, index) => ({
+      ...structuredClone(state.taskRuns[0]),
+      id: `completed-${index}`,
+      title: `Completed ${index}`,
+      status: "completed" as const,
+      completedAt: index,
+      updatedAt: index,
+      assignments: [],
+      tasks: [],
+      groups: [],
+    }));
+
+    const report = formatStatusReport(history);
+    expect(report).toContain("Completed 24");
+    expect(report).toContain("Completed 5");
+    expect(report).not.toContain("Completed 4");
+    expect(report).not.toContain("Completed 0");
+  });
+
   test("taskRun and group inspect expose full checklist and task assignment ids", () => {
     const taskRunInspect = formatInspectReport(state, "task-run-1");
     expect(taskRunInspect).toContain("Checklist:");

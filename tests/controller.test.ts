@@ -1,8 +1,15 @@
 import { describe, expect, test, vi } from "vitest";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { CheckpointContext, CheckpointResult } from "../src/state/persistence-coordinator.js";
 
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
+import { formatInspectReport, formatStatusReport } from "../src/orchestration/commands.js";
+import { DurableObjectStore } from "../src/state/object-store.js";
+import { sha256Hex } from "../src/state/canonical-json.js";
+import { projectAssignmentArchive, type ArchiveRef } from "../src/state/durable-projection.js";
 import type {
   AttachResult,
   EditGroupInput,
@@ -37,8 +44,9 @@ interface TaskRunControllerApi {
   clear(scope?: "completed" | "all", targetId?: string): Promise<number>;
   handleUserAsk(prompt: string, ctx?: unknown): Promise<unknown>;
   flushPersistence(ctx?: unknown): Promise<void>;
+  getRunResult(assignmentId: string, archiveId?: string): Promise<string | undefined>;
   awaitLastWork(): Promise<void>;
-  restoreState(state: TaskedSubagentsState): void;
+  restoreState(state: TaskedSubagentsState, archiveRefs?: readonly ArchiveRef[]): void;
   reconcileRestoredRuns(ctx?: unknown): void;
   getState(): TaskedSubagentsState;
 }
@@ -108,6 +116,15 @@ class CompletingRuntime implements SubagentRuntime {
 
   getSnapshot() {
     return { assignments: [], counts: { queued: 0, running: 0, blocked: 0, attention: 0, completed: 0, failed: 0, cancelled: 0, paused: 0, skipped: 0 } };
+  }
+}
+
+class DurableResultRuntime extends CompletingRuntime {
+  readonly resultId = "a".repeat(32);
+
+  override async launchTaskGraph(request: LaunchTaskGraphRequest): Promise<DurableSubagentRunHandle> {
+    const handle = await super.launchTaskGraph(request);
+    return { ...handle, resultId: this.resultId, assignments: handle.assignments.map((assignment) => ({ ...assignment, resultId: this.resultId })) };
   }
 }
 
@@ -782,7 +799,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
 
   test("uses the last live context when flushing without a call context", async () => {
     const persistence = new ContextRecordingPersistence();
-    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { persistence }));
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { persistence, runtime: new CompletingRuntime() }));
     const context = persistenceContext("session-retained", "c".repeat(64));
 
     await controller.setTasks({ ...baseSetTasks, taskRunId: "task-run-retained", wait: true }, context);
@@ -809,6 +826,68 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     expect(state).toMatchObject({ version: 4, currentTaskRunId: "task-run-1" });
     expect(state.taskRuns[0].tasks[0].status).toBe("completed");
     expect(state.taskRuns[0].status).toBe("completed");
+  });
+
+  test("stores and links terminal assignment archives before checkpointing", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-archive-"));
+    const runtime = new DurableResultRuntime();
+    await mkdir(join(dataRoot, "results", "pi-tasked-subagents"), { recursive: true });
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${runtime.resultId}.json`), "authoritative output");
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { runtime, dataRoot }));
+
+    await controller.setTasks({ ...baseSetTasks, wait: true });
+    const assignmentId = controller.getState().taskRuns[0].assignments[0].id;
+    const archives = await new DurableObjectStore(dataRoot).listAssignmentArchives("pi-tasked-subagents", assignmentId);
+
+    expect(archives).toHaveLength(1);
+    expect(archives[0].archive).toMatchObject({ assignmentId, resultId: runtime.resultId, runId: expect.any(String) });
+  });
+
+  test("loads only the selected immutable result and never silently chooses an ambiguous archive", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-result-"));
+    const store = new DurableObjectStore(dataRoot);
+    const assignmentId = "old-assignment";
+    const createArchive = async (runId: string, resultId: string) => {
+      const archive = projectAssignmentArchive({
+        assignmentId,
+        taskRunId: `run-${runId}`,
+        taskId: "task",
+        status: "completed",
+        summary: "done",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        runId,
+        resultId,
+        completedAt: 1,
+      });
+      const archiveId = await store.put("assignment", archive, 256 * 1024);
+      await store.linkAssignmentArchive("pi-tasked-subagents", assignmentId, archiveId);
+      return { archive, archiveId };
+    };
+    const firstResultId = "a".repeat(32);
+    const secondResultId = "b".repeat(32);
+    await mkdir(join(dataRoot, "results", "pi-tasked-subagents"), { recursive: true });
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${firstResultId}.json`), "first authoritative output");
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${secondResultId}.json`), "second authoritative output");
+    const first = await createArchive("branch-one", firstResultId);
+    const second = await createArchive("branch-two", secondResultId);
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { dataRoot }));
+    const empty: TaskedSubagentsState = { version: 4, taskRuns: [], updatedAt: 1 };
+
+    controller.restoreState(empty, [{
+      assignmentId,
+      assignmentIdHash: sha256Hex(assignmentId),
+      archiveId: second.archiveId,
+      resultId: secondResultId,
+      taskRunId: second.archive.taskRunId,
+      completedAt: second.archive.completedAt,
+    }]);
+    await expect(controller.getRunResult(assignmentId)).resolves.toBe("second authoritative output");
+
+    controller.restoreState(empty);
+    await expect(controller.getRunResult(assignmentId)).resolves.toContain(`Ambiguous result for ${assignmentId}`);
+    await expect(controller.getRunResult(assignmentId, first.archiveId)).resolves.toBe("first authoritative output");
   });
 
   test("completed dispatch accepts duplicate criterion evidence when all criteria are covered", async () => {
@@ -1399,6 +1478,22 @@ describe("TaskedSubagentsController TaskRun public API", () => {
 
     expect(runtime.cancelled).toHaveLength(1);
     expect(controller.getState().taskRuns[0].assignments[0]?.status).toBe("cancelled");
+  });
+
+  test("restoreState retains completed history counts and archive inspection", () => {
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi()));
+    controller.restoreState({
+      version: 4, taskRuns: [], updatedAt: 4,
+      completedHistory: [{
+        taskRunId: "completed-run", title: "Completed", status: "completed", createdAt: 1, updatedAt: 4, completedAt: 4,
+        groupCount: 2, taskCount: 3, assignmentCount: 4, assignmentArchiveIds: ["a".repeat(64)],
+        archives: [{ archiveId: "a".repeat(64), assignmentId: "archived", taskRunId: "completed-run", taskId: "task", status: "completed", runId: "run", resultId: "result", completedAt: 4, summary: "Archived", criteriaEvidence: [], artifacts: [], followUps: [] }],
+      }],
+    });
+
+    const restored = controller.getState();
+    expect(formatStatusReport(restored, "completed-run")).toContain("tasks: 3");
+    expect(formatInspectReport(restored, "archived")).toContain("Archived");
   });
 
   test("restoreState clears launch cancellation bookkeeping", async () => {

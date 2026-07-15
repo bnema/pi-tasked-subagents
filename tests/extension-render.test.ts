@@ -45,6 +45,33 @@ function renderCollapsedToolResult(text: string): string {
 }
 
 describe("tasked_subagents extension rendering", () => {
+  test("session tree fences restore before async selection and shutdown awaits a flush", async () => {
+    let sessionTree: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+    let sessionShutdown: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+    const restoreState = vi.spyOn(TaskedSubagentsController.prototype, "restoreState");
+    const flushPersistence = vi.spyOn(TaskedSubagentsController.prototype, "flushPersistence");
+    const context = {
+      cwd: "/tmp/project", mode: "tui",
+      sessionManager: { getBranch: () => [], getEntries: () => [], getSessionId: () => "generic-session" },
+      ui: {
+        theme: { fg: (_color: string, value: string) => value }, notify: vi.fn(), onTerminalInput: vi.fn(),
+        setStatus: vi.fn(), setWidget: vi.fn(), requestRender: vi.fn(),
+      },
+    };
+    taskedSubagentsExtension({
+      on: vi.fn((event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => {
+        if (event === "session_tree") sessionTree = handler;
+        if (event === "session_shutdown") sessionShutdown = handler;
+      }),
+      registerMessageRenderer: vi.fn(), registerTool: vi.fn(), registerCommand: vi.fn(), appendEntry: vi.fn(), sendMessage: vi.fn(),
+    } as never);
+
+    await sessionTree?.({}, context);
+    expect(restoreState).toHaveBeenCalledTimes(1);
+    await sessionShutdown?.({}, context);
+    expect(flushPersistence).toHaveBeenCalledWith(context);
+  });
+
   test("Escape cancels active subagent runs without consuming Pi's interrupt", async () => {
     let sessionStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
     const terminalInputs: Array<(data: string) => { consume?: boolean } | undefined> = [];

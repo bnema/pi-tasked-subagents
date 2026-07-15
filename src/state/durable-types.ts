@@ -81,3 +81,8 @@ export interface AssignmentArchiveMetadataOnlyV1 extends AssignmentArchiveIdenti
 }
 
 export type AssignmentArchiveV1 = AssignmentArchiveDetailV1 | AssignmentArchiveMetadataOnlyV1;
+
+/** Bounded completed-run history reconstructed from one validated checkpoint. */
+export interface RestoredCompletedHistoryV1 extends CompletedRunSummary {
+  archives: Array<AssignmentArchiveV1 & { archiveId: string }>;
+}

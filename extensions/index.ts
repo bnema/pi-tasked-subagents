@@ -5,12 +5,13 @@
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
   InputSource,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { COMMAND_NAME, TOOL_NAME } from "../src/defaults.js";
+import { COMMAND_NAME, ENTRY_TYPE_STATE, TOOL_NAME } from "../src/defaults.js";
 import { shortTitle } from "../src/utils/text.js";
 import { listAvailableAgentProfiles } from "../src/launcher/agent-profiles.js";
 import {
@@ -30,7 +31,10 @@ import {
 } from "../src/orchestration/commands.js";
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 import { routeInput } from "../src/orchestration/input-router.js";
-import { restoreStateFromSessionEntries } from "../src/state/persistence.js";
+import type { SessionEntry } from "../src/state/persistence.js";
+import { restoreBranchState } from "../src/state/restore.js";
+import { DurableObjectStore } from "../src/state/object-store.js";
+import { resolveStorageRoot } from "../src/state/storage-paths.js";
 import { registerMessageRenderers, statusLabel } from "../src/ui/messages.js";
 
 const NonEmptyString = Type.String({ minLength: 1 });
@@ -55,6 +59,14 @@ function sessionEntryCustomType(entry: unknown): string | undefined {
 function sessionEntryData(entry: unknown): unknown {
   if (!entry || typeof entry !== "object" || !("data" in entry)) return undefined;
   return entry.data;
+}
+
+function persistenceEntries(entries: readonly unknown[]): SessionEntry[] {
+  return entries.map((entry) => ({
+    type: entry && typeof entry === "object" && "type" in entry && typeof entry.type === "string" ? entry.type : "",
+    customType: sessionEntryCustomType(entry),
+    data: sessionEntryData(entry),
+  }));
 }
 
 function parseJsonObject(text: string): Record<string, unknown> | undefined {
@@ -202,17 +214,35 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
     return decision.action === "handled" ? { action: "handled" as const } : { action: "continue" as const };
   });
 
+  const restoreLifecycle = async (ctx: ExtensionContext): Promise<void> => {
+    // Fence old watchers before any filesystem I/O. Retaining the current state
+    // until a complete graph is selected avoids an invalid branch becoming an
+    // implicit empty-state checkpoint.
+    controller.restoreState(controller.getState());
+    const branchEntries = persistenceEntries(ctx.sessionManager.getBranch());
+    const allEntries = persistenceEntries((ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch()));
+    const sessionId = ctx.sessionManager.getSessionId();
+    const restored = await restoreBranchState(
+      branchEntries,
+      new DurableObjectStore(resolveStorageRoot()),
+      {
+        sessionId,
+        allEntries,
+        appendMigratedPointer: (pointer) => pi.appendEntry(ENTRY_TYPE_STATE, pointer),
+      },
+    );
+    if (restored.restored) controller.restoreState(restored.state, restored.archiveRefs);
+    else if (restored.diagnostics.length > 0) {
+      ctx.ui.notify("Tasked subagents persistence could not restore this branch; existing state was retained.", "error");
+    }
+    controller.updateUI(ctx);
+    if (restored.restored) controller.reconcileRestoredRuns(ctx);
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     let escapeCancellation: Promise<number> | undefined;
-    const entries = ctx.sessionManager.getBranch();
-    const restored = restoreStateFromSessionEntries(entries.map((entry) => ({
-      type: entry.type,
-      customType: sessionEntryCustomType(entry),
-      data: sessionEntryData(entry),
-    })));
-    controller.restoreState(restored);
-    controller.updateUI(ctx);
-    controller.reconcileRestoredRuns(ctx);
+    await restoreLifecycle(ctx);
+
     if (ctx.mode === "tui") {
       ctx.ui.onTerminalInput((data) => {
         if (!matchesKey(data, "escape") || escapeCancellation) return;
@@ -234,15 +264,11 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    const entries = ctx.sessionManager.getBranch();
-    const restored = restoreStateFromSessionEntries(entries.map((entry) => ({
-      type: entry.type,
-      customType: sessionEntryCustomType(entry),
-      data: sessionEntryData(entry),
-    })));
-    controller.restoreState(restored);
-    controller.updateUI(ctx);
-    controller.reconcileRestoredRuns(ctx);
+    await restoreLifecycle(ctx);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await controller.flushPersistence(ctx);
   });
 
   pi.registerTool({
@@ -476,7 +502,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             break;
           }
           const assignmentId = resolveResultAssignmentId(controller.getState(), parsed.assignmentId);
-          output = assignmentId ? await controller.getRunResult(assignmentId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), parsed.assignmentId);
+          output = assignmentId ? await controller.getRunResult(assignmentId, parsed.archiveId) ?? formatResultReport(controller.getState(), assignmentId) : formatResultReport(controller.getState(), parsed.assignmentId);
           break;
         }
         case "attach": {

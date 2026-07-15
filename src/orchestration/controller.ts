@@ -2,6 +2,8 @@
 // Task-run controller for pi-tasked-subagents
 // ──────────────────────────────────────────────
 
+import { readFile } from "node:fs/promises";
+
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -38,7 +40,14 @@ import { PiRunnerAdapter } from "../launcher/pi-runner-adapter.js";
 import type { RunnerRuntimeContext } from "../launcher/interface.js";
 import { cloneState, createEmptyState, createStateLock, ensureState } from "../state/store.js";
 import { DurableObjectStore } from "../state/object-store.js";
-import { buildCheckpointProjection } from "../state/durable-projection.js";
+import { sha256Hex } from "../state/canonical-json.js";
+import {
+  buildCheckpointProjection,
+  projectAssignmentArchive,
+  type ArchiveRef,
+} from "../state/durable-projection.js";
+import type { AssignmentArchiveV1 } from "../state/durable-types.js";
+import { resultFilePath, sessionStoragePaths } from "../state/storage-paths.js";
 import {
   PersistenceCoordinator,
   type CheckpointContext,
@@ -96,6 +105,8 @@ export interface TaskedSubagentsControllerOptions {
   /** Injectable coordinator boundary for tests and extension lifecycle wiring. */
   persistence?: ControllerPersistence;
   dataRoot?: string;
+  /** Test seam; production uses the same store for archives and checkpoints. */
+  objectStore?: DurableObjectStore;
 }
 
 export class PersistenceError extends Error {
@@ -182,32 +193,6 @@ function parseReportsFromRaw(raw: string | undefined): Array<{ assignmentId?: st
   }
 }
 
-function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
-  return values.find((value) => Boolean(value?.trim()));
-}
-
-function resultForAssignment(raw: string | undefined, assignmentId: string): string | undefined {
-  if (!raw?.trim()) return undefined;
-  try {
-    const parsed = JSON.parse(raw) as {
-      results?: Array<{
-        stepId?: string | number;
-        rawOutput?: string;
-        output?: string;
-        summary?: string;
-        error?: string;
-      }>;
-    };
-    if (Array.isArray(parsed.results)) {
-      const child = parsed.results.find((entry) => String(entry.stepId) === assignmentId);
-      return child ? firstNonEmpty(child.rawOutput, child.output, child.summary, child.error) : undefined;
-    }
-  } catch {
-    // Non-JSON raw output is the single-assignment result.
-  }
-  return raw;
-}
-
 type MutableTarget =
   | { kind: "taskRun"; taskRun: TaskRunRecord }
   | { kind: "group"; taskRun: TaskRunRecord; group: TaskGroupRecord }
@@ -261,6 +246,10 @@ export class TaskedSubagentsController {
   private readonly defaultAgent: string;
   private readonly pi: ExtensionAPI;
   private readonly persistence: ControllerPersistence;
+  private readonly objectStore: DurableObjectStore;
+  private readonly dataRoot: string;
+  /** Immutable terminal archives visible to the next checkpoint. */
+  private archiveRefs: ArchiveRef[] = [];
   private taskRunCounter = 0;
   private lastContext: ExtensionContext | undefined;
   private lastDispatchWork: Promise<void> = Promise.resolve();
@@ -280,10 +269,12 @@ export class TaskedSubagentsController {
     this.pi = pi;
     this.runtime = options?.runtime ?? options?.launcher ?? DEFAULT_OPTIONS.runtime;
     this.defaultAgent = options?.defaultAgent ?? DEFAULT_OPTIONS.defaultAgent;
+    this.dataRoot = resolveStorageRoot({ dataRoot: options?.dataRoot });
+    this.objectStore = options?.objectStore ?? new DurableObjectStore(this.dataRoot);
     this.persistence = options?.persistence ?? new PersistenceCoordinator(
-      new DurableObjectStore(resolveStorageRoot({ dataRoot: options?.dataRoot })),
+      this.objectStore,
       { append: (pointer) => this.pi.appendEntry(ENTRY_TYPE_STATE, pointer) },
-      { dataRoot: resolveStorageRoot({ dataRoot: options?.dataRoot }) },
+      { dataRoot: this.dataRoot },
     );
   }
 
@@ -291,8 +282,15 @@ export class TaskedSubagentsController {
     return cloneState(this.state);
   }
 
-  restoreState(state: TaskedSubagentsState): void {
+  restoreState(state: TaskedSubagentsState, archiveRefs: readonly ArchiveRef[] = []): void {
+    const completedHistory = state.completedHistory === undefined ? undefined : structuredClone(state.completedHistory);
     this.state = ensureState(state);
+    if (completedHistory?.length) {
+      this.state.completedHistory = completedHistory;
+      if (state.currentTaskRunId && completedHistory.some((summary) => summary.taskRunId === state.currentTaskRunId)) {
+        this.state.currentTaskRunId = state.currentTaskRunId;
+      }
+    }
     this.taskRunCounter = Math.max(this.taskRunCounter, maxTaskRunCounter(this.state.taskRuns));
     this.runProgressSignatures.clear();
     this.terminalProgressAssignmentIds.clear();
@@ -300,6 +298,7 @@ export class TaskedSubagentsController {
     this.launchingRuns.clear();
     this.cancellationRequestedRunIds.clear();
     this.signalSuppressionCounts.clear();
+    this.archiveRefs = [...structuredClone(archiveRefs)];
     this.clearAllInProgress = false;
     this.scheduledDispatches.clear();
     this.lastDispatchWork = Promise.resolve();
@@ -831,11 +830,57 @@ export class TaskedSubagentsController {
     return cancelled;
   }
 
-  async getRunResult(assignmentId: string): Promise<string | undefined> {
-    const handle = this.resolveHandleForAssignment(assignmentId);
-    if (!handle) return undefined;
-    const raw = await this.runtime.getRunResult(handle);
-    return resultForAssignment(raw, assignmentId);
+  /**
+   * Resolve one immutable terminal archive, then read only its authoritative
+   * result file. A branch-local checkpoint reference wins over directory
+   * discovery; multiple unreferenced branch variants require an archive ID.
+   */
+  async getRunResult(assignmentId: string, requestedArchiveId?: string): Promise<string | undefined> {
+    const sessionId = this.checkpointContext().sessionId;
+    if (!sessionId) return "Result is unavailable: no active session.";
+    const selected = this.archiveRefs.filter((ref) => ref.assignmentId === assignmentId);
+    let archiveId = requestedArchiveId;
+    if (!archiveId && selected.length === 1) archiveId = selected[0].archiveId;
+
+    let archive: AssignmentArchiveV1 | undefined;
+    if (archiveId) {
+      // An explicit archive ID must be branch-selected or linked in this
+      // session's hashed assignment directory; a global object digest alone
+      // is not a cross-session capability.
+      if (!selected.some((ref) => ref.archiveId === archiveId)) {
+        const linked = await this.objectStore.listAssignmentArchives<AssignmentArchiveV1>(sessionId, assignmentId);
+        if (!linked.some((match) => match.archiveId === archiveId)) {
+          return "Result is unavailable: archive ID is not linked to this assignment.";
+        }
+      }
+      try {
+        archive = await this.objectStore.get<AssignmentArchiveV1>(archiveId, "assignment", 256 * 1024);
+      } catch {
+        return "Result is unavailable: the immutable assignment archive could not be read.";
+      }
+      if (archive.assignmentId !== assignmentId) return "Result is unavailable: archive ID does not match the assignment.";
+    } else {
+      const matches = await this.objectStore.listAssignmentArchives<AssignmentArchiveV1>(sessionId, assignmentId);
+      if (matches.length === 0) return undefined;
+      if (matches.length > 1) {
+        return [
+          `Ambiguous result for ${assignmentId}; specify an archive ID.`,
+          ...matches.map((match) => `  ${match.archiveId} · ${match.archive.runId}`),
+        ].join("\n");
+      }
+      archive = matches[0].archive;
+    }
+
+    if (!archive.resultId) {
+      return archive.resultUnavailableReason === "missing-legacy-result"
+        ? "Result is unavailable: the legacy result file is missing."
+        : "Result is unavailable: this assignment has no durable result identity.";
+    }
+    try {
+      return await readFile(resultFilePath(sessionStoragePaths(this.dataRoot, sessionId), archive.resultId), "utf8");
+    } catch {
+      return "Result is unavailable: the durable result file is missing.";
+    }
   }
 
   async clear(scope: "completed" | "all" = "completed", targetId?: string): Promise<number> {
@@ -875,21 +920,23 @@ export class TaskedSubagentsController {
     }
 
     return this.lock.withLock(async () => {
-      const before = this.state.taskRuns.length;
+      const before = this.state.taskRuns.length + (this.state.completedHistory?.length ?? 0);
       if (normalizedTargetId) {
         const taskRunId = this.resolveTaskRunIdForTarget(normalizedTargetId);
         const target = taskRunId ? this.state.taskRuns.find((taskRun) => taskRun.id === taskRunId) : undefined;
         const active = target?.assignments.some((assignment) => assignment.status === "queued" || assignment.status === "running");
         if (target && !active) this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.id !== target.id);
+        this.state.completedHistory = this.state.completedHistory?.filter((summary) => summary.taskRunId !== normalizedTargetId);
       } else {
         this.state.taskRuns = this.state.taskRuns.filter((taskRun) => taskRun.status !== "completed" && taskRun.status !== "cancelled");
+        this.state.completedHistory = [];
       }
 
       if (this.state.currentTaskRunId && !this.state.taskRuns.some((taskRun) => taskRun.id === this.state.currentTaskRunId)) {
         this.state.currentTaskRunId = this.state.taskRuns.at(-1)?.id;
       }
       this.state.updatedAt = Date.now();
-      const removed = before - this.state.taskRuns.length;
+      const removed = before - this.state.taskRuns.length - (this.state.completedHistory?.length ?? 0);
       await this.checkpointState(checkpointContext);
       this.updateUI(this.lastContext);
       return removed;
@@ -913,7 +960,10 @@ export class TaskedSubagentsController {
     if (ctx) this.lastContext = ctx;
     const context = this.checkpointContext(ctx);
     if (!context.sessionId) throw new PersistenceError("Checkpoint context has no active session");
-    await this.persistence.flush(context);
+    // A dirty checkpoint already captured its archive references. Flush only
+    // needs the live branch/session identity and must not rewrite its snapshot.
+    const { archiveRefs: _archiveRefs, ...flushContext } = context;
+    await this.persistence.flush(flushContext);
   }
 
   private checkpointContext(ctx?: ExtensionContext): CheckpointContext {
@@ -934,7 +984,11 @@ export class TaskedSubagentsController {
       if (candidate.customType !== ENTRY_TYPE_STATE || !this.isStatePointer(candidate.data)) continue;
       visiblePointers.push(structuredClone(candidate.data));
     }
-    return { sessionId, visiblePointers };
+    return {
+      sessionId,
+      visiblePointers,
+      ...(this.archiveRefs.length > 0 ? { archiveRefs: structuredClone(this.archiveRefs) } : {}),
+    };
   }
 
   private isStatePointer(value: unknown): value is StatePointerV5 {
@@ -1290,6 +1344,46 @@ export class TaskedSubagentsController {
     });
   }
 
+  private async archiveTerminalAssignments(
+    taskRun: TaskRunRecord,
+    assignments: readonly TaskAssignmentRecord[],
+    sessionId: string,
+  ): Promise<void> {
+    for (const assignment of assignments) {
+      if (!finalAssignmentStatus(assignment.status)) continue;
+      const result = assignment.result;
+      const resultId = assignment.launchRef?.resultId;
+      const archive = projectAssignmentArchive({
+        assignmentId: assignment.id,
+        taskRunId: taskRun.id,
+        ...(assignment.groupId === undefined ? {} : { groupId: assignment.groupId }),
+        taskId: assignment.taskId,
+        status: assignment.status,
+        summary: result?.summary ?? "",
+        criteriaEvidence: result?.criteriaEvidence ?? [],
+        artifacts: result?.artifacts ?? taskRun.artifacts.filter((artifact) => artifact.assignmentId === assignment.id),
+        followUps: result?.followUps ?? [],
+        runId: assignment.runId ?? "unknown",
+        ...(resultId === undefined
+          ? { resultUnavailableReason: "missing-legacy-result" as const }
+          : { resultId }),
+        completedAt: assignment.completedAt ?? assignment.updatedAt,
+      });
+      const archiveId = await this.objectStore.put("assignment", archive, 256 * 1024);
+      await this.objectStore.linkAssignmentArchive(sessionId, assignment.id, archiveId);
+      if (!this.archiveRefs.some((ref) => ref.archiveId === archiveId)) {
+        this.archiveRefs.push({
+          assignmentId: assignment.id,
+          assignmentIdHash: sha256Hex(assignment.id),
+          archiveId,
+          ...(resultId === undefined ? {} : { resultId }),
+          taskRunId: taskRun.id,
+          completedAt: archive.completedAt,
+        });
+      }
+    }
+  }
+
   private async applyRunOutcome(
     taskRunId: string,
     runId: string,
@@ -1349,8 +1443,15 @@ export class TaskedSubagentsController {
       deriveTaskRunStatus(taskRun, timestamp);
       for (const assignment of assignments) this.terminalProgressAssignmentIds.delete(assignment.id);
 
+      // Archives are written and linked before the checkpoint can reference
+      // them. This ordering leaves an orphan on a later checkpoint failure,
+      // never a pointer to a missing terminal archive.
+      await this.archiveTerminalAssignments(taskRun, assignments, checkpointContext.sessionId);
       taskRunForSignal = cloneState({ version: 4, taskRuns: [taskRun], currentTaskRunId: taskRun.id, updatedAt: taskRun.updatedAt }).taskRuns[0];
-      await this.checkpointState(checkpointContext);
+      await this.checkpointState({
+        ...checkpointContext,
+        ...(this.archiveRefs.length > 0 ? { archiveRefs: structuredClone(this.archiveRefs) } : {}),
+      });
       this.updateUI(ctx ?? this.lastContext);
     });
     const taskRunIsTerminal = taskRunForSignal?.status !== "running" && taskRunForSignal?.status !== "pending";

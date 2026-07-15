@@ -161,6 +161,8 @@ export interface AttachResult {
   report: string;
 }
 
+import type { RestoredCompletedHistoryV1 } from "./state/durable-types.js";
+
 // ──────────────────────────────────────────────
 // Persisted domain records
 // ──────────────────────────────────────────────
@@ -280,6 +282,8 @@ export interface TaskRunRecord {
 export interface TaskedSubagentsState {
   version: 4;
   taskRuns: TaskRunRecord[];
+  /** Checkpoint-only terminal history; never treated as schedulable graph state. */
+  completedHistory?: RestoredCompletedHistoryV1[];
   currentTaskRunId?: string;
   updatedAt: number;
 }

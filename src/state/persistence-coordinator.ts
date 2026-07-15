@@ -18,6 +18,7 @@ import type {
 import {
   buildCheckpointManifest,
   buildCheckpointProjection,
+  type ArchiveRef,
 } from "./durable-projection.js";
 import { sessionStoragePaths } from "./storage-paths.js";
 
@@ -32,6 +33,8 @@ export interface CheckpointContext {
   /** Every valid v5 pointer returned by sessionManager.getEntries(), not just the active branch. */
   visiblePointers: readonly StatePointerV5[];
   now?: number;
+  /** Terminal archives written before this checkpoint; omitted archives remain discoverable by assignment ID. */
+  archiveRefs?: readonly ArchiveRef[];
 }
 
 export interface PersistenceFailure {
@@ -169,7 +172,7 @@ export class PersistenceCoordinator {
       return this.recordDirty(state, context.sessionId, capturedEpoch, failure("stale_generation", "A newer session generation superseded this checkpoint"));
     }
 
-    const projected = buildCheckpointProjection(state, []);
+    const projected = buildCheckpointProjection(state, context.archiveRefs ?? []);
     if (!projected.ok) return this.recordDirty(state, context.sessionId, capturedEpoch, failure("projection", projected.error.message));
     const digest = sha256Hex(canonicalJson(projected.value));
     if (digest === this.projectionDigest && this.lastCommitted) {
