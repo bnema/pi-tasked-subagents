@@ -76,6 +76,39 @@ function safeErrorMessage(error: unknown): string {
   return "Durable persistence operation failed";
 }
 
+/** Atomically replace the session's complete durable checkpoint root set. */
+export async function rewriteSessionRefs(
+  root: string,
+  sessionId: string,
+  checkpointIds: ReadonlySet<string>,
+  onWritten?: () => void,
+): Promise<void> {
+  if ([...checkpointIds].some((checkpointId) => !DIGEST_ID.test(checkpointId))) throw new Error("Invalid checkpoint digest");
+  const paths = sessionStoragePaths(root, sessionId);
+  const bytes = canonicalJson({ version: 1, checkpointIds: [...checkpointIds].sort() });
+  await fs.mkdir(dirname(paths.refsPath), { recursive: true, mode: 0o700 });
+  const temporary = `${paths.refsPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    await handle.writeFile(bytes, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await fs.rename(temporary, paths.refsPath);
+    const directory = await fs.open(dirname(paths.refsPath), constants.O_RDONLY | constants.O_DIRECTORY);
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+    onWritten?.();
+  } finally {
+    await handle?.close();
+    await fs.rm(temporary, { force: true });
+  }
+}
+
 /**
  * Serializes durable checkpoints. It deliberately does not mutate controller
  * state: failed snapshots remain available for a later explicit retry.
@@ -305,33 +338,11 @@ export class PersistenceCoordinator {
   }
 
   private async writeRefs(sessionId: string, visiblePointers: readonly StatePointerV5[], checkpointId: string): Promise<void> {
-    const paths = sessionStoragePaths(this.root, sessionId);
     const checkpointIds = new Set<string>(this.committedIds);
     for (const pointer of visiblePointers) {
       if (this.validPointer(pointer)) checkpointIds.add(pointer.checkpointId);
     }
     checkpointIds.add(checkpointId);
-    const bytes = canonicalJson({ version: 1, checkpointIds: [...checkpointIds].sort() });
-    await fs.mkdir(dirname(paths.refsPath), { recursive: true, mode: 0o700 });
-    const temporary = `${paths.refsPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-    let handle: fs.FileHandle | undefined;
-    try {
-      handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
-      await handle.writeFile(bytes, "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await fs.rename(temporary, paths.refsPath);
-      const directory = await fs.open(dirname(paths.refsPath), constants.O_RDONLY | constants.O_DIRECTORY);
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
-      this.onRefsWritten?.();
-    } finally {
-      await handle?.close();
-      await fs.rm(temporary, { force: true });
-    }
+    await rewriteSessionRefs(this.root, sessionId, checkpointIds, this.onRefsWritten);
   }
 }

@@ -28,9 +28,11 @@ import type {
   StatePointerV5,
 } from "./durable-types.js";
 import { DurableObjectStore } from "./object-store.js";
+import { rewriteSessionRefs } from "./persistence-coordinator.js";
 import type { SessionEntry } from "./persistence.js";
 import { ensureState } from "./store.js";
 import { migrateNewestV4State } from "./v4-migration.js";
+import { isResultId } from "./storage-paths.js";
 import type { ArchiveRef } from "./durable-projection.js";
 
 const DIGEST_ID = /^[a-f0-9]{64}$/;
@@ -47,7 +49,7 @@ export interface RestoreContext {
 }
 
 export interface RestoreDiagnostic {
-  code: "pointer_invalid" | "checkpoint_invalid" | "object_missing" | "object_invalid" | "migration_failed";
+  code: "pointer_invalid" | "checkpoint_invalid" | "object_missing" | "object_invalid" | "migration_failed" | "refs_write_failed";
   message: string;
   checkpointId?: string;
   objectId?: string;
@@ -87,6 +89,10 @@ function boundedString(value: unknown, maxBytes = MAX_ARCHIVE_ID_BYTES): value i
   return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= maxBytes;
 }
 
+function boundedText(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
 function exactKeys(input: Record<string, unknown>, allowed: readonly string[]): boolean {
   return Object.keys(input).every((key) => allowed.includes(key));
 }
@@ -118,18 +124,21 @@ function isV4Entry(entry: SessionEntry): boolean {
 
 function validCompletedSummary(value: unknown): value is CompletedRunSummary {
   const input = record(value);
-  return Boolean(input && optionalString(input.taskRunId) && optionalString(input.title) &&
+  return Boolean(input && exactKeys(input, ["taskRunId", "title", "status", "createdAt", "updatedAt", "completedAt", "groupCount", "taskCount", "assignmentCount", "assignmentArchiveIds"]) &&
+    boundedString(input.taskRunId) && boundedString(input.title, MAX_ARCHIVE_SUMMARY_BYTES) &&
     typeof input.status === "string" && TERMINAL_STATUS.has(input.status) &&
-    safeInteger(input.createdAt) && safeInteger(input.updatedAt) &&
-    (input.completedAt === undefined || safeInteger(input.completedAt)) &&
+    safeInteger(input.createdAt) && input.createdAt >= 0 && safeInteger(input.updatedAt) && input.updatedAt >= 0 &&
+    (input.completedAt === undefined || (safeInteger(input.completedAt) && input.completedAt >= 0)) &&
     safeInteger(input.groupCount) && input.groupCount >= 0 && safeInteger(input.taskCount) && input.taskCount >= 0 &&
     safeInteger(input.assignmentCount) && input.assignmentCount >= 0 &&
-    Array.isArray(input.assignmentArchiveIds) && input.assignmentArchiveIds.every((id) => typeof id === "string" && DIGEST_ID.test(id)));
+    Array.isArray(input.assignmentArchiveIds) && new Set(input.assignmentArchiveIds).size === input.assignmentArchiveIds.length &&
+    input.assignmentArchiveIds.every((id) => typeof id === "string" && DIGEST_ID.test(id)));
 }
 
 function validateManifest(value: unknown, sessionId: string): value is CheckpointManifestV1 {
   const input = record(value);
-  if (!input || input.checkpointVersion !== 1 || input.sessionId !== sessionId || !safeInteger(input.sequence) || input.sequence < 0 ||
+  if (!input || !exactKeys(input, ["checkpointVersion", "sessionId", "sequence", "currentTaskRunId", "recoverableRuns", "recentCompleted", "recentAssignmentRefs", "updatedAt"]) ||
+    input.checkpointVersion !== 1 || input.sessionId !== sessionId || !safeInteger(input.sequence) || input.sequence < 0 ||
     !safeInteger(input.updatedAt) || !Array.isArray(input.recoverableRuns) || !Array.isArray(input.recentCompleted) ||
     !Array.isArray(input.recentAssignmentRefs) || input.recoverableRuns.length > MAX_RECOVERABLE_TASK_RUNS ||
     input.recentCompleted.length > MAX_RECENT_COMPLETED || input.recentAssignmentRefs.length > MAX_RECENT_ASSIGNMENT_REFS) return false;
@@ -138,19 +147,20 @@ function validateManifest(value: unknown, sessionId: string): value is Checkpoin
   const runIds = new Set<string>();
   for (const run of input.recoverableRuns) {
     const ref = record(run);
-    if (!ref || !optionalString(ref.taskRunId) || runIds.has(ref.taskRunId as string) || typeof ref.status !== "string" ||
-      !RECOVERABLE_STATUS.has(ref.status) || !DIGEST_ID.test(String(ref.objectId ?? "")) || !safeInteger(ref.updatedAt)) return false;
+    if (!ref || !exactKeys(ref, ["taskRunId", "status", "objectId", "updatedAt"]) || !boundedString(ref.taskRunId) || runIds.has(ref.taskRunId as string) || typeof ref.status !== "string" ||
+      !RECOVERABLE_STATUS.has(ref.status) || !DIGEST_ID.test(String(ref.objectId ?? "")) || !safeInteger(ref.updatedAt) || ref.updatedAt < 0) return false;
     runIds.add(ref.taskRunId as string);
   }
   if (!input.recentCompleted.every(validCompletedSummary)) return false;
   const completedIds = new Set(input.recentCompleted.map((summary) => (summary as CompletedRunSummary).taskRunId));
+  if (completedIds.size !== input.recentCompleted.length || [...completedIds].some((id) => runIds.has(id))) return false;
   if (currentTaskRunId !== undefined && !runIds.has(currentTaskRunId as string) && !completedIds.has(currentTaskRunId as string)) return false;
   const archiveIds = new Set<string>();
   for (const ref of input.recentAssignmentRefs) {
     const item = record(ref);
     if (!item || !exactKeys(item, ["assignmentId", "assignmentIdHash", "archiveId", "resultId"]) || !boundedString(item.assignmentId) ||
       !DIGEST_ID.test(String(item.assignmentIdHash ?? "")) || sha256Hex(item.assignmentId as string) !== item.assignmentIdHash ||
-      !DIGEST_ID.test(String(item.archiveId ?? "")) || (item.resultId !== undefined && !boundedString(item.resultId)) ||
+      !DIGEST_ID.test(String(item.archiveId ?? "")) || (item.resultId !== undefined && !isResultId(item.resultId)) ||
       archiveIds.has(item.archiveId as string)) return false;
     archiveIds.add(item.archiveId as string);
   }
@@ -160,7 +170,7 @@ function validateManifest(value: unknown, sessionId: string): value is Checkpoin
 function validArchiveArtifact(value: unknown, archive: Record<string, unknown>): boolean {
   const input = record(value);
   return Boolean(input && exactKeys(input, ["label", "path", "assignmentId", "taskRunId", "groupId", "taskId"]) &&
-    boundedString(input.label, MAX_ARCHIVE_ARTIFACT_LABEL_BYTES) && boundedString(input.path, MAX_ARCHIVE_ARTIFACT_PATH_BYTES) &&
+    boundedText(input.label, MAX_ARCHIVE_ARTIFACT_LABEL_BYTES) && boundedText(input.path, MAX_ARCHIVE_ARTIFACT_PATH_BYTES) &&
     input.assignmentId === archive.assignmentId && input.taskRunId === archive.taskRunId && input.taskId === archive.taskId &&
     input.groupId === archive.groupId);
 }
@@ -169,7 +179,7 @@ function validArchiveEvidence(value: unknown): boolean {
   const input = record(value);
   return Boolean(input && exactKeys(input, ["criteriaIndex", "criterionId", "evidence"]) &&
     safeInteger(input.criteriaIndex) && input.criteriaIndex >= 0 &&
-    boundedString(input.criterionId, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES) && boundedString(input.evidence, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES));
+    boundedText(input.criterionId, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES) && boundedText(input.evidence, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES));
 }
 
 function validArchive(archive: unknown, assignmentId?: string, resultId?: string): archive is AssignmentArchiveV1 {
@@ -179,18 +189,18 @@ function validArchive(archive: unknown, assignmentId?: string, resultId?: string
     !boundedString(input.runId) || typeof input.status !== "string" || !TERMINAL_ASSIGNMENT_STATUS.has(input.status) ||
     !safeInteger(input.completedAt) || input.completedAt < 0 ||
     (input.groupId !== undefined && !boundedString(input.groupId)) ||
-    (input.resultId !== undefined && !boundedString(input.resultId)) ||
+    (input.resultId !== undefined && !isResultId(input.resultId)) ||
     (input.resultUnavailableReason !== undefined && input.resultUnavailableReason !== "missing-legacy-result") ||
     ((input.resultId === undefined) === (input.resultUnavailableReason === undefined)) ||
     (assignmentId !== undefined && !optionalSame(assignmentId, input.assignmentId as string)) ||
     (resultId !== undefined && input.resultId !== resultId)) return false;
   if (input.detailOmitted === true) return exactKeys(input, [...identityKeys, "detailOmitted"]);
   if (!exactKeys(input, [...identityKeys, "summary", "criteriaEvidence", "artifacts", "followUps"]) ||
-    !boundedString(input.summary, MAX_ARCHIVE_SUMMARY_BYTES) || !Array.isArray(input.criteriaEvidence) ||
+    !boundedText(input.summary, MAX_ARCHIVE_SUMMARY_BYTES) || !Array.isArray(input.criteriaEvidence) ||
     input.criteriaEvidence.length > MAX_ARCHIVE_CRITERIA_EVIDENCE || !input.criteriaEvidence.every(validArchiveEvidence) ||
     !Array.isArray(input.artifacts) || input.artifacts.length > MAX_ARCHIVE_ARTIFACTS || !input.artifacts.every((item) => validArchiveArtifact(item, input)) ||
     !Array.isArray(input.followUps) || input.followUps.length > MAX_ARCHIVE_FOLLOW_UPS ||
-    !input.followUps.every((item) => boundedString(item, MAX_ARCHIVE_FOLLOW_UP_BYTES))) return false;
+    !input.followUps.every((item) => boundedText(item, MAX_ARCHIVE_FOLLOW_UP_BYTES))) return false;
   return true;
 }
 
@@ -349,6 +359,47 @@ async function restorePointer(pointer: StatePointerV5, store: DurableObjectStore
   };
 }
 
+async function pinRestoredCheckpointGraphs(
+  branchEntries: readonly SessionEntry[],
+  store: DurableObjectStore,
+  context: RestoreContext,
+  activePointer: StatePointerV5,
+): Promise<void> {
+  const checkpointIds = new Set<string>([activePointer.checkpointId]);
+  // getEntries() includes all branches. Revalidate each candidate graph instead
+  // of trusting pointer syntax, so refs never retain partial or corrupt graphs.
+  for (const entry of [...branchEntries, ...context.allEntries]) {
+    const pointer = pointerFromEntry(entry);
+    if (!pointer || checkpointIds.has(pointer.checkpointId)) continue;
+    try {
+      await restorePointer(pointer, store, context.sessionId);
+      checkpointIds.add(pointer.checkpointId);
+    } catch {
+      // A non-active branch is independently recoverable; invalid graphs are
+      // deliberately excluded without affecting active-branch restoration.
+    }
+  }
+  await rewriteSessionRefs(store.root, context.sessionId, checkpointIds);
+}
+
+async function finalizeSuccessfulRestore(
+  result: Extract<RestoreResult, { restored: true }>,
+  branchEntries: readonly SessionEntry[],
+  store: DurableObjectStore,
+  context: RestoreContext,
+): Promise<RestoreResult> {
+  try {
+    await pinRestoredCheckpointGraphs(branchEntries, store, context, result.pointer);
+    return result;
+  } catch {
+    return {
+      restored: false,
+      diagnostics: [...result.diagnostics, { code: "refs_write_failed", message: "Durable checkpoint references could not be updated" }],
+      hasV4Candidate: [...branchEntries, ...context.allEntries].some(isV4Entry),
+    };
+  }
+}
+
 /**
  * Select the newest fully valid v5 graph from one Pi branch. A graph is never
  * composed from separate checkpoints: any failed reference rejects its pointer.
@@ -370,7 +421,7 @@ export async function restoreBranchState(
     }
     try {
       const restored = await restorePointer(pointer, store, context.sessionId);
-      return { restored: true, state: restored.state, pointer, archiveRefs: restored.archiveRefs, diagnostics, migrated: false };
+      return finalizeSuccessfulRestore({ restored: true, state: restored.state, pointer, archiveRefs: restored.archiveRefs, diagnostics, migrated: false }, branchEntries, store, context);
     } catch (error) {
       const text = error instanceof Error ? error.message : "";
       const objectId = error instanceof RestoreObjectError
@@ -386,14 +437,14 @@ export async function restoreBranchState(
     appendMigratedPointer: context.appendMigratedPointer,
   });
   if (migration.migrated) {
-    return {
+    return finalizeSuccessfulRestore({
       restored: true,
       state: migration.state,
       pointer: migration.pointer,
       archiveRefs: migration.archiveRefs,
       diagnostics,
       migrated: true,
-    };
+    }, branchEntries, store, context);
   }
   const hasV4Candidate = [...branchEntries, ...context.allEntries].some(isV4Entry);
   if (hasV4Candidate && migration.reason !== "no_valid_v4") {

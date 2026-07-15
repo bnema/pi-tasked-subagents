@@ -282,6 +282,20 @@ export class TaskedSubagentsController {
     return cloneState(this.state);
   }
 
+  /** Fence stale asynchronous work without discarding the last valid restore. */
+  fenceRestore(): number {
+    this.stateEpoch += 1;
+    this.persistence.invalidate(this.stateEpoch);
+    return this.stateEpoch;
+  }
+
+  /** Install an asynchronous restore only when no newer lifecycle has fenced it. */
+  installRestoredState(state: TaskedSubagentsState, archiveRefs: readonly ArchiveRef[] = [], expectedEpoch: number): boolean {
+    if (this.stateEpoch !== expectedEpoch) return false;
+    this.restoreState(state, archiveRefs);
+    return true;
+  }
+
   restoreState(state: TaskedSubagentsState, archiveRefs: readonly ArchiveRef[] = []): void {
     const completedHistory = state.completedHistory === undefined ? undefined : structuredClone(state.completedHistory);
     this.state = ensureState(state);
@@ -302,8 +316,7 @@ export class TaskedSubagentsController {
     this.clearAllInProgress = false;
     this.scheduledDispatches.clear();
     this.lastDispatchWork = Promise.resolve();
-    this.stateEpoch += 1;
-    this.persistence.invalidate(this.stateEpoch);
+    this.fenceRestore();
     this.dispatchRunCounter = Math.max(this.dispatchRunCounter, maxDispatchRunCounter(this.state.taskRuns));
   }
 

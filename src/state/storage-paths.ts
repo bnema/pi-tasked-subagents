@@ -9,6 +9,11 @@ const SAFE_PATH_ID = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
 const RESULT_ID = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/;
 const DIGEST_ID = /^[a-f0-9]{64}$/;
 
+/** Result identities are 128-bit launch IDs or 256-bit migrated content digests. */
+export function isResultId(value: unknown): value is string {
+  return typeof value === "string" && RESULT_ID.test(value);
+}
+
 export interface StoragePathsOptions {
   /** An application-root override, used by tests and embedders. */
   dataRoot?: string;
@@ -92,7 +97,7 @@ export function sessionStoragePaths(root: string, sessionId: string): SessionSto
 }
 
 export function resultFilePath(paths: SessionStoragePaths, resultId: string): string {
-  assertId(resultId, RESULT_ID, "result ID");
+  if (!isResultId(resultId)) unsafeId("result ID");
   return containedPath(paths.root, "results", sessionIdFromPaths(paths), `${resultId}.json`);
 }
 

@@ -215,28 +215,34 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   });
 
   const restoreLifecycle = async (ctx: ExtensionContext): Promise<void> => {
-    // Fence old watchers before any filesystem I/O. Retaining the current state
-    // until a complete graph is selected avoids an invalid branch becoming an
-    // implicit empty-state checkpoint.
-    controller.restoreState(controller.getState());
+    // Fence old watchers before any filesystem I/O, but retain committed lookup
+    // context until a complete replacement has been restored and pinned.
+    const restoreEpoch = controller.fenceRestore();
     const branchEntries = persistenceEntries(ctx.sessionManager.getBranch());
     const allEntries = persistenceEntries((ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch()));
     const sessionId = ctx.sessionManager.getSessionId();
-    const restored = await restoreBranchState(
-      branchEntries,
-      new DurableObjectStore(resolveStorageRoot()),
-      {
-        sessionId,
-        allEntries,
-        appendMigratedPointer: (pointer) => pi.appendEntry(ENTRY_TYPE_STATE, pointer),
-      },
-    );
-    if (restored.restored) controller.restoreState(restored.state, restored.archiveRefs);
-    else if (restored.diagnostics.length > 0) {
+    let restored;
+    try {
+      restored = await restoreBranchState(
+        branchEntries,
+        new DurableObjectStore(resolveStorageRoot()),
+        {
+          sessionId,
+          allEntries,
+          appendMigratedPointer: (pointer) => pi.appendEntry(ENTRY_TYPE_STATE, pointer),
+        },
+      );
+    } catch {
+      ctx.ui.notify("Tasked subagents persistence could not restore this branch; existing state was retained.", "error");
+      controller.updateUI(ctx);
+      return;
+    }
+    const installed = restored.restored && controller.installRestoredState(restored.state, restored.archiveRefs, restoreEpoch);
+    if (!restored.restored && restored.diagnostics.length > 0) {
       ctx.ui.notify("Tasked subagents persistence could not restore this branch; existing state was retained.", "error");
     }
     controller.updateUI(ctx);
-    if (restored.restored) controller.reconcileRestoredRuns(ctx);
+    if (installed) controller.reconcileRestoredRuns(ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => {

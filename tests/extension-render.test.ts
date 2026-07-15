@@ -1,7 +1,15 @@
+import { readFileSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, test, vi } from "vitest";
 
 import taskedSubagentsExtension from "../extensions/index.js";
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
+import { PersistenceCoordinator } from "../src/state/persistence-coordinator.js";
+import { DurableObjectStore } from "../src/state/object-store.js";
+import { sessionStoragePaths } from "../src/state/storage-paths.js";
 
 interface CapturedTool {
   description: string;
@@ -48,7 +56,7 @@ describe("tasked_subagents extension rendering", () => {
   test("session tree fences restore before async selection and shutdown awaits a flush", async () => {
     let sessionTree: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
     let sessionShutdown: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-    const restoreState = vi.spyOn(TaskedSubagentsController.prototype, "restoreState");
+    const fenceRestore = vi.spyOn(TaskedSubagentsController.prototype, "fenceRestore");
     const flushPersistence = vi.spyOn(TaskedSubagentsController.prototype, "flushPersistence");
     const context = {
       cwd: "/tmp/project", mode: "tui",
@@ -67,9 +75,66 @@ describe("tasked_subagents extension rendering", () => {
     } as never);
 
     await sessionTree?.({}, context);
-    expect(restoreState).toHaveBeenCalledTimes(1);
+    expect(fenceRestore).toHaveBeenCalledTimes(1);
     await sessionShutdown?.({}, context);
     expect(flushPersistence).toHaveBeenCalledWith(context);
+  });
+
+  test("session startup pins all valid branch checkpoint graphs before installing restored state", async () => {
+    const xdgDataHome = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-extension-"));
+    const previousXdgDataHome = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = xdgDataHome;
+    const dataRoot = join(xdgDataHome, "pi-tasked-subagents");
+    const sessionId = "generic-session";
+    const store = new DurableObjectStore(dataRoot);
+    const appender = { append: vi.fn() };
+    const coordinator = new PersistenceCoordinator(store, appender);
+    try {
+      const active = await coordinator.checkpoint({ version: 4, taskRuns: [], updatedAt: 1 }, { sessionId, visiblePointers: [], now: 1 });
+      if (!active.committed) throw new Error("active checkpoint was not committed");
+      const inactive = await coordinator.checkpoint({ version: 4, taskRuns: [], updatedAt: 2 }, { sessionId, visiblePointers: [active.pointer], now: 2 });
+      if (!inactive.committed) throw new Error("inactive checkpoint was not committed");
+      const paths = sessionStoragePaths(dataRoot, sessionId);
+      await writeFile(paths.refsPath, JSON.stringify({ version: 1, checkpointIds: [active.pointer.checkpointId] }));
+
+      let sessionStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+      let refsAtInstall: { checkpointIds: string[] } | undefined;
+      const originalRestoreState = TaskedSubagentsController.prototype.restoreState;
+      const restoreState = vi.spyOn(TaskedSubagentsController.prototype, "restoreState").mockImplementation(function (this: TaskedSubagentsController, state, archiveRefs) {
+        refsAtInstall = JSON.parse(readFileSync(paths.refsPath, "utf8")) as { checkpointIds: string[] };
+        return originalRestoreState.call(this, state, archiveRefs);
+      });
+      const pi = {
+        on: vi.fn((event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => {
+          if (event === "session_start") sessionStart = handler;
+        }),
+        registerMessageRenderer: vi.fn(), registerTool: vi.fn(), registerCommand: vi.fn(), appendEntry: vi.fn(), sendMessage: vi.fn(),
+      };
+      taskedSubagentsExtension(pi as never);
+      const context = {
+        cwd: "/tmp/project", mode: "json",
+        sessionManager: {
+          getBranch: () => [{ type: "custom", customType: "pi-tasked-subagents:state", data: active.pointer }],
+          getEntries: () => [
+            { type: "custom", customType: "pi-tasked-subagents:state", data: active.pointer },
+            { type: "custom", customType: "pi-tasked-subagents:state", data: inactive.pointer },
+          ],
+          getSessionId: () => sessionId,
+        },
+        ui: { theme: { fg: (_color: string, value: string) => value }, notify: vi.fn(), onTerminalInput: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn(), requestRender: vi.fn() },
+      };
+
+      await sessionStart?.({}, context);
+
+      expect(restoreState).toHaveBeenCalledOnce();
+      expect(refsAtInstall?.checkpointIds).toEqual([active.pointer.checkpointId, inactive.pointer.checkpointId].sort());
+      expect(JSON.parse(await readFile(paths.refsPath, "utf8"))).toEqual(refsAtInstall);
+      expect(pi.appendEntry).not.toHaveBeenCalled();
+    } finally {
+      if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = previousXdgDataHome;
+      await rm(xdgDataHome, { recursive: true, force: true });
+    }
   });
 
   test("Escape cancels active subagent runs without consuming Pi's interrupt", async () => {

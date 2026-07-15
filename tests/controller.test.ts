@@ -47,6 +47,8 @@ interface TaskRunControllerApi {
   getRunResult(assignmentId: string, archiveId?: string): Promise<string | undefined>;
   awaitLastWork(): Promise<void>;
   restoreState(state: TaskedSubagentsState, archiveRefs?: readonly ArchiveRef[]): void;
+  fenceRestore(): number;
+  installRestoredState(state: TaskedSubagentsState, archiveRefs: readonly ArchiveRef[] | undefined, expectedEpoch: number): boolean;
   reconcileRestoredRuns(ctx?: unknown): void;
   getState(): TaskedSubagentsState;
 }
@@ -74,7 +76,7 @@ class CompletingRuntime implements SubagentRuntime {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
       asyncDir: `/tmp/async-${request.runId}`,
-      resultId: `result-${request.runId}`,
+      resultId: "a".repeat(32),
       resultPath: `/tmp/${request.runId}.json`,
       resultReservationPath: `/tmp/${request.runId}.json.reservation`,
       assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
@@ -342,7 +344,7 @@ class LaunchControlledRuntime extends CompletingRuntime {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
       asyncDir: `/tmp/async-${request.runId}`,
-      resultId: `result-${request.runId}`,
+      resultId: "b".repeat(32),
       resultPath: `/tmp/${request.runId}.json`,
       resultReservationPath: `/tmp/${request.runId}.json.reservation`,
       assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
@@ -392,7 +394,7 @@ class MultiLaunchControlledRuntime extends CompletingRuntime {
       runId: request.runId,
       asyncId: `async-${request.runId}`,
       asyncDir: `/tmp/async-${request.runId}`,
-      resultId: `result-${request.runId}`,
+      resultId: "c".repeat(32),
       resultPath: `/tmp/${request.runId}.json`,
       resultReservationPath: `/tmp/${request.runId}.json.reservation`,
       assignments: request.tasks.map((task) => ({ assignmentId: task.assignmentId, runId: request.runId, resultPath: `/tmp/${request.runId}.json` })),
@@ -888,6 +890,38 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     controller.restoreState(empty);
     await expect(controller.getRunResult(assignmentId)).resolves.toContain(`Ambiguous result for ${assignmentId}`);
     await expect(controller.getRunResult(assignmentId, first.archiveId)).resolves.toBe("first authoritative output");
+  });
+
+  test("restore fencing preserves selected archive result lookup when tree restore later fails", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "tasked-result-"));
+    const store = new DurableObjectStore(dataRoot);
+    const assignmentId = "archived-assignment";
+    const resultId = "c".repeat(32);
+    const archive = projectAssignmentArchive({
+      assignmentId, taskRunId: "archived-run", taskId: "task", status: "completed", summary: "done",
+      criteriaEvidence: [], artifacts: [], followUps: [], runId: "archived-dispatch", resultId, completedAt: 1,
+    });
+    const archiveId = await store.put("assignment", archive, 256 * 1024);
+    await mkdir(join(dataRoot, "results", "pi-tasked-subagents"), { recursive: true });
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${resultId}.json`), "preserved archive output");
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { dataRoot }));
+    controller.restoreState({ version: 4, taskRuns: [], updatedAt: 1 }, [{
+      assignmentId, assignmentIdHash: sha256Hex(assignmentId), archiveId, resultId, taskRunId: "archived-run", completedAt: 1,
+    }]);
+
+    controller.fenceRestore();
+
+    await expect(controller.getRunResult(assignmentId)).resolves.toBe("preserved archive output");
+  });
+
+  test("a newer restore fence rejects stale asynchronous restore installation", () => {
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi()));
+    controller.restoreState(recoverableState());
+    const staleEpoch = controller.fenceRestore();
+    controller.fenceRestore();
+
+    expect(controller.installRestoredState({ version: 4, taskRuns: [], updatedAt: 2 }, undefined, staleEpoch)).toBe(false);
+    expect(controller.getState().taskRuns).toHaveLength(1);
   });
 
   test("completed dispatch accepts duplicate criterion evidence when all criteria are covered", async () => {
@@ -1487,7 +1521,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
       completedHistory: [{
         taskRunId: "completed-run", title: "Completed", status: "completed", createdAt: 1, updatedAt: 4, completedAt: 4,
         groupCount: 2, taskCount: 3, assignmentCount: 4, assignmentArchiveIds: ["a".repeat(64)],
-        archives: [{ archiveId: "a".repeat(64), assignmentId: "archived", taskRunId: "completed-run", taskId: "task", status: "completed", runId: "run", resultId: "result", completedAt: 4, summary: "Archived", criteriaEvidence: [], artifacts: [], followUps: [] }],
+        archives: [{ archiveId: "a".repeat(64), assignmentId: "archived", taskRunId: "completed-run", taskId: "task", status: "completed", runId: "run", resultId: "b".repeat(32), completedAt: 4, summary: "Archived", criteriaEvidence: [], artifacts: [], followUps: [] }],
       }],
     });
 

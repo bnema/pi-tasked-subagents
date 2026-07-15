@@ -102,7 +102,7 @@ describe("commands", () => {
       groupCount: 3, taskCount: 5, assignmentCount: 7, assignmentArchiveIds: ["a".repeat(64)],
       archives: [{
         archiveId: "a".repeat(64), assignmentId: "archived-assignment", taskRunId: "completed-run", groupId: "group", taskId: "task",
-        status: "completed", runId: "run", resultId: "result", completedAt: 4, summary: "Archived result", criteriaEvidence: [], artifacts: [], followUps: [],
+        status: "completed", runId: "run", resultId: "a".repeat(32), completedAt: 4, summary: "Archived result", criteriaEvidence: [], artifacts: [], followUps: [],
       }],
     }];
 
