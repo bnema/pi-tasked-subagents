@@ -388,7 +388,12 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             text = "dispatch wait=true requires taskRunId so the wait is bound to a specific task run.";
             break;
           }
-          const result = await controller.dispatchReady({ taskRunId: params.taskRunId, maxConcurrency: params.maxConcurrency, ctx });
+          const result = await controller.dispatchReady({
+            taskRunId: params.taskRunId,
+            maxConcurrency: params.maxConcurrency,
+            ctx,
+            emitTerminalSignal: !params.wait,
+          });
           text = params.wait
             ? `Dispatched and waited for ${result.launched} task assignment(s), skipped ${result.skipped}.\n\n${(await controller.attachTarget(params.taskRunId, ctx)).report}`
             : `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;
@@ -436,7 +441,8 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           break;
         }
         case "clear": {
-          const count = await controller.clear(params.scope ?? "completed");
+          const target = params.targetId ?? params.assignmentId ?? params.taskId ?? params.groupId ?? params.taskRunId;
+          const count = await controller.clear(params.scope ?? "completed", target);
           text = formatClearAcknowledgement(count);
           break;
         }
@@ -515,7 +521,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           break;
         }
         case "clear": {
-          const count = await controller.clear(parsed.scope ?? "completed");
+          const count = await controller.clear(parsed.scope ?? "completed", parsed.targetId);
           output = formatClearAcknowledgement(count);
           break;
         }
@@ -532,7 +538,12 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
             output = "Dispatch rejected:\ndispatch wait=true requires taskRunId so the wait is bound to a specific task run.";
             break;
           }
-          const result = await controller.dispatchReady({ taskRunId: dispatchArgs.taskRunId, maxConcurrency: dispatchArgs.maxConcurrency, ctx });
+          const result = await controller.dispatchReady({
+            taskRunId: dispatchArgs.taskRunId,
+            maxConcurrency: dispatchArgs.maxConcurrency,
+            ctx,
+            emitTerminalSignal: !dispatchArgs.wait,
+          });
           output = dispatchArgs.wait
             ? `Dispatched and waited for ${result.launched} task assignment(s), skipped ${result.skipped}.\n\n${(await controller.attachTarget(dispatchArgs.taskRunId, ctx)).report}`
             : `Dispatched ${result.launched} task assignment(s), skipped ${result.skipped}.`;

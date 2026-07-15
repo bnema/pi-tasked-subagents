@@ -124,7 +124,7 @@ Public target ids are `taskRunId`, `groupId`, `taskId`, and `assignmentId`.
 
 ## UI and messages
 
-**Decision.** UI surfaces show task runs, groups, tasks, authoritative assignments, and criteria progress. Superseded attempts are collapsed into a history count in aggregate views and remain available by direct assignment id. Completion/attention/failure messages identify the task run and assignment run rather than presenting generic background execution. The compact widget prioritizes active progress, while `inspect` includes a full checklist view for the selected TaskRun.
+**Decision.** UI surfaces show task runs, groups, tasks, authoritative assignments, and criteria progress. Superseded attempts are collapsed into a history count in aggregate views and remain available by direct assignment id. Background work emits one completion/attention/failure message only when its TaskRun becomes terminal; awaited work returns its report directly without queuing another agent turn. Targeted mutations select their TaskRun for the compact widget, while `inspect` includes a full checklist view for the selected TaskRun.
 
 **Rationale.** Status output should reinforce the product model and make recovery actions obvious.
 

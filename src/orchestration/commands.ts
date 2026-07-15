@@ -152,10 +152,11 @@ export function parseCommand(input: string, internal = false): ParsedCommand {
       return targetId && prompt ? { action, targetId, prompt } : { action: "help" };
     }
     case "clear": {
-      const scope = tokens[1]?.toLowerCase();
+      const targetOrScope = tokens[1];
+      const scope = targetOrScope?.toLowerCase();
       if (!scope || scope === "completed") return { action: "clear", scope: "completed" };
       if (scope === "all") return { action: "clear", scope: "all" };
-      return { action: "help" };
+      return tokens.length === 2 ? { action: "clear", scope: "completed", targetId: targetOrScope } : { action: "help" };
     }
     case "agents":
     case "list-agents":
@@ -476,7 +477,7 @@ export function buildHelpText(): string {
     "  /tasked-subagents continue <taskId|assignmentId|groupId> <prompt>",
     "  /tasked-subagents resolve <taskId|assignmentId|groupId|taskRunId> <fix-summary>",
     "  /tasked-subagents cancel <assignmentId>",
-    "  /tasked-subagents clear [completed|all]",
+    "  /tasked-subagents clear [completed|all|<taskRunId|groupId|taskId|assignmentId>]",
     "  /tasked-subagents agents [--details]",
     "",
     "Tool usage:",

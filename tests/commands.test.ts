@@ -57,6 +57,9 @@ describe("commands", () => {
     expect(parseCommand("continue task fix it")).toEqual({ action: "continue", targetId: "task", prompt: "fix it" });
     expect(parseCommand("resolve a1 fixed in commit abc123")).toEqual({ action: "resolve", targetId: "a1", prompt: "fixed in commit abc123" });
     expect(parseCommand("attach task-run-1")).toEqual({ action: "attach", targetId: "task-run-1" });
+    expect(parseCommand("clear completed")).toEqual({ action: "clear", scope: "completed" });
+    expect(parseCommand("clear all")).toEqual({ action: "clear", scope: "all" });
+    expect(parseCommand("clear task-run-1")).toEqual({ action: "clear", scope: "completed", targetId: "task-run-1" });
     expect(parseCommand("wait task-run-1")).toEqual({ action: "help" });
     expect(parseCommand("resolve task")).toEqual({ action: "help" });
     expect(parseCommand("run do arbitrary prompt")).toEqual({ action: "help" });
