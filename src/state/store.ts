@@ -80,6 +80,14 @@ function normalizeEvidence(raw: unknown): TaskEvidence | undefined {
   };
 }
 
+function normalizeResolvedExternally(raw: unknown): { reason: string; at: number } | undefined {
+  const input = objectRecord(raw);
+  const reason = optionalString(input.reason);
+  const at = optionalTimestamp(input.at);
+  if (!reason || at === undefined) return undefined;
+  return { reason, at };
+}
+
 function normalizeCriterion(raw: unknown, index: number): TaskCriterion {
   const input = objectRecord(raw);
   const id = optionalString(input.id) ?? `C${index + 1}`;
@@ -102,6 +110,7 @@ function normalizeTask(raw: unknown): TaskRecord | undefined {
     return undefined;
   }
   const filesHint = stringList(input.filesHint);
+  const resolvedExternally = normalizeResolvedExternally(input.resolvedExternally);
   const criteria = input.criteria.map((criterion, criterionIndex) => {
     if (typeof criterion === "string") {
       return normalizeCriterion({ id: `C${criterionIndex + 1}`, text: criterion }, criterionIndex);
@@ -126,6 +135,7 @@ function normalizeTask(raw: unknown): TaskRecord | undefined {
     when: optionalString(input.when),
     expansionMode: input.expansionMode === "append_tasks" ? "append_tasks" : undefined,
     continuation: optionalString(input.continuation),
+    ...(resolvedExternally ? { resolvedExternally } : {}),
     createdAt,
     updatedAt,
     completedAt: optionalTimestamp(input.completedAt),
@@ -273,6 +283,7 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
   const timestamp = now();
   const rawStatus = stringValue(input.status, "queued") as AssignmentStatus;
   const recentActivity = stringList(input.recentActivity).slice(-3);
+  const resolvedExternally = normalizeResolvedExternally(input.resolvedExternally);
   return {
     id,
     taskRunId,
@@ -290,6 +301,7 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
     ...(recentActivity.length > 0 ? { recentActivity } : {}),
     supersededAt: optionalTimestamp(input.supersededAt),
     supersededByAssignmentId: optionalString(input.supersededByAssignmentId),
+    ...(resolvedExternally ? { resolvedExternally } : {}),
     createdAt: numberValue(input.createdAt, timestamp),
     updatedAt: numberValue(input.updatedAt, timestamp),
     completedAt: optionalTimestamp(input.completedAt),
@@ -369,6 +381,7 @@ function normalizeTaskRun(raw: unknown, _index: number): TaskRunRecord | undefin
         .filter((entry) => taskIds.has(entry.taskId) && assignmentIds.has(entry.assignmentId) && !supersededAssignmentIds.has(entry.assignmentId))
       : [],
     maxConcurrency: optionalPositiveInteger(input.maxConcurrency),
+    ...(input.attentionNagTriggered === true ? { attentionNagTriggered: true } : {}),
     createdAt: numberValue(input.createdAt, timestamp),
     updatedAt: numberValue(input.updatedAt, timestamp),
     completedAt: optionalTimestamp(input.completedAt),

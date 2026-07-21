@@ -19,6 +19,7 @@ import {
   formatAgentsReport,
   formatCancelAcknowledgement,
   formatClearAcknowledgement,
+  formatAckAcknowledgement,
   formatContinueAcknowledgement,
   formatInspectReport,
   formatResolveAcknowledgement,
@@ -182,6 +183,7 @@ const ToolParamsSchema = Type.Object({
     Type.Literal("dispatch"),
     Type.Literal("continue"),
     Type.Literal("resolve"),
+    Type.Literal("ack"),
     Type.Literal("stop"),
     Type.Literal("cancel"),
     Type.Literal("clear"),
@@ -201,6 +203,7 @@ const ToolParamsSchema = Type.Object({
   group: Type.Optional(TaskGroupPatchSchema),
   task: Type.Optional(TaskPatchSchema),
   prompt: Type.Optional(NonEmptyString),
+  reason: Type.Optional(NonEmptyString),
   details: Type.Optional(Type.Boolean()),
   scope: Type.Optional(Type.Union([Type.Literal("completed"), Type.Literal("all")], { default: "completed" })),
   maxConcurrency: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -212,9 +215,20 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
   registerMessageRenderers(pi);
 
   pi.on("input", (event, ctx) => {
+    // A new user prompt starts a fresh segment; re-arm end-of-turn reminders.
+    void controller.rearmAttentionReminders().catch(() => undefined);
     const decision = routeInput(event.text, event.source as InputSource | undefined, controller, ctx);
     return decision.action === "handled" ? { action: "handled" as const } : { action: "continue" as const };
   });
+
+  // `agent_settled` is supported by the runtime; the pinned type declarations
+  // lag, so register it through a narrowly-typed cast.
+  (pi.on as unknown as (event: "agent_settled", handler: (event: { type: "agent_settled" }, ctx: ExtensionContext) => void | Promise<void>) => void)(
+    "agent_settled",
+    async (_event, ctx) => {
+      await controller.remindPendingAttention(ctx);
+    },
+  );
 
   const restoreLifecycle = async (ctx: ExtensionContext): Promise<void> => {
     // Fence old watchers before any filesystem I/O, but retain committed lookup
@@ -302,6 +316,7 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
       "Use status for human-requested health checks, suspected stalls, or after about 60s with no signal.",
       "Use result with an assignmentId, or with a taskRunId/groupId/taskId only when it maps to one assignment, after a terminal follow-up signal or explicit human request.",
       "Use resolve with targetId and prompt after fixing an attention/failure finding; the verification assignment decides whether the target is complete.",
+      "Use ack with targetId and reason when an attention/failure finding was already fixed and verified outside this run (by you or a later run); use resolve instead when you want independent re-verification.",
       "Use continue, stop, and cancel to manage task assignments.",
       "Use list_agents to discover available subagent profile names before choosing an agentHint.",
     ],
@@ -457,6 +472,16 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           text = resolved ? formatResolveAcknowledgement(target, params.prompt) : `Could not resolve ${target}.`;
           break;
         }
+        case "ack": {
+          const target = params.targetId ?? params.taskId ?? params.assignmentId ?? params.groupId ?? params.taskRunId;
+          if (!target || !params.reason) {
+            text = "ack requires targetId and reason.";
+            break;
+          }
+          const acked = await controller.ackTarget(target, params.reason, ctx);
+          text = acked.acked ? formatAckAcknowledgement(target, params.reason) : `Could not ack ${target}: ${acked.error ?? "not eligible"}`;
+          break;
+        }
         case "stop": {
           const assignmentId = params.assignmentId ?? params.targetId;
           if (!assignmentId) {
@@ -537,6 +562,15 @@ export default function taskedSubagentsExtension(pi: ExtensionAPI): void {
           }
           const resolved = await controller.resolveTarget(parsed.targetId, parsed.prompt, ctx);
           output = resolved ? formatResolveAcknowledgement(parsed.targetId, parsed.prompt) : `Could not resolve ${parsed.targetId}.`;
+          break;
+        }
+        case "ack": {
+          if (!parsed.targetId || !parsed.prompt) {
+            output = buildHelpText();
+            break;
+          }
+          const acked = await controller.ackTarget(parsed.targetId, parsed.prompt, ctx);
+          output = acked.acked ? formatAckAcknowledgement(parsed.targetId, parsed.prompt) : `Could not ack ${parsed.targetId}: ${acked.error ?? "not eligible"}`;
           break;
         }
         case "stop": {

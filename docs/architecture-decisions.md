@@ -141,6 +141,7 @@ Expansion is visible by construction. A triage task can append new groups or tas
 - `attach`
 - `continue`
 - `resolve`
+- `ack`
 - `stop`
 - `cancel`
 - `clear`
@@ -149,6 +150,8 @@ Expansion is visible by construction. A triage task can append new groups or tas
 Public target ids are `taskRunId`, `groupId`, `taskId`, and `assignmentId`.
 
 **Rationale.** These names match the persisted model and avoid compatibility aliases that would keep plan/phase vocabulary alive.
+
+`ack` is a zero-subagent acknowledgement that an `attention`/`failed`/`blocked`/`paused` finding was resolved externally (by the main agent or a later run). It cascades over the target's descendants: eligible tasks and assignments become `completed` with a persisted `resolvedExternally` audit trail, while never-started descendants are `cancelled`/`skipped` rather than marked done; running descendants block the ack. Use `resolve` instead when independent re-verification is wanted. While unresolved stale `attention`/`failed` runs exist, an end-of-turn reminder (`agent_settled`) prompts the main agent to `ack` or `resolve` each one, at most once per run per session segment.
 
 ## UI and messages
 
@@ -163,4 +166,5 @@ Public target ids are `taskRunId`, `groupId`, `taskId`, and `assignmentId`.
 | `pi-tasked-subagents:state` | bounded v5 pointer to an immutable external checkpoint |
 | `pi-tasked-subagents:completion` | task-run completion follow-up |
 | `pi-tasked-subagents:attention` | attention follow-up |
+| `pi-tasked-subagents:attention-reminder` | end-of-turn reminder to ack/resolve stale attention runs |
 | `pi-tasked-subagents:failure` | failure/cancellation follow-up |

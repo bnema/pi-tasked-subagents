@@ -8,6 +8,7 @@ import type { ArtifactRef, TaskAssignmentRecord, TaskRunRecord } from "../types.
 import {
   ENTRY_TYPE_ARTIFACT,
   ENTRY_TYPE_ATTENTION,
+  ENTRY_TYPE_ATTENTION_REMINDER,
   ENTRY_TYPE_COMPLETION,
   ENTRY_TYPE_FAILURE,
   ENTRY_TYPE_LAUNCH,
@@ -195,5 +196,6 @@ export function registerMessageRenderers(pi: ExtensionAPI): void {
   register(ENTRY_TYPE_COMPLETION, (message, options, theme) => renderAssignmentMessage(message, options.expanded, theme as never));
   register(ENTRY_TYPE_FAILURE, (message, options, theme) => renderAssignmentMessage(message, options.expanded, theme as never));
   register(ENTRY_TYPE_ATTENTION, (message, options, theme) => renderAssignmentMessage(message, options.expanded, theme as never));
+  register(ENTRY_TYPE_ATTENTION_REMINDER, (message) => ({ render: () => message.content.split("\n"), invalidate() {}, dispose() {} }));
   register(ENTRY_TYPE_ARTIFACT, (message, options, theme) => renderArtifactMessage(message, options.expanded, theme as never));
 }

@@ -14,6 +14,7 @@ export const ENTRY_TYPE_STATE = "pi-tasked-subagents:state";
 export const ENTRY_TYPE_LAUNCH = "pi-tasked-subagents:launch";
 export const ENTRY_TYPE_COMPLETION = "pi-tasked-subagents:completion";
 export const ENTRY_TYPE_ATTENTION = "pi-tasked-subagents:attention";
+export const ENTRY_TYPE_ATTENTION_REMINDER = "pi-tasked-subagents:attention-reminder";
 export const ENTRY_TYPE_FAILURE = "pi-tasked-subagents:failure";
 export const ENTRY_TYPE_ARTIFACT = "pi-tasked-subagents:artifact";
 

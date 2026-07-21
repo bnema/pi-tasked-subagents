@@ -20,6 +20,7 @@ export type CommandAction =
   | "stop"
   | "continue"
   | "resolve"
+  | "ack"
   | "cancel"
   | "clear"
   | "agents"
@@ -152,7 +153,8 @@ export function parseCommand(input: string, internal = false): ParsedCommand {
     case "attach":
       return tokens[1] ? { action: "attach", targetId: tokens[1] } : { action: "attach" };
     case "continue":
-    case "resolve": {
+    case "resolve":
+    case "ack": {
       const targetId = tokens[1];
       const prompt = tokens.slice(2).join(" ").trim();
       return targetId && prompt ? { action, targetId, prompt } : { action: "help" };
@@ -428,6 +430,7 @@ function formatGroupDetail(taskRun: TaskRunRecord, group: TaskGroupRecord): stri
 
 function formatTaskDetail(taskRun: TaskRunRecord, group: TaskGroupRecord | undefined, task: TaskRecord): string {
   const lines = [`Task: ${task.id}`, `  text: ${task.text}`, `  status: ${statusLabel(task.status)}`, `  taskRun: ${taskRun.id}`];
+  if (task.resolvedExternally) lines.push(`  resolved externally: ${task.resolvedExternally.reason}`);
   if (group) lines.push(`  group: ${group.id} · ${group.title}`);
   lines.push("", "Criteria:");
   for (const criterion of task.criteria) {
@@ -442,6 +445,7 @@ function formatAssignmentDetail(taskRun: TaskRunRecord, assignment: TaskAssignme
   const lines = [`Assignment: ${assignment.id}`, `  status: ${statusLabel(assignment.status)}`, assignment.supersededByAssignmentId ? `  historical: superseded by ${assignment.supersededByAssignmentId}` : undefined, `  taskRun: ${taskRun.id} · ${taskRun.title}`, assignment.groupId ? `  group: ${assignment.groupId}` : undefined, `  task: ${assignment.taskId}`, `  agent: ${assignment.agent}`]
     .filter((line): line is string => Boolean(line));
   if (assignment.result?.summary) lines.push(`  result: ${assignment.result.summary}`);
+  if (assignment.resolvedExternally) lines.push(`  resolved externally: ${assignment.resolvedExternally.reason}`);
   if (assignment.result?.followUps.length) {
     lines.push("", "Follow-ups:");
     for (const followUp of assignment.result.followUps) lines.push(`- ${followUp}`);
@@ -495,6 +499,10 @@ export function formatContinueAcknowledgement(targetId: string, prompt: string):
 
 export function formatResolveAcknowledgement(targetId: string, prompt: string): string {
   return `Resolving ${targetId}; verification assignment is running in the background: ${shortTitle(prompt)}. Do not poll; wait for the completion/attention follow-up signal.`;
+}
+
+export function formatAckAcknowledgement(targetId: string, reason: string): string {
+  return `Acknowledged ${targetId} as resolved externally: ${shortTitle(reason)}. No verification assignment was launched.`;
 }
 
 export function formatStopAcknowledgement(assignmentId: string): string {
@@ -552,6 +560,7 @@ export function buildHelpText(): string {
     "  /tasked-subagents stop <assignmentId>",
     "  /tasked-subagents continue <taskId|assignmentId|groupId> <prompt>",
     "  /tasked-subagents resolve <taskId|assignmentId|groupId|taskRunId> <fix-summary>",
+    "  /tasked-subagents ack <taskId|assignmentId|groupId|taskRunId> <reason>",
     "  /tasked-subagents cancel <assignmentId>",
     "  /tasked-subagents clear [completed|all|<taskRunId|groupId|taskId|assignmentId>]",
     "  /tasked-subagents agents [--details]",
@@ -569,6 +578,7 @@ export function buildHelpText(): string {
     "  Add wait=true to set_tasks/patch_task_run/edit_task/edit_group/dispatch when the main agent should remain locked until launched work finishes.",
     "  tasked_subagents action=continue targetId=<taskId|assignmentId|groupId> prompt=<prompt>",
     "  tasked_subagents action=resolve targetId=<taskId|assignmentId|groupId|taskRunId> prompt=<fix-summary>",
+    "  tasked_subagents action=ack targetId=<taskId|assignmentId|groupId|taskRunId> reason=<why-already-resolved>",
     "  tasked_subagents action=stop assignmentId=<assignmentId>",
     "  tasked_subagents action=cancel assignmentId=<assignmentId>",
     "  tasked_subagents action=list_agents [details=true]",
