@@ -298,6 +298,8 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
     currentTool: optionalString(input.currentTool),
     lastActionAt: optionalTimestamp(input.lastActionAt),
     lastActionSummary: optionalString(input.lastActionSummary),
+    staleWarnedAt: optionalTimestamp(input.staleWarnedAt),
+    staleEscalatedAt: optionalTimestamp(input.staleEscalatedAt),
     ...(recentActivity.length > 0 ? { recentActivity } : {}),
     supersededAt: optionalTimestamp(input.supersededAt),
     supersededByAssignmentId: optionalString(input.supersededByAssignmentId),

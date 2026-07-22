@@ -269,6 +269,10 @@ export interface TaskAssignmentRecord {
   lastActionAt?: number;
   lastActionSummary?: string;
   recentActivity?: string[];
+  /** Set when a heartbeat warning was emitted for the current stale episode. */
+  staleWarnedAt?: number;
+  /** Set when the current stale episode was escalated to attention. */
+  staleEscalatedAt?: number;
   supersededAt?: number;
   supersededByAssignmentId?: string;
   resolvedExternally?: ResolvedExternally;

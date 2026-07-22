@@ -13,8 +13,11 @@ import {
   ENTRY_TYPE_ATTENTION_REMINDER,
   ENTRY_TYPE_COMPLETION,
   ENTRY_TYPE_FAILURE,
+  ENTRY_TYPE_STALE_ASSIGNMENT,
   ENTRY_TYPE_STATE,
   PACKAGE_NAME,
+  STALE_ASSIGNMENT_ATTENTION_MS,
+  STALE_ASSIGNMENT_WARNING_MS,
 } from "../defaults.js";
 import type {
   AckResult,
@@ -61,7 +64,7 @@ import { normalizeTaskRunInput, validateTaskRunInput } from "../state/task-run-v
 import { statusLabel } from "../ui/messages.js";
 import { buildFooterStatus } from "../ui/status.js";
 import { buildWidgetLines, createWidgetContent } from "../ui/widget.js";
-import { shortTitle } from "../utils/text.js";
+import { formatCompactDuration, shortTitle } from "../utils/text.js";
 import {
   applyAssignmentProgress,
   createReadyAssignments,
@@ -109,6 +112,10 @@ export interface TaskedSubagentsControllerOptions {
   dataRoot?: string;
   /** Test seam; production uses the same store for archives and checkpoints. */
   objectStore?: DurableObjectStore;
+  /** Idle span before a running assignment emits a heartbeat warning. */
+  staleWarningMs?: number;
+  /** Idle span before a running assignment escalates to attention. */
+  staleAttentionMs?: number;
 }
 
 export class PersistenceError extends Error {
@@ -159,6 +166,28 @@ function controlStatusForAssignment(
   if (targetStatus === "paused") return currentStatus === "queued" || currentStatus === "running" ? "paused" : undefined;
   if (targetStatus === "cancelled") return finalAssignmentStatus(currentStatus) ? undefined : "cancelled";
   return undefined;
+}
+
+interface StaleAssignmentEntry {
+  assignmentId: string;
+  agent: string;
+  idleMs: number;
+  lastActionSummary?: string;
+}
+
+interface StaleAssignmentSignal {
+  taskRunId: string;
+  kind: "stale-assignment" | "stale-escalation";
+  entries: StaleAssignmentEntry[];
+}
+
+function staleEntry(assignment: TaskAssignmentRecord, idleMs: number): StaleAssignmentEntry {
+  return {
+    assignmentId: assignment.id,
+    agent: assignment.agent,
+    idleMs,
+    ...(assignment.lastActionSummary ? { lastActionSummary: assignment.lastActionSummary } : {}),
+  };
 }
 
 function progressSignature(snapshot: RunProgressSnapshot): string {
@@ -255,6 +284,8 @@ export class TaskedSubagentsController {
   private readonly persistence: ControllerPersistence;
   private readonly objectStore: DurableObjectStore;
   private readonly dataRoot: string;
+  private readonly staleWarningMs: number;
+  private readonly staleAttentionMs: number;
   /** Immutable terminal archives visible to the next checkpoint. */
   private archiveRefs: ArchiveRef[] = [];
   private taskRunCounter = 0;
@@ -280,6 +311,8 @@ export class TaskedSubagentsController {
     this.defaultAgent = options?.defaultAgent ?? DEFAULT_OPTIONS.defaultAgent;
     this.dataRoot = resolveStorageRoot({ dataRoot: options?.dataRoot });
     this.objectStore = options?.objectStore ?? new DurableObjectStore(this.dataRoot);
+    this.staleWarningMs = options?.staleWarningMs ?? STALE_ASSIGNMENT_WARNING_MS;
+    this.staleAttentionMs = options?.staleAttentionMs ?? STALE_ASSIGNMENT_ATTENTION_MS;
     this.persistence = options?.persistence ?? new PersistenceCoordinator(
       this.objectStore,
       { append: (pointer) => this.pi.appendEntry(ENTRY_TYPE_STATE, pointer) },
@@ -1561,20 +1594,115 @@ export class TaskedSubagentsController {
   private async applyRunProgressUpdate(taskRunId: string, snapshot: RunProgressSnapshot, expectedEpoch: number | undefined, ctx?: ExtensionContext): Promise<void> {
     const signature = progressSignature(snapshot);
     const key = `${taskRunId}:${snapshot.runId}`;
-    if (this.runProgressSignatures.get(key) === signature) return;
-    await this.lock.withLock(() => {
-      if (expectedEpoch !== undefined && this.stateEpoch !== expectedEpoch) return;
+    const staleSignals = await this.lock.withLock(async () => {
+      if (expectedEpoch !== undefined && this.stateEpoch !== expectedEpoch) return [];
       const taskRun = this.state.taskRuns.find((candidate) => candidate.id === taskRunId);
-      if (!taskRun) return;
-      if (!applyAssignmentProgress(taskRun, snapshot)) return;
-      for (const step of snapshot.steps) {
-        if (step.status === "completed" && step.id) this.terminalProgressAssignmentIds.add(step.id);
-      }
-      this.runProgressSignatures.set(key, signature);
+      if (!taskRun) return [];
+      // Staleness runs on every poll tick, before the progress dedup, so a
+      // worker that has gone silent (identical snapshots) is still caught.
+      const signals = await this.evaluateStaleAssignments(taskRun, snapshot, ctx);
       // Progress is display-only. Terminal assignment state comes only from
-      // controls or the authoritative terminal runner result.
-      this.updateUI(ctx ?? this.lastContext);
+      // controls or the authoritative terminal runner result. The dedup still
+      // skips redundant repaint work for an unchanged snapshot.
+      if (this.runProgressSignatures.get(key) !== signature && applyAssignmentProgress(taskRun, snapshot)) {
+        for (const step of snapshot.steps) {
+          if (step.status === "completed" && step.id) this.terminalProgressAssignmentIds.add(step.id);
+        }
+        this.runProgressSignatures.set(key, signature);
+        this.updateUI(ctx ?? this.lastContext);
+      }
+      return signals;
     });
+    for (const signal of staleSignals) this.emitStaleSignal(signal);
+  }
+
+  /**
+   * Detect running assignments whose last recorded action has aged past the
+   * warning/attention thresholds and, symmetrically, recover ones that resumed.
+   * Runs under the caller's state lock; returns the signals to emit afterwards.
+   */
+  private async evaluateStaleAssignments(
+    taskRun: TaskRunRecord,
+    snapshot: RunProgressSnapshot,
+    ctx: ExtensionContext | undefined,
+  ): Promise<StaleAssignmentSignal[]> {
+    const now = Date.now();
+    const warnEntries: StaleAssignmentEntry[] = [];
+    const escalateEntries: StaleAssignmentEntry[] = [];
+    let changed = false;
+    for (const assignment of taskRun.assignments) {
+      if (isSupersededAssignment(assignment)) continue;
+      if (assignment.runId !== snapshot.runId) continue;
+      // Monitor running assignments, plus ones this heartbeat escalated to
+      // attention so they can still be recovered once the worker resumes.
+      const monitored = assignment.status === "running"
+        || (assignment.status === "attention" && assignment.staleEscalatedAt !== undefined);
+      if (!monitored) continue;
+      // A tool is genuinely executing; long-running commands must never be flagged.
+      if (assignment.currentTool) continue;
+      const idleMs = now - (assignment.lastActionAt ?? assignment.updatedAt);
+
+      if (idleMs < this.staleWarningMs) {
+        if (assignment.staleWarnedAt === undefined && assignment.staleEscalatedAt === undefined) continue;
+        const wasEscalated = assignment.staleEscalatedAt !== undefined;
+        assignment.staleWarnedAt = undefined;
+        assignment.staleEscalatedAt = undefined;
+        // Un-escalate only the status this heartbeat itself raised to attention.
+        if (wasEscalated && assignment.status === "attention") assignment.status = "running";
+        assignment.updatedAt = now;
+        changed = true;
+        continue;
+      }
+
+      if (assignment.staleWarnedAt === undefined) {
+        assignment.staleWarnedAt = now;
+        assignment.updatedAt = now;
+        changed = true;
+        warnEntries.push(staleEntry(assignment, idleMs));
+      }
+      if (idleMs >= this.staleAttentionMs && assignment.staleEscalatedAt === undefined) {
+        assignment.staleEscalatedAt = now;
+        assignment.status = "attention";
+        assignment.updatedAt = now;
+        changed = true;
+        escalateEntries.push(staleEntry(assignment, idleMs));
+      }
+    }
+
+    if (!changed) return [];
+    deriveTaskRunStatus(taskRun, now);
+    await this.checkpointState(this.checkpointContext(ctx));
+    this.updateUI(ctx ?? this.lastContext);
+    const signals: StaleAssignmentSignal[] = [];
+    if (warnEntries.length > 0) signals.push({ taskRunId: taskRun.id, kind: "stale-assignment", entries: warnEntries });
+    if (escalateEntries.length > 0) signals.push({ taskRunId: taskRun.id, kind: "stale-escalation", entries: escalateEntries });
+    return signals;
+  }
+
+  private emitStaleSignal(signal: StaleAssignmentSignal): void {
+    const header = signal.kind === "stale-escalation"
+      ? "[tasked-subagents] stale assignment escalated to attention"
+      : "[tasked-subagents] stale assignment detected";
+    const lines = [header];
+    for (const entry of signal.entries) {
+      lines.push(
+        `assignment: ${entry.assignmentId} (${entry.agent})`,
+        `idle: ${formatCompactDuration(entry.idleMs)}`,
+        `last event: ${entry.lastActionSummary?.trim() || "none"}`,
+        "active tool: none",
+        `action required: continue waiting, resolve targetId=${entry.assignmentId} prompt=<fix>, or ack/cancel targetId=${entry.assignmentId}`,
+      );
+    }
+    try {
+      this.pi.sendMessage({
+        customType: ENTRY_TYPE_STALE_ASSIGNMENT,
+        content: lines.join("\n"),
+        display: false,
+        details: { taskRunId: signal.taskRunId, assignmentIds: signal.entries.map((entry) => entry.assignmentId), kind: signal.kind },
+      }, { triggerTurn: true, deliverAs: "followUp" });
+    } catch {
+      // best effort heartbeat; state remains source of truth
+    }
   }
 
   private async archiveTerminalAssignments(

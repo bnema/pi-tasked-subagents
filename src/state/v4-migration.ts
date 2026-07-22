@@ -578,7 +578,8 @@ function losslessV4Graph(raw: unknown, normalized: TaskedSubagentsState): boolea
         !nonEmptyString(assignment.agent) || !nonEmptyString(assignment.prompt) ||
         !ASSIGNMENT_STATUSES.has(String(assignment.status)) || !hasOptionalString(assignment, "runId") ||
         !hasOptionalString(assignment, "currentTool") || !hasOptionalString(assignment, "lastActionSummary") ||
-        !hasOptionalTimestamp(assignment, "lastActionAt") || !hasOptionalTimestamp(assignment, "supersededAt") ||
+        !hasOptionalTimestamp(assignment, "lastActionAt") || !hasOptionalTimestamp(assignment, "staleWarnedAt") ||
+        !hasOptionalTimestamp(assignment, "staleEscalatedAt") || !hasOptionalTimestamp(assignment, "supersededAt") ||
         !hasOptionalString(assignment, "supersededByAssignmentId") || !finiteNumber(assignment.createdAt) || !finiteNumber(assignment.updatedAt) ||
         !hasOptionalTimestamp(assignment, "completedAt") || (assignment.recentActivity !== undefined && !strictStringList(assignment.recentActivity)) ||
         !strictResult(assignment.result, assignment.id as string) || (assignment.launchRef !== undefined && !strictLaunchRef(assignment.launchRef, assignment.id as string))) return false;
