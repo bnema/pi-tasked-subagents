@@ -7,7 +7,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DEFAULT_WIDGET_LINES } from "../defaults.js";
 import type { TaskAssignmentRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
 import { assignmentsForTask, authoritativeAssignment, isSupersededAssignment } from "../orchestration/assignment-attempts.js";
-import { shortTitle } from "../utils/text.js";
+import { formatCompactDuration, shortTitle } from "../utils/text.js";
 import {
   GLYPH_ATTENTION,
   GLYPH_DONE,
@@ -43,6 +43,8 @@ const TASK_TITLE_WIDTH = 46;
 const ACTIVITY_TEXT_WIDTH = 50;
 const ASSIGNMENT_ID_WIDTH = 24;
 const MAX_ACTIVITY_LINES = 3;
+/** Only annotate a completed action with its age once it reads as idle, not in-progress. */
+const IDLE_AGE_THRESHOLD_MS = 60_000;
 const RUNNING_DOT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const RUNNING_DOT_INTERVAL_MS = 120;
 
@@ -259,7 +261,7 @@ function activityKey(text: string): string {
   return text.trim().replace(/^last:\s*/iu, "");
 }
 
-function assignmentActivityItems(assignment: TaskAssignmentRecord): string[] {
+function assignmentActivityItems(assignment: TaskAssignmentRecord, now: number): string[] {
   const seen = new Set<string>();
   const items: string[] = [];
   const add = (text: string | undefined, key = text): void => {
@@ -270,8 +272,19 @@ function assignmentActivityItems(assignment: TaskAssignmentRecord): string[] {
     items.push(compactActivityText(value));
   };
 
+  // A completed action with no active tool is idle, not running: show its age so
+  // "last: tool end: bash" no longer reads as though bash were still executing.
+  const idleAge = !assignment.currentTool && assignment.lastActionAt !== undefined && now - assignment.lastActionAt >= IDLE_AGE_THRESHOLD_MS
+    ? ` (${formatCompactDuration(now - assignment.lastActionAt)} ago)`
+    : "";
+
   add(assignment.currentTool ? `tool: ${assignment.currentTool}` : undefined);
-  add(assignment.lastActionSummary ? `last: ${assignment.lastActionSummary}` : undefined, assignment.lastActionSummary);
+  if (assignment.lastActionSummary) {
+    // Reserve room for the idle-age suffix so summary truncation never eats it.
+    const base = `last: ${assignment.lastActionSummary}`;
+    const line = idleAge ? `${shortTitle(base, ACTIVITY_TEXT_WIDTH - idleAge.length)}${idleAge}` : base;
+    add(line, assignment.lastActionSummary);
+  }
 
   const remainingSlots = MAX_ACTIVITY_LINES - items.length;
   const recentActivity: string[] = [];
@@ -303,7 +316,7 @@ function taskActivityLines(
   const activityChildPrefix = `${childPrefix(parentLast, theme)}${childPrefix(taskLast, theme)}`;
   const currentTime = options.now ?? Date.now();
   const elapsed = formatElapsed(assignment.createdAt, currentTime);
-  const activityItems = assignmentActivityItems(assignment);
+  const activityItems = assignmentActivityItems(assignment, currentTime);
   const assignmentLine = `${assignmentPrefix}${joinParts([
     colorStatus(assignment.status, theme),
     muted(task.id, theme),

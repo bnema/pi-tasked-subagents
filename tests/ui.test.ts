@@ -137,6 +137,44 @@ describe("ui", () => {
     expect(rendered.split("reading src/orchestration/controller.ts")).toHaveLength(2);
   });
 
+  test("widget annotates an idle completed action with its age once no tool is active", () => {
+    const idle = cloneState(state);
+    const assignment = idle.taskRuns[0].assignments[0];
+    delete assignment.currentTool;
+    delete assignment.recentActivity;
+    assignment.lastActionAt = 1_000;
+    assignment.lastActionSummary = "tool end: bash";
+
+    const rendered = buildWidgetLines(idle, 10, undefined, { now: 1_000 + 3 * 60_000 }).join("\n");
+
+    expect(rendered).toContain("last: tool end: bash (3m ago)");
+  });
+
+  test("widget keeps the idle-age suffix visible even when the summary is long", () => {
+    const idle = cloneState(state);
+    const assignment = idle.taskRuns[0].assignments[0];
+    delete assignment.currentTool;
+    delete assignment.recentActivity;
+    assignment.lastActionAt = 1_000;
+    assignment.lastActionSummary = "reading a very long file path under src/orchestration that overflows the compact width";
+
+    const rendered = buildWidgetLines(idle, 10, undefined, { now: 1_000 + 3 * 60_000 }).join("\n");
+
+    expect(rendered).toContain("(3m ago)");
+    // The summary is elided, but the age annotation must remain fully intact.
+    expect(rendered).toMatch(/…\s*\(3m ago\)/);
+  });
+
+  test("widget omits the idle age while a tool is still active", () => {
+    const active = cloneState(state);
+    active.taskRuns[0].assignments[0].lastActionAt = 1_000;
+
+    const rendered = buildWidgetLines(active, 10, undefined, { now: 1_000 + 3 * 60_000 }).join("\n");
+
+    expect(rendered).toContain("tool: bash");
+    expect(rendered).not.toContain("ago)");
+  });
+
   test("widget renders one-off ungrouped task runs", () => {
     const oneOff = cloneState(state);
     oneOff.taskRuns[0].groups = [];

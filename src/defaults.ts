@@ -17,6 +17,13 @@ export const ENTRY_TYPE_ATTENTION = "pi-tasked-subagents:attention";
 export const ENTRY_TYPE_ATTENTION_REMINDER = "pi-tasked-subagents:attention-reminder";
 export const ENTRY_TYPE_FAILURE = "pi-tasked-subagents:failure";
 export const ENTRY_TYPE_ARTIFACT = "pi-tasked-subagents:artifact";
+export const ENTRY_TYPE_STALE_ASSIGNMENT = "pi-tasked-subagents:stale-assignment";
+
+// Stale-assignment heartbeat thresholds. A running assignment with no active
+// tool whose last recorded action is older than these emits a warning, then an
+// attention escalation, so a silent worker never blocks a task run forever.
+export const STALE_ASSIGNMENT_WARNING_MS = 5 * 60_000;
+export const STALE_ASSIGNMENT_ATTENTION_MS = 15 * 60_000;
 
 // State version for the task-run state model.
 export const STATE_VERSION = 4;

@@ -686,6 +686,75 @@ class MultiWaitControlledRuntime extends CompletingRuntime {
   }
 }
 
+class ManualProgressRuntime extends CompletingRuntime {
+  onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void>;
+  private waitStartedResolve!: () => void;
+  private resolveWait?: (status: RunStatus) => void;
+  readonly waitStarted = new Promise<void>((resolve) => {
+    this.waitStartedResolve = resolve;
+  });
+
+  override async waitForRunSignal(
+    handle: SubagentRunHandle | undefined,
+    options?: { onUpdate?: (snapshot: RunProgressSnapshot) => void | Promise<void> },
+  ): Promise<RunStatus> {
+    this.waitHandles.push(handle);
+    this.onUpdate = options?.onUpdate;
+    this.waitStartedResolve();
+    return new Promise<RunStatus>((resolve) => {
+      this.resolveWait = resolve;
+    });
+  }
+
+  async tick(snapshot: RunProgressSnapshot): Promise<void> {
+    await this.onUpdate?.(snapshot);
+  }
+
+  finish(status: RunStatus = "attention"): void {
+    this.resolveWait?.(status);
+  }
+}
+
+function staleRunningState(base: number, overrides: { currentTool?: string } = {}): TaskedSubagentsState {
+  const run: TaskRunRecord = {
+    id: "task-run-1",
+    title: "Task run",
+    request: "Ship it",
+    context: "Context",
+    status: "running",
+    groups: [{ id: "main", title: "Main", status: "running", dependsOn: [], maxConcurrency: 4, createdAt: 1, updatedAt: 1 }],
+    tasks: [
+      { id: "work", groupId: "main", text: "Work task", status: "running", criteria: [{ id: "C1", text: "Done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: ["a1"], createdAt: 1, updatedAt: 1 },
+    ],
+    assignments: [
+      {
+        id: "a1",
+        taskRunId: "task-run-1",
+        groupId: "main",
+        taskId: "work",
+        agent: "delegate",
+        prompt: "work",
+        status: "running",
+        runId: "run-1",
+        launchRef: launchRef(),
+        ...(overrides.currentTool ? { currentTool: overrides.currentTool } : {}),
+        lastActionAt: base,
+        lastActionSummary: "tool end: bash",
+        createdAt: base,
+        updatedAt: base,
+      },
+    ],
+    artifacts: [],
+    createdAt: 1,
+    updatedAt: base,
+  };
+  return { version: 4, taskRuns: [run], currentTaskRunId: "task-run-1", updatedAt: base };
+}
+
+function assignmentById(controller: TaskRunControllerApi, id: string): TaskAssignmentRecord | undefined {
+  return controller.getState().taskRuns[0].assignments.find((assignment) => assignment.id === id);
+}
+
 function liveRunIds(controller: TaskRunControllerApi): Map<string, number> {
   return (controller as unknown as { liveRunIds: Map<string, number> }).liveRunIds;
 }
@@ -1739,6 +1808,170 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     await expect(controller.ackTarget("attention", "handled inline")).resolves.toMatchObject({ acked: true });
     await controller.remindPendingAttention();
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("warns once for a stale assignment, then escalates and recovers across poll ticks", async () => {
+    const base = 1_800_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(base);
+    try {
+      const dataRoot = await createControllerDataRoot("tasked-stale-");
+      const pi = fakePi();
+      const runtime = new ManualProgressRuntime();
+      const controller = asTaskRunApi(new TaskedSubagentsController(pi, { launcher: runtime, dataRoot, staleWarningMs: 1_000, staleAttentionMs: 3_000 }));
+      const sendMessage = pi.sendMessage as unknown as ReturnType<typeof vi.fn>;
+      controller.restoreState(staleRunningState(base));
+      controller.reconcileRestoredRuns();
+      await runtime.waitStarted;
+
+      const snapshot: RunProgressSnapshot = { runId: "run-1", status: "running", steps: [{ id: "a1", status: "running", agent: "delegate", lastActionAt: base }] };
+
+      nowSpy.mockReturnValue(base + 500);
+      await runtime.tick(snapshot);
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      nowSpy.mockReturnValue(base + 1_500);
+      await runtime.tick(snapshot);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const [warning, warningOptions] = sendMessage.mock.calls[0];
+      expect(warning.customType).toBe("pi-tasked-subagents:stale-assignment");
+      expect(warning.display).toBe(false);
+      expect(warning.content).toContain("[tasked-subagents] stale assignment detected");
+      expect(warning.content).toContain("assignment: a1 (delegate)");
+      expect(warning.content).toContain("last event: tool end: bash");
+      expect(warning.content).toContain("active tool: none");
+      expect(warning.details).toMatchObject({ taskRunId: "task-run-1", assignmentIds: ["a1"], kind: "stale-assignment" });
+      expect(warningOptions).toMatchObject({ triggerTurn: true, deliverAs: "followUp" });
+
+      // Repeated identical ticks below the attention threshold stay silent.
+      nowSpy.mockReturnValue(base + 2_000);
+      await runtime.tick(snapshot);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+
+      // Crossing the attention threshold escalates exactly once.
+      nowSpy.mockReturnValue(base + 3_500);
+      await runtime.tick(snapshot);
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      const [escalation] = sendMessage.mock.calls[1];
+      expect(escalation.customType).toBe("pi-tasked-subagents:stale-assignment");
+      expect(escalation.content).toContain("[tasked-subagents] stale assignment escalated to attention");
+      expect(escalation.details).toMatchObject({ kind: "stale-escalation", assignmentIds: ["a1"] });
+      expect(assignmentById(controller, "a1")?.status).toBe("attention");
+      expect(assignmentById(controller, "a1")?.staleEscalatedAt).toBe(base + 3_500);
+      expect(controller.getState().taskRuns[0].status).toBe("attention");
+
+      nowSpy.mockReturnValue(base + 4_500);
+      await runtime.tick(snapshot);
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+
+      // Fresh activity clears the markers and restores the running status. The
+      // first fresh tick updates the stored action time; the next recovers.
+      const fresh: RunProgressSnapshot = { runId: "run-1", status: "running", steps: [{ id: "a1", status: "running", agent: "delegate", lastActionAt: base + 5_000 }] };
+      nowSpy.mockReturnValue(base + 5_000);
+      await runtime.tick(fresh);
+      nowSpy.mockReturnValue(base + 5_001);
+      await runtime.tick(fresh);
+
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      const recovered = assignmentById(controller, "a1");
+      expect(recovered?.status).toBe("running");
+      expect(recovered?.staleWarnedAt).toBeUndefined();
+      expect(recovered?.staleEscalatedAt).toBeUndefined();
+      expect(controller.getState().taskRuns[0].status).toBe("running");
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  test("never flags a stale assignment while a tool is active", async () => {
+    const base = 1_800_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(base);
+    try {
+      const dataRoot = await createControllerDataRoot("tasked-stale-tool-");
+      const pi = fakePi();
+      const runtime = new ManualProgressRuntime();
+      const controller = asTaskRunApi(new TaskedSubagentsController(pi, { launcher: runtime, dataRoot, staleWarningMs: 1_000, staleAttentionMs: 3_000 }));
+      const sendMessage = pi.sendMessage as unknown as ReturnType<typeof vi.fn>;
+      controller.restoreState(staleRunningState(base, { currentTool: "bash" }));
+      controller.reconcileRestoredRuns();
+      await runtime.waitStarted;
+
+      nowSpy.mockReturnValue(base + 60_000);
+      await runtime.tick({ runId: "run-1", status: "running", steps: [{ id: "a1", status: "running", agent: "delegate", currentTool: "bash", lastActionAt: base }] });
+
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(assignmentById(controller, "a1")?.status).toBe("running");
+      expect(assignmentById(controller, "a1")?.staleWarnedAt).toBeUndefined();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  test("emits the stale warning and keeps its guard even when the checkpoint fails", async () => {
+    const base = 1_800_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(base);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const dataRoot = await createControllerDataRoot("tasked-stale-fail-");
+      const pi = fakePi();
+      const runtime = new ManualProgressRuntime();
+      const persistence = new ToggleFailingPersistence();
+      const controller = asTaskRunApi(new TaskedSubagentsController(pi, { launcher: runtime, persistence, dataRoot, staleWarningMs: 1_000, staleAttentionMs: 3_000 }));
+      const sendMessage = pi.sendMessage as unknown as ReturnType<typeof vi.fn>;
+      controller.restoreState(staleRunningState(base));
+      controller.reconcileRestoredRuns();
+      await runtime.waitStarted;
+
+      persistence.fail = true;
+      nowSpy.mockReturnValue(base + 1_500);
+      await runtime.tick({ runId: "run-1", status: "running", steps: [{ id: "a1", status: "running", agent: "delegate", lastActionAt: base }] });
+
+      // A failed checkpoint must neither reject the tick nor drop the warning,
+      // and the in-memory guard must remain set so it will not repeat.
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0][0].details).toMatchObject({ kind: "stale-assignment", assignmentIds: ["a1"] });
+      expect(errorSpy).toHaveBeenCalled();
+      expect(assignmentById(controller, "a1")?.staleWarnedAt).toBe(base + 1_500);
+
+      // A later identical tick (checkpoint now succeeding) stays silent.
+      persistence.fail = false;
+      nowSpy.mockReturnValue(base + 2_000);
+      await runtime.tick({ runId: "run-1", status: "running", steps: [{ id: "a1", status: "running", agent: "delegate", lastActionAt: base }] });
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+      nowSpy.mockRestore();
+    }
+  });
+
+  test("stale heartbeat markers survive a persistence round-trip", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-stale-persist-");
+    const pointers: unknown[] = [];
+    const pi = {
+      appendEntry: (_type: string, data: unknown) => { pointers.push(data); },
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    } as unknown as ExtensionAPI;
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { dataRoot }));
+    const state = recoverableState();
+    state.taskRuns[0].assignments[0].staleWarnedAt = 1_800_000_000_111;
+    state.taskRuns[0].assignments[0].staleEscalatedAt = 1_800_000_000_222;
+    controller.restoreState(state);
+
+    // Any checkpoint durably projects the current graph; arming the nag is a
+    // convenient one that does not disturb the assignment markers.
+    await controller.remindPendingAttention();
+
+    const latestPointer = pointers.at(-1);
+    const restored = await restoreBranchState(
+      [{ type: "custom", customType: "pi-tasked-subagents:state", data: latestPointer }],
+      new DurableObjectStore(dataRoot),
+      { sessionId: "pi-tasked-subagents", allEntries: [], appendMigratedPointer: () => undefined },
+    );
+    expect(restored.restored).toBe(true);
+    if (!restored.restored) throw new Error("expected the checkpoint to restore");
+    const restoredAssignment = restored.state.taskRuns[0].assignments.find((assignment) => assignment.id === "a1");
+    expect(restoredAssignment?.staleWarnedAt).toBe(1_800_000_000_111);
+    expect(restoredAssignment?.staleEscalatedAt).toBe(1_800_000_000_222);
   });
 
   test("stopRun uses the assignment launch handle without plan ids", async () => {
