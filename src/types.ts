@@ -58,6 +58,12 @@ export type TaskReportStatus = "completed" | "attention" | "failed";
 export type OutputMode = "text" | "json";
 export type TaskExpansionMode = "append_tasks";
 
+/** Audit trail for a task or assignment closed by `ack` rather than by a subagent. */
+export interface ResolvedExternally {
+  reason: string;
+  at: number;
+}
+
 // ──────────────────────────────────────────────
 // Task-run input
 // ──────────────────────────────────────────────
@@ -161,6 +167,12 @@ export interface AttachResult {
   report: string;
 }
 
+export interface AckResult {
+  acked: boolean;
+  taskRunId?: string;
+  error?: string;
+}
+
 import type { RestoredCompletedHistoryV1 } from "./state/durable-types.js";
 
 // ──────────────────────────────────────────────
@@ -199,6 +211,7 @@ export interface TaskRecord {
   when?: string;
   expansionMode?: TaskExpansionMode;
   continuation?: string;
+  resolvedExternally?: ResolvedExternally;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
@@ -258,6 +271,7 @@ export interface TaskAssignmentRecord {
   recentActivity?: string[];
   supersededAt?: number;
   supersededByAssignmentId?: string;
+  resolvedExternally?: ResolvedExternally;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
@@ -274,6 +288,8 @@ export interface TaskRunRecord {
   assignments: TaskAssignmentRecord[];
   artifacts: ArtifactRef[];
   maxConcurrency?: number;
+  /** Set once an end-of-turn attention reminder has been auto-triggered for this run. */
+  attentionNagTriggered?: boolean;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;

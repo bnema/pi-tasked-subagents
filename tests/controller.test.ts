@@ -7,6 +7,7 @@ import type { CheckpointContext, CheckpointResult } from "../src/state/persisten
 
 import { TaskedSubagentsController } from "../src/orchestration/controller.js";
 import { formatInspectReport, formatStatusReport } from "../src/orchestration/commands.js";
+import { buildWidgetLines } from "../src/ui/widget.js";
 import { DurableObjectStore } from "../src/state/object-store.js";
 import { sha256Hex } from "../src/state/canonical-json.js";
 import { projectAssignmentArchive, type ArchiveRef } from "../src/state/durable-projection.js";
@@ -40,6 +41,9 @@ interface TaskRunControllerApi {
   attachTarget(targetId?: string, ctx?: unknown): Promise<AttachResult>;
   continueTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
   resolveTarget(targetId: string, prompt: string, ctx?: unknown): Promise<boolean>;
+  ackTarget(targetId: string, reason: string, ctx?: unknown): Promise<{ acked: boolean; taskRunId?: string; error?: string }>;
+  remindPendingAttention(ctx?: unknown): Promise<void>;
+  rearmAttentionReminders(): Promise<void>;
   stopRun(assignmentId: string): Promise<boolean>;
   cancelRun(assignmentId: string): Promise<boolean>;
   cancelActiveRuns(): Promise<number>;
@@ -1592,6 +1596,149 @@ describe("TaskedSubagentsController TaskRun public API", () => {
       .every((assignment) => Boolean(assignment.supersededByAssignmentId))).toBe(true);
     expect(taskRun.assignments.filter((assignment) => !assignment.supersededAt).map((assignment) => assignment.status))
       .toEqual(["completed", "completed"]);
+  });
+
+  test("ackTarget on a run resolves attention/failed descendants externally and leaves the widget", async () => {
+    const { controller } = controllerWith();
+    controller.restoreState(recoverableState());
+
+    await expect(controller.ackTarget("task-run-1", "fixed and verified by run-14")).resolves.toMatchObject({ acked: true, taskRunId: "task-run-1" });
+
+    const run = controller.getState().taskRuns[0];
+    expect(run.status).toBe("completed");
+    expect(run.tasks.map((task) => task.status)).toEqual(["completed", "completed", "completed"]);
+    expect(run.tasks.find((task) => task.id === "attention")?.resolvedExternally).toMatchObject({ reason: "fixed and verified by run-14" });
+    expect(run.tasks.find((task) => task.id === "failed")?.resolvedExternally).toMatchObject({ reason: "fixed and verified by run-14" });
+    expect(run.assignments.find((assignment) => assignment.id === "a1")?.status).toBe("completed");
+    expect(run.assignments.find((assignment) => assignment.id === "a1")?.resolvedExternally?.reason).toBe("fixed and verified by run-14");
+    expect(buildWidgetLines(controller.getState(), 14)).toHaveLength(0);
+    await expect(controller.clear("completed")).resolves.toBe(1);
+  });
+
+  test("ackTarget on a single task re-derives its group and run status", async () => {
+    const { controller } = controllerWith();
+    controller.restoreState(recoverableState());
+
+    await expect(controller.ackTarget("attention", "fixed by hand")).resolves.toMatchObject({ acked: true });
+
+    const run = controller.getState().taskRuns[0];
+    expect(run.tasks.find((task) => task.id === "attention")?.status).toBe("completed");
+    expect(run.tasks.find((task) => task.id === "attention")?.resolvedExternally?.reason).toBe("fixed by hand");
+    expect(run.tasks.find((task) => task.id === "failed")?.status).toBe("failed");
+    expect(run.groups[0].status).toBe("failed");
+    expect(run.status).toBe("failed");
+  });
+
+  test("ackTarget cancels never-started tasks and skips queued assignments without claiming work", async () => {
+    const { controller } = controllerWith();
+    const state = recoverableState();
+    const run = state.taskRuns[0];
+    run.tasks.push({ id: "later", groupId: "main", text: "Never started", status: "pending", criteria: [{ id: "C1", text: "Later done", satisfied: false, evidence: [] }], dependsOn: ["attention"], assignmentIds: [], createdAt: 1, updatedAt: 1 });
+    run.tasks.push({ id: "queuedTask", groupId: "main", text: "Queued task", status: "running", criteria: [{ id: "C1", text: "Queued done", satisfied: false, evidence: [] }], dependsOn: [], assignmentIds: ["aq"], createdAt: 1, updatedAt: 1 });
+    run.assignments.push({ id: "aq", taskRunId: "task-run-1", groupId: "main", taskId: "queuedTask", agent: "delegate", prompt: "queued", status: "queued", runId: "run-1", launchRef: launchRef(), createdAt: 1, updatedAt: 1 });
+    controller.restoreState(state);
+
+    await expect(controller.ackTarget("task-run-1", "resolved externally")).resolves.toMatchObject({ acked: true });
+
+    const acked = controller.getState().taskRuns[0];
+    expect(acked.tasks.find((task) => task.id === "later")?.status).toBe("cancelled");
+    expect(acked.tasks.find((task) => task.id === "later")?.resolvedExternally).toBeUndefined();
+    expect(acked.tasks.find((task) => task.id === "queuedTask")?.status).toBe("blocked");
+    expect(acked.assignments.find((assignment) => assignment.id === "aq")?.status).toBe("skipped");
+    expect(acked.assignments.find((assignment) => assignment.id === "aq")?.resolvedExternally).toBeUndefined();
+    expect(acked.tasks.find((task) => task.id === "attention")?.status).toBe("completed");
+  });
+
+  test("ackTarget rejects empty reason, unknown targets, running descendants, and already-resolved targets", async () => {
+    const { controller } = controllerWith();
+    controller.restoreState(recoverableState("running"));
+
+    await expect(controller.ackTarget("task-run-1", "   ")).resolves.toMatchObject({ acked: false });
+    await expect(controller.ackTarget("does-not-exist", "reason")).resolves.toMatchObject({ acked: false });
+    const running = await controller.ackTarget("attention", "reason");
+    expect(running.acked).toBe(false);
+    expect(running.error).toContain("running");
+
+    controller.restoreState(recoverableState());
+    const alreadyResolved = await controller.ackTarget("done", "reason");
+    expect(alreadyResolved.acked).toBe(false);
+    expect(alreadyResolved.error).toContain("nothing");
+  });
+
+  test("ack annotations and nag flags survive a persistence round-trip", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-ack-persist-");
+    const pointers: unknown[] = [];
+    const pi = {
+      appendEntry: (_type: string, data: unknown) => { pointers.push(data); },
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    } as unknown as ExtensionAPI;
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { dataRoot }));
+    controller.restoreState(recoverableState());
+
+    await expect(controller.ackTarget("attention", "fixed by a later run")).resolves.toMatchObject({ acked: true });
+    // The settle right after an ack skips that run; the next settle arms the nag.
+    await controller.remindPendingAttention();
+    await controller.remindPendingAttention();
+
+    const latestPointer = pointers.at(-1);
+    const restored = await restoreBranchState(
+      [{ type: "custom", customType: "pi-tasked-subagents:state", data: latestPointer }],
+      new DurableObjectStore(dataRoot),
+      { sessionId: "pi-tasked-subagents", allEntries: [], appendMigratedPointer: () => undefined },
+    );
+    expect(restored.restored).toBe(true);
+    if (!restored.restored) throw new Error("expected the acked checkpoint to restore");
+    const restoredRun = restored.state.taskRuns[0];
+    expect(restoredRun.tasks.find((task) => task.id === "attention")?.resolvedExternally).toMatchObject({ reason: "fixed by a later run" });
+    expect(restoredRun.attentionNagTriggered).toBe(true);
+  });
+
+  test("reminds once with triggerTurn for a stale attention run, then stays silent and re-arms after restore", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-remind-");
+    const pi = fakePi();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { dataRoot }));
+    const sendMessage = pi.sendMessage as unknown as ReturnType<typeof vi.fn>;
+    controller.restoreState(recoverableState());
+
+    await controller.remindPendingAttention();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const [message, options] = sendMessage.mock.calls[0];
+    expect(message.customType).toBe("pi-tasked-subagents:attention-reminder");
+    expect(message.content).toContain("task-run-1");
+    expect(message.content).toContain("attention");
+    expect(message.details).toMatchObject({ taskRunIds: ["task-run-1"] });
+    expect(options).toMatchObject({ triggerTurn: true, deliverAs: "followUp" });
+
+    await controller.remindPendingAttention();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    controller.restoreState(recoverableState());
+    await controller.remindPendingAttention();
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not remind while the attention run still has a running assignment", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-remind-active-");
+    const pi = fakePi();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { dataRoot }));
+    const sendMessage = pi.sendMessage as unknown as ReturnType<typeof vi.fn>;
+    controller.restoreState(recoverableState("running"));
+
+    await controller.remindPendingAttention();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("does not remind about a run the settling turn already acked", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-remind-acked-");
+    const pi = fakePi();
+    const controller = asTaskRunApi(new TaskedSubagentsController(pi, { dataRoot }));
+    const sendMessage = pi.sendMessage as unknown as ReturnType<typeof vi.fn>;
+    controller.restoreState(recoverableState());
+
+    await expect(controller.ackTarget("attention", "handled inline")).resolves.toMatchObject({ acked: true });
+    await controller.remindPendingAttention();
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test("stopRun uses the assignment launch handle without plan ids", async () => {

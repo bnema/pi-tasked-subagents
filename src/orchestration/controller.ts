@@ -10,12 +10,14 @@ import {
   COMMAND_NAME,
   DEFAULT_WIDGET_LINES,
   ENTRY_TYPE_ATTENTION,
+  ENTRY_TYPE_ATTENTION_REMINDER,
   ENTRY_TYPE_COMPLETION,
   ENTRY_TYPE_FAILURE,
   ENTRY_TYPE_STATE,
   PACKAGE_NAME,
 } from "../defaults.js";
 import type {
+  AckResult,
   AttachResult,
   EditGroupInput,
   EditGroupResult,
@@ -73,7 +75,7 @@ import { normalizeTargetId } from "./ids.js";
 import { maxDispatchRunCounter, maxTaskRunCounter } from "./run-counters.js";
 import { applyTaskRunPatchMutable, taskRunToInput } from "./task-run-patch.js";
 
-export type { AttachResult, EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, PatchTaskRunInput, PatchTaskRunResult, SetTasksInput, SetTasksResult } from "../types.js";
+export type { AckResult, AttachResult, EditGroupInput, EditGroupResult, EditTaskInput, EditTaskResult, PatchTaskRunInput, PatchTaskRunResult, SetTasksInput, SetTasksResult } from "../types.js";
 
 export interface DispatchOptions {
   maxConcurrency?: number;
@@ -203,6 +205,11 @@ function recoverableTaskStatus(status: string): boolean {
   return status === "attention" || status === "failed" || status === "blocked" || status === "cancelled";
 }
 
+/** A task/assignment state an external fix can acknowledge as resolved. */
+function ackEligibleStatus(status: string): boolean {
+  return status === "attention" || status === "blocked" || status === "paused" || status === "failed";
+}
+
 function assignmentResolutionLines(taskRun: TaskRunRecord, task: TaskRecord): string[] {
   return task.assignmentIds
     .map((assignmentId) => taskRun.assignments.find((assignment) => assignment.id === assignmentId))
@@ -261,6 +268,8 @@ export class TaskedSubagentsController {
   private readonly launchingRuns = new Map<string, string[]>();
   private readonly cancellationRequestedRunIds = new Set<string>();
   private readonly signalSuppressionCounts = new Map<string, number>();
+  /** Task runs the settling turn already acked/resolved/continued; skipped by the next reminder. */
+  private readonly attentionActionedTaskRunIds = new Set<string>();
   private clearAllInProgress = false;
   private stateEpoch = 0;
   private dispatchRunCounter = 0;
@@ -312,6 +321,11 @@ export class TaskedSubagentsController {
     this.launchingRuns.clear();
     this.cancellationRequestedRunIds.clear();
     this.signalSuppressionCounts.clear();
+    // A restart re-arms one triggered reminder for any stale attention run.
+    for (const taskRun of this.state.taskRuns) {
+      if (taskRun.attentionNagTriggered) taskRun.attentionNagTriggered = undefined;
+    }
+    this.attentionActionedTaskRunIds.clear();
     this.archiveRefs = [...structuredClone(archiveRefs)];
     this.clearAllInProgress = false;
     this.scheduledDispatches.clear();
@@ -778,7 +792,11 @@ export class TaskedSubagentsController {
   }
 
   async continueTarget(targetId: string, prompt: string, ctx?: ExtensionContext): Promise<boolean> {
-    const result = await this.readyTargetForDispatch(targetId, (_taskRun, _task) => prompt.trim(), { ctx, directTargetsMustBeRecoverable: false });
+    const result = await this.readyTargetForDispatch(targetId, (_taskRun, _task) => prompt.trim(), {
+      ctx,
+      directTargetsMustBeRecoverable: false,
+      markAttentionActioned: true,
+    });
     if (!result) return false;
     this.scheduleDispatch(result, ctx);
     return true;
@@ -788,11 +806,17 @@ export class TaskedSubagentsController {
     const result = await this.readyTargetForDispatch(
       targetId,
       (taskRun, task) => buildResolutionPrompt(taskRun, task, prompt),
-      { ctx, directTargetsMustBeRecoverable: true },
+      { ctx, directTargetsMustBeRecoverable: true, markAttentionActioned: true },
     );
     if (!result) return false;
     this.scheduleDispatch(result, ctx);
     return true;
+  }
+
+  async ackTarget(targetId: string, reason: string, ctx?: ExtensionContext): Promise<AckResult> {
+    if (ctx) this.lastContext = ctx;
+    const checkpointContext = this.checkpointContext(ctx);
+    return this.lock.withLock(() => this.ackTargetMutable(targetId, reason, ctx, checkpointContext));
   }
 
   async stopRun(assignmentId: string): Promise<boolean> {
@@ -948,6 +972,7 @@ export class TaskedSubagentsController {
           this.runProgressSignatures.clear();
           this.liveRunIds.clear();
           this.signalSuppressionCounts.clear();
+          this.attentionActionedTaskRunIds.clear();
           this.scheduledDispatches.clear();
           this.lastDispatchWork = Promise.resolve();
           this.clearAllInProgress = false;
@@ -1272,7 +1297,7 @@ export class TaskedSubagentsController {
   private readyTargetForDispatch(
     targetId: string,
     continuationForTask: (taskRun: TaskRunRecord, task: TaskRecord) => string,
-    options: { ctx?: ExtensionContext; directTargetsMustBeRecoverable: boolean },
+    options: { ctx?: ExtensionContext; directTargetsMustBeRecoverable: boolean; markAttentionActioned?: boolean },
   ): Promise<string | undefined> {
     const ctx = options.ctx;
     if (ctx) this.lastContext = ctx;
@@ -1327,9 +1352,152 @@ export class TaskedSubagentsController {
       deriveTaskRunStatus(target.taskRun, timestamp);
       this.state.currentTaskRunId = target.taskRun.id;
       await this.checkpointState(checkpointContext);
+      if (options.markAttentionActioned) this.attentionActionedTaskRunIds.add(target.taskRun.id);
       this.updateUI(ctx ?? this.lastContext);
       return target.taskRun.id;
     });
+  }
+
+  private ackAffectedTasks(target: MutableTarget): TaskRecord[] {
+    switch (target.kind) {
+      case "taskRun": return target.taskRun.tasks;
+      case "group": return target.taskRun.tasks.filter((task) => task.groupId === target.group.id);
+      case "task":
+      case "assignment": return [target.task];
+    }
+  }
+
+  private applyAckCascade(taskRun: TaskRunRecord, affectedTaskIds: ReadonlySet<string>, reason: string, timestamp: number): void {
+    for (const assignment of taskRun.assignments) {
+      if (isSupersededAssignment(assignment) || !affectedTaskIds.has(assignment.taskId)) continue;
+      if (ackEligibleStatus(assignment.status)) {
+        assignment.status = "completed";
+        assignment.resolvedExternally = { reason, at: timestamp };
+        assignment.completedAt = timestamp;
+        assignment.updatedAt = timestamp;
+      } else if (assignment.status === "queued") {
+        // Launched but never produced a result; do not claim work that did not run.
+        assignment.status = "skipped";
+        assignment.completedAt = timestamp;
+        assignment.updatedAt = timestamp;
+      }
+    }
+    for (const task of taskRun.tasks) {
+      if (!affectedTaskIds.has(task.id)) continue;
+      if (ackEligibleStatus(task.status)) {
+        for (const criterion of task.criteria) criterion.satisfied = true;
+        task.status = "completed";
+        task.resolvedExternally = { reason, at: timestamp };
+        task.completedAt = timestamp;
+        task.updatedAt = timestamp;
+      } else if (task.status === "pending" || task.status === "ready") {
+        task.status = "cancelled";
+        task.completedAt = timestamp;
+        task.updatedAt = timestamp;
+      }
+    }
+  }
+
+  private async ackTargetMutable(targetId: string, reason: string, ctx: ExtensionContext | undefined, checkpointContext: CheckpointContext): Promise<AckResult> {
+    if (this.clearAllInProgress) return { acked: false, error: "Clear all is in progress" };
+    const normalized = normalizeTargetId(targetId);
+    if (!normalized) return { acked: false, error: "ack requires a targetId" };
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) return { acked: false, error: "ack requires a non-empty reason" };
+    const target = this.resolveTargetMutable(normalized);
+    if (!target) return { acked: false, error: `Ack target not found: ${normalized}` };
+
+    const taskRun = target.taskRun;
+    const affectedTaskIds = new Set(this.ackAffectedTasks(target).map((task) => task.id));
+    const affectedAssignments = taskRun.assignments.filter((assignment) => affectedTaskIds.has(assignment.taskId) && !isSupersededAssignment(assignment));
+    const affectedTasks = taskRun.tasks.filter((task) => affectedTaskIds.has(task.id));
+
+    if (affectedAssignments.some((assignment) => assignment.status === "running")) {
+      return { acked: false, taskRunId: taskRun.id, error: `Ack target ${normalized} has running assignments; stop or await them first.` };
+    }
+    const anyEligible = affectedTasks.some((task) => ackEligibleStatus(task.status)) || affectedAssignments.some((assignment) => ackEligibleStatus(assignment.status));
+    if (!anyEligible) {
+      return { acked: false, taskRunId: taskRun.id, error: `Ack target ${normalized} has nothing in attention, blocked, paused, or failed to acknowledge.` };
+    }
+
+    const timestamp = Date.now();
+    const candidate = cloneState(this.state);
+    const candidateTaskRun = candidate.taskRuns.find((item) => item.id === taskRun.id)!;
+    this.applyAckCascade(candidateTaskRun, affectedTaskIds, trimmedReason, timestamp);
+    deriveTaskRunStatus(candidateTaskRun, timestamp);
+    candidate.currentTaskRunId = candidateTaskRun.id;
+    candidate.updatedAt = timestamp;
+    const projectionError = this.preflightCheckpoint(candidate);
+    if (projectionError) return { acked: false, taskRunId: taskRun.id, error: projectionError };
+
+    this.state = candidate;
+    this.attentionActionedTaskRunIds.add(taskRun.id);
+    await this.checkpointState(checkpointContext);
+    this.updateUI(ctx ?? this.lastContext);
+    return { acked: true, taskRunId: taskRun.id };
+  }
+
+  /** True once a run's terminal alert is stale: attention/failed with no active assignment. */
+  private taskRunAwaitingAck(taskRun: TaskRunRecord): boolean {
+    if (taskRun.status !== "attention" && taskRun.status !== "failed") return false;
+    return !taskRun.assignments.some((assignment) => !isSupersededAssignment(assignment) && (assignment.status === "queued" || assignment.status === "running"));
+  }
+
+  /** Re-arm every run's end-of-turn reminder; a new user prompt starts a fresh segment. */
+  async rearmAttentionReminders(): Promise<void> {
+    await this.lock.withLock(() => {
+      for (const taskRun of this.state.taskRuns) {
+        if (taskRun.attentionNagTriggered) taskRun.attentionNagTriggered = undefined;
+      }
+      this.attentionActionedTaskRunIds.clear();
+    });
+  }
+
+  async remindPendingAttention(ctx?: ExtensionContext): Promise<void> {
+    if (ctx) this.lastContext = ctx;
+    const checkpointContext = this.checkpointContext(ctx);
+    const reminder = await this.lock.withLock(async () => {
+      if (this.clearAllInProgress) return undefined;
+      const pending = this.state.taskRuns.filter((taskRun) => this.taskRunAwaitingAck(taskRun) && !this.attentionActionedTaskRunIds.has(taskRun.id));
+      this.attentionActionedTaskRunIds.clear();
+      if (pending.length === 0) return undefined;
+      const armed = pending.filter((taskRun) => taskRun.attentionNagTriggered !== true);
+      if (armed.length === 0) return undefined;
+      const timestamp = Date.now();
+      for (const taskRun of armed) {
+        taskRun.attentionNagTriggered = true;
+        taskRun.updatedAt = timestamp;
+      }
+      this.state.updatedAt = timestamp;
+      await this.checkpointState(checkpointContext);
+      return armed.map((taskRun) => cloneState({ version: 4, taskRuns: [taskRun], currentTaskRunId: taskRun.id, updatedAt: taskRun.updatedAt }).taskRuns[0]);
+    });
+    if (reminder) this.emitAttentionReminder(reminder);
+  }
+
+  private emitAttentionReminder(taskRuns: TaskRunRecord[]): void {
+    const targetIds: string[] = [];
+    const lines = [`[tasked-subagents] attention reminder: ${taskRuns.length} task run${taskRuns.length === 1 ? "" : "s"} still need acknowledgement.`];
+    for (const taskRun of taskRuns) {
+      targetIds.push(taskRun.id);
+      lines.push(`- ${taskRun.id} · ${taskRun.title} (${statusLabel(taskRun.status)})`);
+      for (const task of taskRun.tasks) {
+        if (task.status === "attention" || task.status === "failed" || task.status === "blocked") {
+          lines.push(`    ${task.id} · ${statusLabel(task.status)} · ${shortTitle(task.text, 80)}`);
+        }
+      }
+    }
+    lines.push("Acknowledge each fixed finding with tasked_subagents ack targetId=<id> reason=<why>, or resolve targetId=<id> prompt=<fix> to re-verify.");
+    try {
+      this.pi.sendMessage({
+        customType: ENTRY_TYPE_ATTENTION_REMINDER,
+        content: lines.join("\n"),
+        display: false,
+        details: { taskRunIds: targetIds, kind: "attention-reminder" },
+      }, { triggerTurn: true, deliverAs: "followUp" });
+    } catch {
+      // best effort reminder; state remains source of truth
+    }
   }
 
   private suppressTaskRunSignal(taskRunId: string): void {
