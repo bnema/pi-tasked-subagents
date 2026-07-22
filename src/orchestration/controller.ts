@@ -792,9 +792,12 @@ export class TaskedSubagentsController {
   }
 
   async continueTarget(targetId: string, prompt: string, ctx?: ExtensionContext): Promise<boolean> {
-    const result = await this.readyTargetForDispatch(targetId, (_taskRun, _task) => prompt.trim(), { ctx, directTargetsMustBeRecoverable: false });
+    const result = await this.readyTargetForDispatch(targetId, (_taskRun, _task) => prompt.trim(), {
+      ctx,
+      directTargetsMustBeRecoverable: false,
+      markAttentionActioned: true,
+    });
     if (!result) return false;
-    this.attentionActionedTaskRunIds.add(result);
     this.scheduleDispatch(result, ctx);
     return true;
   }
@@ -803,10 +806,9 @@ export class TaskedSubagentsController {
     const result = await this.readyTargetForDispatch(
       targetId,
       (taskRun, task) => buildResolutionPrompt(taskRun, task, prompt),
-      { ctx, directTargetsMustBeRecoverable: true },
+      { ctx, directTargetsMustBeRecoverable: true, markAttentionActioned: true },
     );
     if (!result) return false;
-    this.attentionActionedTaskRunIds.add(result);
     this.scheduleDispatch(result, ctx);
     return true;
   }
@@ -1295,7 +1297,7 @@ export class TaskedSubagentsController {
   private readyTargetForDispatch(
     targetId: string,
     continuationForTask: (taskRun: TaskRunRecord, task: TaskRecord) => string,
-    options: { ctx?: ExtensionContext; directTargetsMustBeRecoverable: boolean },
+    options: { ctx?: ExtensionContext; directTargetsMustBeRecoverable: boolean; markAttentionActioned?: boolean },
   ): Promise<string | undefined> {
     const ctx = options.ctx;
     if (ctx) this.lastContext = ctx;
@@ -1350,6 +1352,7 @@ export class TaskedSubagentsController {
       deriveTaskRunStatus(target.taskRun, timestamp);
       this.state.currentTaskRunId = target.taskRun.id;
       await this.checkpointState(checkpointContext);
+      if (options.markAttentionActioned) this.attentionActionedTaskRunIds.add(target.taskRun.id);
       this.updateUI(ctx ?? this.lastContext);
       return target.taskRun.id;
     });
@@ -1467,7 +1470,7 @@ export class TaskedSubagentsController {
       }
       this.state.updatedAt = timestamp;
       await this.checkpointState(checkpointContext);
-      return pending.map((taskRun) => cloneState({ version: 4, taskRuns: [taskRun], currentTaskRunId: taskRun.id, updatedAt: taskRun.updatedAt }).taskRuns[0]);
+      return armed.map((taskRun) => cloneState({ version: 4, taskRuns: [taskRun], currentTaskRunId: taskRun.id, updatedAt: taskRun.updatedAt }).taskRuns[0]);
     });
     if (reminder) this.emitAttentionReminder(reminder);
   }

@@ -1643,6 +1643,7 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     const acked = controller.getState().taskRuns[0];
     expect(acked.tasks.find((task) => task.id === "later")?.status).toBe("cancelled");
     expect(acked.tasks.find((task) => task.id === "later")?.resolvedExternally).toBeUndefined();
+    expect(acked.tasks.find((task) => task.id === "queuedTask")?.status).toBe("blocked");
     expect(acked.assignments.find((assignment) => assignment.id === "aq")?.status).toBe("skipped");
     expect(acked.assignments.find((assignment) => assignment.id === "aq")?.resolvedExternally).toBeUndefined();
     expect(acked.tasks.find((task) => task.id === "attention")?.status).toBe("completed");
