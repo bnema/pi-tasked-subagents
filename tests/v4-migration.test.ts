@@ -138,6 +138,25 @@ describe("v4 bounded migration", () => {
     expect(reloaded).toMatchObject({ restored: true, migrated: false, pointer: result.pointer });
   });
 
+  test("preserves stale heartbeat timestamps through a v4 migration", async () => {
+    const dataRoot = await root();
+    const legacy = state("running");
+    legacy.taskRuns[0].assignments[0].staleWarnedAt = 1_800_000_000_111;
+    legacy.taskRuns[0].assignments[0].staleEscalatedAt = 1_800_000_000_222;
+    const appended: unknown[] = [];
+    const migrated = await restoreBranchState([
+      { type: "custom", customType: ENTRY_TYPE_STATE, data: legacy },
+    ], new DurableObjectStore(dataRoot), {
+      sessionId: "generic-session", allEntries: [], appendMigratedPointer: (pointer) => appended.push(pointer),
+    });
+
+    expect(migrated).toMatchObject({ restored: true, migrated: true });
+    if (!migrated.restored) return;
+    const assignment = migrated.state.taskRuns[0].assignments[0];
+    expect(assignment.staleWarnedAt).toBe(1_800_000_000_111);
+    expect(assignment.staleEscalatedAt).toBe(1_800_000_000_222);
+  });
+
   test("uses the next visible v5 sequence in both the manifest and pointer", async () => {
     const dataRoot = await root();
     const legacy = state("running");

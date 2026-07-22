@@ -1906,6 +1906,43 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     }
   });
 
+  test("emits the stale warning and keeps its guard even when the checkpoint fails", async () => {
+    const base = 1_800_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(base);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const dataRoot = await createControllerDataRoot("tasked-stale-fail-");
+      const pi = fakePi();
+      const runtime = new ManualProgressRuntime();
+      const persistence = new ToggleFailingPersistence();
+      const controller = asTaskRunApi(new TaskedSubagentsController(pi, { launcher: runtime, persistence, dataRoot, staleWarningMs: 1_000, staleAttentionMs: 3_000 }));
+      const sendMessage = pi.sendMessage as unknown as ReturnType<typeof vi.fn>;
+      controller.restoreState(staleRunningState(base));
+      controller.reconcileRestoredRuns();
+      await runtime.waitStarted;
+
+      persistence.fail = true;
+      nowSpy.mockReturnValue(base + 1_500);
+      await runtime.tick({ runId: "run-1", status: "running", steps: [{ id: "a1", status: "running", agent: "delegate", lastActionAt: base }] });
+
+      // A failed checkpoint must neither reject the tick nor drop the warning,
+      // and the in-memory guard must remain set so it will not repeat.
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0][0].details).toMatchObject({ kind: "stale-assignment", assignmentIds: ["a1"] });
+      expect(errorSpy).toHaveBeenCalled();
+      expect(assignmentById(controller, "a1")?.staleWarnedAt).toBe(base + 1_500);
+
+      // A later identical tick (checkpoint now succeeding) stays silent.
+      persistence.fail = false;
+      nowSpy.mockReturnValue(base + 2_000);
+      await runtime.tick({ runId: "run-1", status: "running", steps: [{ id: "a1", status: "running", agent: "delegate", lastActionAt: base }] });
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+      nowSpy.mockRestore();
+    }
+  });
+
   test("stale heartbeat markers survive a persistence round-trip", async () => {
     const dataRoot = await createControllerDataRoot("tasked-stale-persist-");
     const pointers: unknown[] = [];

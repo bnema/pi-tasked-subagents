@@ -279,7 +279,12 @@ function assignmentActivityItems(assignment: TaskAssignmentRecord, now: number):
     : "";
 
   add(assignment.currentTool ? `tool: ${assignment.currentTool}` : undefined);
-  add(assignment.lastActionSummary ? `last: ${assignment.lastActionSummary}${idleAge}` : undefined, assignment.lastActionSummary);
+  if (assignment.lastActionSummary) {
+    // Reserve room for the idle-age suffix so summary truncation never eats it.
+    const base = `last: ${assignment.lastActionSummary}`;
+    const line = idleAge ? `${shortTitle(base, ACTIVITY_TEXT_WIDTH - idleAge.length)}${idleAge}` : base;
+    add(line, assignment.lastActionSummary);
+  }
 
   const remainingSlots = MAX_ACTIVITY_LINES - items.length;
   const recentActivity: string[] = [];

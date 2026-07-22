@@ -1671,7 +1671,15 @@ export class TaskedSubagentsController {
 
     if (!changed) return [];
     deriveTaskRunStatus(taskRun, now);
-    await this.checkpointState(this.checkpointContext(ctx));
+    try {
+      await this.checkpointState(this.checkpointContext(ctx));
+    } catch (error) {
+      // This runs on the display-only progress tick. A failed checkpoint must
+      // not reject onUpdate and tear down stale monitoring, nor drop the
+      // already-computed signal: the in-memory guard timestamps stay set (so
+      // the signal will not repeat) and state remains the source of truth.
+      console.error(`[${PACKAGE_NAME}] stale heartbeat checkpoint failed:`, error);
+    }
     this.updateUI(ctx ?? this.lastContext);
     const signals: StaleAssignmentSignal[] = [];
     if (warnEntries.length > 0) signals.push({ taskRunId: taskRun.id, kind: "stale-assignment", entries: warnEntries });
