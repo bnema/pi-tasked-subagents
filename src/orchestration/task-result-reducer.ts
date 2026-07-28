@@ -2,7 +2,7 @@
 // Task result reducer: validate and apply subagent task reports
 // ──────────────────────────────────────────────
 
-import type { ArtifactRef, SubagentTaskReport, TaskAssignmentRecord, TaskRecord, TaskRunRecord } from "../types.js";
+import type { ArtifactRef, AssignmentUsage, SubagentTaskReport, TaskAssignmentRecord, TaskRecord, TaskRunRecord } from "../types.js";
 import { deriveTaskRunStatus } from "./task-scheduler.js";
 
 export interface ApplyTaskReportResult {
@@ -154,7 +154,7 @@ function validateReport(
 export function applySubagentTaskReport(
   taskRun: TaskRunRecord,
   report: SubagentTaskReport,
-  options: { now?: number; rawResultPath?: string; expectedAssignmentId?: string } = {},
+  options: { now?: number; rawResultPath?: string; expectedAssignmentId?: string; usage?: AssignmentUsage } = {},
 ): ApplyTaskReportResult {
   const timestamp = options.now ?? Date.now();
   const assignment = taskRun.assignments.find((candidate) => candidate.id === (options.expectedAssignmentId ?? report.assignmentId));
@@ -214,6 +214,7 @@ export function applySubagentTaskReport(
   }
 
   assignment!.status = report.status;
+  if (options.usage !== undefined) assignment!.usage = options.usage;
   assignment!.result = {
     assignmentId: report.assignmentId,
     status: report.status,

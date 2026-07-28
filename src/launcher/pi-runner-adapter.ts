@@ -25,7 +25,8 @@ import type {
 } from "../types.js";
 import { getAgentProfile, listAvailableAgentProfiles } from "./agent-profiles.js";
 import { ensureTaskGraphRequest, type LaunchResult, type RunnerRuntimeContext, type RunnerChildConfig, type RunnerConfig } from "./interface.js";
-import { captureProcessIdentity, isProcessIdentityAlive, signalProcessIdentity } from "./process-identity.mjs";
+import { captureProcessIdentity, isProcessIdentityAlive, readProcessStartTime } from "./process-identity.mjs";
+import { settleOwnedProcessTermination } from "./direct-runner.mjs";
 import { openPinnedDirectory } from "../state/pinned-directory.mjs";
 import { publishTerminalResult, reserveResultReservation } from "./result-files.mjs";
 
@@ -148,6 +149,19 @@ interface RunnerStatusFile {
   }>;
 }
 
+interface RunnerResultChild {
+  stepId?: string | number;
+  status?: string;
+  summary?: string;
+  report?: Record<string, unknown>;
+  diagnostic?: string;
+  output?: string;
+  rawOutput?: string;
+  error?: string;
+  success?: boolean;
+  usage?: unknown;
+}
+
 interface RunnerResultFile {
   runId?: string;
   timestamp?: number;
@@ -155,7 +169,7 @@ interface RunnerResultFile {
   success?: boolean;
   summary?: string;
   rawOutput?: string;
-  results?: Array<{ stepId?: string | number; output?: string; rawOutput?: string; summary?: string; error?: string; success?: boolean }>;
+  results?: RunnerResultChild[];
 }
 
 function mapRunnerState(state: string | undefined): RunStatus {
@@ -177,6 +191,11 @@ function isTerminalStatus(status: RunStatus): boolean {
 
 const TERMINAL_RESULT_STATUS_GRACE_MS = 1_000;
 const TERMINAL_RESULT_STATUS_POLL_INTERVAL_MS = 25;
+const TERMINATION_GRACE_MS = 5_000;
+const TERMINATION_POLL_MS = 50;
+const TERMINATION_FORCE_WAIT_MS = 5_000;
+const TERMINATION_DEADLINE_MS = 30_000;
+const TERMINATION_DISCOVERY_POLL_MS = 50;
 
 function buildProgressSnapshot(runId: string, statusFile: RunnerStatusFile): RunProgressSnapshot {
   return {
@@ -226,6 +245,20 @@ function preservedStepStatus(status: string | undefined): boolean {
   return status === "completed" || status === "failed" || status === "skipped";
 }
 
+async function hasUnverifiedLiveStatusProcesses(status: RunnerStatusFile | undefined, _verifiedIdentities: Array<{ pid: number; startTime: string }> = []): Promise<boolean> {
+  const candidates: Array<{ pid?: number; pidStartTime?: string }> = [{ pid: status?.pid, pidStartTime: status?.pidStartTime }];
+  for (const step of status?.steps ?? []) candidates.push({ pid: step.pid, pidStartTime: step.pidStartTime });
+  for (const candidate of candidates) {
+    if (typeof candidate.pid !== "number" || !Number.isSafeInteger(candidate.pid) || candidate.pid <= 0) continue;
+    if (typeof candidate.pidStartTime === "string" && /^\d+$/u.test(candidate.pidStartTime)) {
+      const identity = { pid: candidate.pid, startTime: candidate.pidStartTime };
+      if (await isProcessIdentityAlive(identity)) continue;
+    }
+    if (await readProcessStartTime(candidate.pid) !== undefined) return true;
+  }
+  return false;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -245,6 +278,14 @@ export interface PiRunnerAdapterOptions {
   storageMutationHook?: (operation: "reserve-result" | "publish-terminal-result") => Promise<void> | void;
   /** Injectable only for deterministic unavailable-procfs tests. */
   procDirectoryPath?: (fd: number) => string;
+  /** Injectable only for bounded termination tests. */
+  terminationTiming?: {
+    graceMs?: number;
+    pollMs?: number;
+    forceWaitMs?: number;
+    deadlineMs?: number;
+    discoveryPollMs?: number;
+  };
 }
 
 export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
@@ -255,6 +296,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
   private readonly resultIdFactory: () => string;
   private readonly storageMutationHook: PiRunnerAdapterOptions["storageMutationHook"];
   private readonly procDirectoryPath: PiRunnerAdapterOptions["procDirectoryPath"];
+  private readonly terminationTiming: Required<NonNullable<PiRunnerAdapterOptions["terminationTiming"]>>;
   /** Each launch is keyed by session and immutable identity, never by report-oriented runId. */
   private readonly trackedLaunches = new Map<string, { launch: LaunchResult; identity?: ProcessIdentity }>();
 
@@ -268,6 +310,13 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     this.resultIdFactory = options.resultIdFactory ?? (() => randomBytes(16).toString("hex"));
     this.storageMutationHook = options.storageMutationHook;
     this.procDirectoryPath = options.procDirectoryPath;
+    this.terminationTiming = {
+      graceMs: options.terminationTiming?.graceMs ?? TERMINATION_GRACE_MS,
+      pollMs: options.terminationTiming?.pollMs ?? TERMINATION_POLL_MS,
+      forceWaitMs: options.terminationTiming?.forceWaitMs ?? TERMINATION_FORCE_WAIT_MS,
+      deadlineMs: options.terminationTiming?.deadlineMs ?? TERMINATION_DEADLINE_MS,
+      discoveryPollMs: options.terminationTiming?.discoveryPollMs ?? TERMINATION_DISCOVERY_POLL_MS,
+    };
   }
 
   async launchTaskGraph(request: LaunchTaskGraphRequest, ctx: RunnerRuntimeContext): Promise<DurableSubagentRunHandle> {
@@ -375,21 +424,30 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       ? await readJsonFile<RunnerResultFile>(resolved.launch.resultPath)
       : await this.readDurableResult(resolved.paths);
     if (!result) return undefined;
+
+    const childOutput = (child: RunnerResultChild): string | undefined => {
+      if (child.report) return JSON.stringify(child.report);
+      if (typeof child.rawOutput === "string" && child.rawOutput.trim()) return child.rawOutput;
+      if (typeof child.output === "string" && child.output.trim()) return child.output;
+      if (typeof child.diagnostic === "string" && child.diagnostic.trim()) return child.diagnostic;
+      return undefined;
+    };
+
     if (typeof result.rawOutput === "string" && result.rawOutput.trim()) return result.rawOutput;
     if (Array.isArray(result.results) && result.results.length > 1) {
       return JSON.stringify({
         runId,
         results: result.results.map((child) => ({
           stepId: child.stepId,
-          output: child.rawOutput ?? child.output ?? "",
+          ...(child.report ? { report: child.report } : { output: childOutput(child) ?? "" }),
           summary: child.summary,
-          error: child.error,
+          error: child.diagnostic ?? child.error,
           success: child.success,
         })),
       });
     }
     const first = result.results?.[0];
-    return first?.rawOutput || first?.output || result.summary;
+    return childOutput(first ?? {}) ?? result.summary;
   }
 
   async isRunAlive(handle: SubagentRunHandle): Promise<boolean> {
@@ -625,8 +683,6 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       : await this.readDurableStatus(paths);
     const resultPath = launch.resultPath ?? paths.resultPath;
 
-    const identities = this.processIdentities(handle, existingStatus, tracked);
-
     const timestamp = now();
     const terminalStatus: RunnerStatusFile & { endedAt?: number; lastUpdate?: number } = {
       ...(existingStatus ?? {}),
@@ -651,16 +707,37 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
       timestamp,
     };
 
-    let allSignaled = true;
-    for (const identity of identities) {
-      // A missing or stale identity is intentionally treated as no longer ours.
-      if (await isProcessIdentityAlive(identity) && !await signalProcessIdentity(identity)) allSignaled = false;
-    }
+    const readStatus = async (): Promise<RunnerStatusFile | undefined> => handle.legacy
+      ? readJsonFile<RunnerStatusFile>(paths.statusPath)
+      : this.readDurableStatus(paths);
+
+    const settlement = await settleOwnedProcessTermination({
+      readStatus: async () => {
+        const statusFile = await readStatus();
+        const currentTracked = handle.legacy ? undefined : this.trackedLaunches.get(this.launchKey(handle.sessionId, handle.resultId));
+        if (!statusFile) return currentTracked?.identity ? { pid: currentTracked.identity.pid, pidStartTime: currentTracked.identity.startTime, steps: [] } : {};
+        if (!handle.legacy && currentTracked?.identity) {
+          return {
+            ...statusFile,
+            pid: statusFile.pid ?? currentTracked.identity.pid,
+            pidStartTime: statusFile.pidStartTime ?? currentTracked.identity.startTime,
+          };
+        }
+        return statusFile;
+      },
+      runnerIdentity: tracked?.identity,
+      ...this.terminationTiming,
+    });
+
+    const finalStatus = await readStatus();
+    const finalIdentities = this.processIdentities(handle, finalStatus, tracked);
+    const ownedAlive = (await Promise.all(finalIdentities.map((identity) => isProcessIdentityAlive(identity)))).some(Boolean);
+    const allOwnedDead = settlement.quiet && !ownedAlive && !await hasUnverifiedLiveStatusProcesses(finalStatus, finalIdentities);
 
     if (handle.legacy) {
       await writeJsonFile(paths.statusPath, terminalStatus);
       await writeJsonFile(resultPath, terminalResult);
-      return allSignaled;
+      return allOwnedDead;
     }
     try {
       const publication = await publishTerminalResult(resultPath, handle.resultReservationPath, {
@@ -682,6 +759,6 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
     } catch {
       return false;
     }
-    return allSignaled;
+    return allOwnedDead;
   }
 }

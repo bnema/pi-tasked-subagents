@@ -2,7 +2,7 @@
 // Task-run controller for pi-tasked-subagents
 // ──────────────────────────────────────────────
 
-import { readFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -15,12 +15,15 @@ import {
   ENTRY_TYPE_FAILURE,
   ENTRY_TYPE_STALE_ASSIGNMENT,
   ENTRY_TYPE_STATE,
+  MAX_RUN_RESULT_BYTES,
   PACKAGE_NAME,
   STALE_ASSIGNMENT_ATTENTION_MS,
   STALE_ASSIGNMENT_WARNING_MS,
 } from "../defaults.js";
+import { normalizeAssignmentUsage } from "../assignment-usage.js";
 import type {
   AckResult,
+  AssignmentResultEnvelope,
   AttachResult,
   EditGroupInput,
   EditGroupResult,
@@ -205,23 +208,183 @@ function progressSignature(snapshot: RunProgressSnapshot): string {
   });
 }
 
-function parseReportsFromRaw(raw: string | undefined): Array<{ assignmentId?: string; report: SubagentTaskReport }> {
+function parseReportsFromRaw(raw: string | undefined): AssignmentResultEnvelope[] {
   if (!raw?.trim()) return [];
   const single = parseTaskReport(raw);
   if (single) return [{ assignmentId: single.assignmentId, report: single }];
 
   try {
-    const parsed = JSON.parse(raw) as { results?: Array<{ stepId?: string | number; output?: string; rawOutput?: string }> };
+    const parsed = JSON.parse(raw) as {
+      results?: Array<{
+        stepId?: string | number;
+        output?: string;
+        rawOutput?: string;
+        report?: unknown;
+        usage?: unknown;
+      }>;
+    };
     return (parsed.results ?? [])
-      .map((result) => {
-        const output = result.rawOutput ?? result.output ?? "";
+      .map((result): AssignmentResultEnvelope | undefined => {
+        const output = typeof result.report === "object" && result.report
+          ? JSON.stringify(result.report)
+          : typeof result.report === "string" && result.report.trim()
+            ? result.report
+            : result.rawOutput ?? result.output ?? "";
         const report = parseTaskReport(output);
-        return report ? { assignmentId: String(result.stepId ?? report.assignmentId), report } : undefined;
+        if (!report) return undefined;
+        const usage = normalizeAssignmentUsage(result.usage);
+        return {
+          assignmentId: String(result.stepId ?? report.assignmentId),
+          report,
+          ...(usage === undefined ? {} : { usage }),
+        };
       })
-      .filter((entry): entry is { assignmentId: string; report: SubagentTaskReport } => Boolean(entry));
+      .filter((entry): entry is AssignmentResultEnvelope => entry !== undefined);
   } catch {
     return [];
   }
+}
+
+const RESULT_UNAVAILABLE_SIZE = "Result is unavailable: the durable result exceeds its size limit.";
+
+async function readBoundedUtf8File(path: string, maxBytes: number): Promise<"missing" | "oversized" | string> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      const before = await handle.stat();
+      if (!before.isFile()) return "missing";
+      if (before.size > maxBytes) return "oversized";
+      const buffer = Buffer.alloc(before.size);
+      const { bytesRead } = await handle.read(buffer, 0, before.size, 0);
+      const after = await handle.stat();
+      if (!after.isFile() || after.size > maxBytes || bytesRead > maxBytes) return "oversized";
+      return buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return "missing";
+  }
+}
+
+function formatArchiveAssignmentFallback(archive: AssignmentArchiveV1, assignmentId: string): string {
+  const lines = [
+    `Assignment: ${assignmentId}`,
+    `  status: ${statusLabel(archive.status)}`,
+  ];
+  if (!("detailOmitted" in archive && archive.detailOmitted)) {
+    if (archive.summary) lines.push(`  summary: ${archive.summary}`);
+    if (archive.criteriaEvidence.length > 0) {
+      lines.push("", "Criteria evidence:");
+      for (const entry of archive.criteriaEvidence) {
+        lines.push(`- ${entry.criterionId}: ${entry.evidence}`);
+      }
+    }
+    if (archive.followUps.length > 0) {
+      lines.push("", "Follow-ups:");
+      for (const followUp of archive.followUps) lines.push(`- ${followUp}`);
+    }
+    if (archive.artifacts.length > 0) {
+      lines.push("", "Artifacts:");
+      for (const artifact of archive.artifacts) lines.push(`- ${artifact.label}: ${artifact.path}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatScopedAssignmentResult(payload: {
+  assignmentId: string;
+  status: string;
+  summary: string;
+  criteriaEvidence: unknown[];
+  followUps: string[];
+  artifacts: unknown[];
+  usage?: unknown;
+}): string {
+  return JSON.stringify(payload);
+}
+
+function projectAssignmentScopedResult(
+  assignmentId: string,
+  archive: AssignmentArchiveV1,
+  raw: string,
+): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return formatArchiveAssignmentFallback(archive, assignmentId);
+
+  const looksLikeJson = trimmed.startsWith("{") || trimmed.startsWith("[");
+  if (!looksLikeJson) return raw;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return RESULT_UNAVAILABLE_SIZE;
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return RESULT_UNAVAILABLE_SIZE;
+  }
+
+  const root = parsed as {
+    results?: Array<{
+      stepId?: string | number;
+      status?: string;
+      summary?: string;
+      output?: string;
+      rawOutput?: string;
+      diagnostic?: string;
+      report?: SubagentTaskReport | string;
+      usage?: unknown;
+    }>;
+  };
+
+  if (!Array.isArray(root.results)) {
+    const single = parseTaskReport(trimmed);
+    if (single && single.assignmentId === assignmentId) {
+      return formatScopedAssignmentResult({
+        assignmentId,
+        status: single.status,
+        summary: single.summary,
+        criteriaEvidence: single.criteriaEvidence,
+        followUps: single.followUps ?? [],
+        artifacts: single.artifacts ?? [],
+      });
+    }
+    return formatArchiveAssignmentFallback(archive, assignmentId);
+  }
+
+  const child = root.results.find((entry) => String(entry.stepId) === assignmentId);
+  if (!child) return formatArchiveAssignmentFallback(archive, assignmentId);
+
+  const reportSource = typeof child.report === "string"
+    ? child.report
+    : child.report
+      ? JSON.stringify(child.report)
+      : child.rawOutput ?? child.output ?? child.diagnostic ?? "";
+  const report = parseTaskReport(reportSource);
+  if (!report) {
+    const detail = !("detailOmitted" in archive && archive.detailOmitted) ? archive : undefined;
+    return formatScopedAssignmentResult({
+      assignmentId,
+      status: typeof child.status === "string" ? child.status : archive.status,
+      summary: typeof child.summary === "string" ? child.summary : detail?.summary ?? "",
+      criteriaEvidence: detail?.criteriaEvidence ?? [],
+      followUps: detail?.followUps ?? [],
+      artifacts: detail?.artifacts ?? [],
+      ...(child.usage === undefined ? {} : { usage: child.usage }),
+    });
+  }
+
+  return formatScopedAssignmentResult({
+    assignmentId,
+    status: report.status,
+    summary: report.summary,
+    criteriaEvidence: report.criteriaEvidence,
+    followUps: report.followUps ?? [],
+    artifacts: report.artifacts ?? [],
+    ...(child.usage === undefined ? {} : { usage: child.usage }),
+  });
 }
 
 type MutableTarget =
@@ -976,11 +1139,13 @@ export class TaskedSubagentsController {
         ? "Result is unavailable: the legacy result file is missing."
         : "Result is unavailable: this assignment has no durable result identity.";
     }
-    try {
-      return await readFile(resultFilePath(sessionStoragePaths(this.dataRoot, sessionId), archive.resultId), "utf8");
-    } catch {
-      return "Result is unavailable: the durable result file is missing.";
-    }
+    const raw = await readBoundedUtf8File(
+      resultFilePath(sessionStoragePaths(this.dataRoot, sessionId), archive.resultId),
+      MAX_RUN_RESULT_BYTES,
+    );
+    if (raw === "missing") return "Result is unavailable: the durable result file is missing.";
+    if (raw === "oversized") return RESULT_UNAVAILABLE_SIZE;
+    return projectAssignmentScopedResult(assignmentId, archive, raw);
   }
 
   async clear(scope: "completed" | "all" = "completed", targetId?: string): Promise<number> {
@@ -1733,6 +1898,7 @@ export class TaskedSubagentsController {
         artifacts: result?.artifacts ?? taskRun.artifacts.filter((artifact) => artifact.assignmentId === assignment.id),
         followUps: result?.followUps ?? [],
         runId: assignment.runId ?? "unknown",
+        ...(assignment.usage === undefined ? {} : { usage: assignment.usage }),
         ...(resultId === undefined
           ? { resultUnavailableReason: "missing-legacy-result" as const }
           : { resultId }),
@@ -1773,7 +1939,7 @@ export class TaskedSubagentsController {
 
       const reports = parseReportsFromRaw(raw);
       const handledAssignmentIds = new Set<string>();
-      for (const { assignmentId, report } of reports) {
+      for (const { assignmentId, report, usage } of reports) {
         const expectedAssignmentId = assignmentId ?? report.assignmentId;
         const assignment = assignments.find((candidate) => candidate.id === expectedAssignmentId);
         if (!assignment) continue;
@@ -1782,6 +1948,7 @@ export class TaskedSubagentsController {
           now: timestamp,
           rawResultPath: assignment.launchRef?.resultPath,
           expectedAssignmentId: assignment.id,
+          ...(usage === undefined ? {} : { usage }),
         });
         if (applied.applied && report.taskRunPatch) {
           const patchResult = applyTaskRunPatchMutable(taskRun, report.taskRunPatch, timestamp);

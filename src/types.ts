@@ -54,6 +54,10 @@ export const ASSIGNMENT_STATUSES = [
 export type AssignmentStatus = (typeof ASSIGNMENT_STATUSES)[number];
 export type RunStatus = AssignmentStatus;
 
+import type { AssignmentUsage } from "./assignment-usage.js";
+
+export type { AssignmentUsage, AssignmentUsageCost } from "./assignment-usage.js";
+
 export type TaskReportStatus = "completed" | "attention" | "failed";
 export type OutputMode = "text" | "json";
 export type TaskExpansionMode = "append_tasks";
@@ -254,6 +258,12 @@ export interface TaskResultRecord {
   createdAt: number;
 }
 
+export interface AssignmentResultEnvelope {
+  assignmentId?: string;
+  report: SubagentTaskReport;
+  usage?: AssignmentUsage;
+}
+
 export interface TaskAssignmentRecord {
   id: string;
   taskRunId: string;
@@ -265,6 +275,7 @@ export interface TaskAssignmentRecord {
   runId?: string;
   launchRef?: SubagentRunHandle;
   result?: TaskResultRecord;
+  usage?: AssignmentUsage;
   currentTool?: string;
   lastActionAt?: number;
   lastActionSummary?: string;

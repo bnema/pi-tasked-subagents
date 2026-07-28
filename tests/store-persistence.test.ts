@@ -14,6 +14,21 @@ import { createEmptyState, deserializeState, ensureState, serializeState } from 
 import { sessionStoragePaths } from "../src/state/storage-paths.js";
 import type { TaskRunRecord, TaskedSubagentsState } from "../src/types.js";
 
+function sampleUsage() {
+  return {
+    input: 100,
+    output: 50,
+    cacheRead: 10,
+    cacheWrite: 5,
+    reasoning: 2,
+    totalTokens: 167,
+    cost: { input: 0.001, output: 0.002, cacheRead: 0.0001, cacheWrite: 0.0002, total: 0.0033 },
+    assistantCalls: 1,
+    toolCalls: 2,
+    models: ["gpt-4"],
+  };
+}
+
 const taskRun = {
   id: "task-run-1",
   title: "Task run",
@@ -854,6 +869,28 @@ describe("task-run state store", () => {
     expect(result.diagnostics).toContainEqual(expect.objectContaining({ code: "object_missing" }));
   });
 
+  test("round-trips valid assignment usage on task-run state", () => {
+    const withUsage: TaskedSubagentsState = structuredClone(currentState);
+    withUsage.taskRuns[0].assignments[0].usage = sampleUsage();
+
+    const restored = deserializeState(serializeState(withUsage));
+
+    expect(restored.taskRuns[0].assignments[0].usage).toEqual(sampleUsage());
+  });
+
+  test("drops malformed assignment usage without rejecting the assignment", () => {
+    const malformed: TaskedSubagentsState = structuredClone(currentState);
+    (malformed.taskRuns[0].assignments[0] as unknown as { usage: unknown }).usage = {
+      ...sampleUsage(),
+      totalTokens: Number.NaN,
+    };
+
+    const restored = ensureState(malformed);
+
+    expect(restored.taskRuns[0].assignments[0]).toMatchObject({ id: "assignment-1" });
+    expect(restored.taskRuns[0].assignments[0].usage).toBeUndefined();
+  });
+
   test("rejects a checkpoint when archive identities, terminal fields, or nested archive detail are malformed", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-tasked-subagents-restore-"));
     storageRoots.push(root);
@@ -887,6 +924,8 @@ describe("task-run state store", () => {
       ["artifact shape", (archive) => { archive.artifacts = [{ label: "Report", path: "local://report", assignmentId: "other", taskRunId: "completed-run", taskId: "completed-task" }]; }],
       ["artifact group", (archive) => { archive.artifacts = [{ label: "Report", path: "local://report", assignmentId: "assignment-completed", taskRunId: "completed-run", groupId: "other", taskId: "completed-task" }]; }],
       ["follow-up shape", (archive) => { archive.followUps = [1]; }],
+      ["usage unknown field", (archive) => { archive.usage = { ...sampleUsage(), extra: true }; }],
+      ["usage negative tokens", (archive) => { archive.usage = { ...sampleUsage(), totalTokens: -1 }; }],
     ];
     for (const [name, mutate] of cases) {
       const archive = structuredClone(validArchive) as Record<string, unknown>;

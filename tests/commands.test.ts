@@ -94,6 +94,24 @@ describe("commands", () => {
     expect(formatInspectReport(state, "a1")).toContain("Assignment: a1");
   });
 
+  test("formats assignment usage on inspect and result views", () => {
+    const withUsage = structuredClone(state);
+    withUsage.taskRuns[0].assignments[0].usage = {
+      input: 1000,
+      output: 500,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      totalTokens: 1500,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.12 },
+      assistantCalls: 2,
+      toolCalls: 3,
+      models: ["gpt-4"],
+    };
+    expect(formatInspectReport(withUsage, "a1")).toContain("usage: 1,500 tok");
+    expect(formatResultReport(withUsage, "a1")).toContain("usage: 1,500 tok");
+  });
+
   test("restored completed history preserves summary counts and archive inspection", () => {
     const restored = structuredClone(state);
     restored.taskRuns = [];
@@ -212,6 +230,33 @@ describe("commands", () => {
     expect(report).toContain("Follow-ups:");
     expect(report).toContain("- Patch task 1 id is required");
     expect(report).toContain("- Retry with a valid task id");
+  });
+
+  test("formatResultReport keeps compact assignment detail instead of dumping a result body", () => {
+    const withResultPath = structuredClone(state);
+    withResultPath.taskRuns[0].assignments[0].status = "completed";
+    withResultPath.taskRuns[0].assignments[0].result = {
+      assignmentId: "a1",
+      status: "completed",
+      summary: "compact summary only",
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: [],
+      createdAt: 1,
+      rawResultPath: "/tmp/should-not-be-body.json",
+    };
+    withResultPath.taskRuns[0].assignments[0].launchRef = {
+      legacy: true,
+      runId: "run-1",
+      asyncId: "run-1",
+      resultPath: "/tmp/should-not-be-body.json",
+      assignments: [{ assignmentId: "a1", runId: "run-1", resultPath: "/tmp/should-not-be-body.json" }],
+    };
+    const report = formatResultReport(withResultPath, "a1");
+    expect(report).toContain("Assignment: a1");
+    expect(report).toContain("compact summary only");
+    expect(report).toContain("result path: /tmp/should-not-be-body.json");
+    expect(report.startsWith("{")).toBe(false);
   });
 
   test("result target resolution refuses ambiguous taskRun and group targets", () => {

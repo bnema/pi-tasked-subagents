@@ -1,5 +1,4 @@
-import {
-  MAX_ASSIGNMENT_ARCHIVE_BYTES,
+import { MAX_ASSIGNMENT_ARCHIVE_BYTES,
   MAX_CHECKPOINT_BYTES,
   MAX_POINTER_BYTES,
   MAX_RECENT_ASSIGNMENT_REFS,
@@ -8,6 +7,7 @@ import {
   MAX_TASK_RUN_OBJECT_BYTES,
   STATE_POINTER_VERSION,
 } from "../defaults.js";
+import { normalizeAssignmentUsage } from "../assignment-usage.js";
 import type { TaskRunRecord, TaskedSubagentsState } from "../types.js";
 import {
   MAX_ARCHIVE_ARTIFACT_LABEL_BYTES,
@@ -184,6 +184,10 @@ function validArchiveEvidence(value: unknown): boolean {
     boundedText(input.criterionId, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES) && boundedText(input.evidence, MAX_ARCHIVE_CRITERION_EVIDENCE_BYTES));
 }
 
+function validArchiveUsage(value: unknown): boolean {
+  return value === undefined || normalizeAssignmentUsage(value) !== undefined;
+}
+
 function validArchive(archive: unknown): archive is AssignmentArchiveV1 {
   const input = record(archive);
   const identityKeys = ["assignmentId", "taskRunId", "groupId", "taskId", "status", "runId", "resultId", "resultUnavailableReason", "completedAt"];
@@ -194,14 +198,18 @@ function validArchive(archive: unknown): archive is AssignmentArchiveV1 {
     (input.resultId !== undefined && !isResultId(input.resultId)) ||
     (input.resultUnavailableReason !== undefined && input.resultUnavailableReason !== "missing-legacy-result") ||
     ((input.resultId === undefined) === (input.resultUnavailableReason === undefined))) return false;
-  if (input.detailOmitted === true) return exactKeys(input, [...identityKeys, "detailOmitted"]);
-  if (!exactKeys(input, [...identityKeys, "summary", "criteriaEvidence", "artifacts", "followUps"]) ||
+  if (input.detailOmitted === true) {
+    const metadataKeys = [...identityKeys, "detailOmitted", "usage"];
+    if (!exactKeys(input, metadataKeys)) return false;
+    return validArchiveUsage(input.usage);
+  }
+  if (!exactKeys(input, [...identityKeys, "summary", "criteriaEvidence", "artifacts", "followUps", "usage"]) ||
     !boundedText(input.summary, MAX_ARCHIVE_SUMMARY_BYTES) || !Array.isArray(input.criteriaEvidence) ||
     input.criteriaEvidence.length > MAX_ARCHIVE_CRITERIA_EVIDENCE || !input.criteriaEvidence.every(validArchiveEvidence) ||
     !Array.isArray(input.artifacts) || input.artifacts.length > MAX_ARCHIVE_ARTIFACTS || !input.artifacts.every((item) => validArchiveArtifact(item, input)) ||
     !Array.isArray(input.followUps) || input.followUps.length > MAX_ARCHIVE_FOLLOW_UPS ||
     !input.followUps.every((item) => boundedText(item, MAX_ARCHIVE_FOLLOW_UP_BYTES))) return false;
-  return true;
+  return validArchiveUsage(input.usage);
 }
 
 function validateTaskRunGraph(run: TaskRunRecord): boolean {

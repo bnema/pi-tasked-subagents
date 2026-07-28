@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 
 import { STATE_VERSION } from "../defaults.js";
+import { normalizeAssignmentUsage } from "../assignment-usage.js";
 import { isResultId, isSessionId } from "./storage-paths.js";
 import type {
   ArtifactRef,
@@ -284,6 +285,7 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
   const rawStatus = stringValue(input.status, "queued") as AssignmentStatus;
   const recentActivity = stringList(input.recentActivity).slice(-3);
   const resolvedExternally = normalizeResolvedExternally(input.resolvedExternally);
+  const usage = normalizeAssignmentUsage(input.usage);
   return {
     id,
     taskRunId,
@@ -295,6 +297,7 @@ function normalizeAssignment(raw: unknown, taskRunId: string, groupIdByTaskId: R
     runId: runId ?? launchRef?.runId,
     launchRef,
     result: normalizeResult(input.result, { assignmentId: id, taskRunId, groupId, taskId }),
+    ...(usage === undefined ? {} : { usage }),
     currentTool: optionalString(input.currentTool),
     lastActionAt: optionalTimestamp(input.lastActionAt),
     lastActionSummary: optionalString(input.lastActionSummary),

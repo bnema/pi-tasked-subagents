@@ -35,6 +35,18 @@ export const MAX_POINTER_BYTES = 4 * 1024;
 export const MAX_CHECKPOINT_BYTES = 256 * 1024;
 export const MAX_TASK_RUN_OBJECT_BYTES = 2 * 1024 * 1024;
 export const MAX_ASSIGNMENT_ARCHIVE_BYTES = 256 * 1024;
+/** Immutable terminal result file bound for public assignment-scoped reads. */
+export const MAX_RUN_RESULT_BYTES = 2 * 1024 * 1024;
+/** Per-child parsed assignment report bound in terminal results. */
+export const MAX_ASSIGNMENT_REPORT_BYTES = 256 * 1024;
+/** Root terminal result summary bound. */
+export const MAX_RESULT_SUMMARY_BYTES = 16 * 1024;
+/** Maximum children in a single terminal result payload. */
+export const MAX_RESULT_CHILDREN = 1_000;
+/** Maximum deduped model labels stored on assignment usage (Phase 4). */
+export const MAX_USAGE_MODELS = 8;
+/** Per-model usage label bound in terminal results (Phase 4). */
+export const MAX_USAGE_MODEL_BYTES = 128;
 export const MAX_RECOVERABLE_TASK_RUNS = 100;
 export const MAX_RECENT_COMPLETED = 20;
 export const MAX_RECENT_ASSIGNMENT_REFS = 1_000;

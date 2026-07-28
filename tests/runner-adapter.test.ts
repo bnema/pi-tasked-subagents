@@ -10,6 +10,14 @@ import { readProcessStartTime } from "../src/launcher/process-identity.mjs";
 import { PiRunnerAdapter } from "../src/launcher/pi-runner-adapter.js";
 import type { SubagentRunHandle } from "../src/types.js";
 
+const fastTerminationTiming = {
+  graceMs: 50,
+  pollMs: 5,
+  forceWaitMs: 200,
+  deadlineMs: 2_000,
+  discoveryPollMs: 5,
+};
+
 async function pollUntil(check: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -49,6 +57,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
       const adapter = new PiRunnerAdapter({
         piBin: sleeper,
         dataRoot: root,
+        terminationTiming: fastTerminationTiming,
         resultIdFactory: () => ids.shift() ?? "cccccccccccccccccccccccccccccccc",
       });
       const request = {
@@ -78,6 +87,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
       expect(JSON.parse(await readFile(path.join(second.asyncDir, "status.json"), "utf8"))).not.toMatchObject({ state: "paused" });
 
       await adapter.cancelRun(second, ctx);
+      await expect(adapter.isRunAlive(second)).resolves.toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -200,7 +210,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
   test("removes a tracked adapter launch when its runner child exits", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
     try {
-      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root, terminationTiming: fastTerminationTiming });
       await adapter.launchTaskGraph({
         runId: "run-cleanup", title: "Run", taskSummary: "Run",
         tasks: [{ assignmentId: "a1", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" }],
@@ -424,7 +434,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
     try {
       const overrideResultPath = path.join(root, "override-results", "run-override.json");
-      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root, terminationTiming: fastTerminationTiming });
       const handle = await adapter.launchTaskGraph({
         runId: "run-override",
         title: "Run",
@@ -474,7 +484,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
   test("writes task_graph runner config", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-test-"));
     try {
-      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root, terminationTiming: fastTerminationTiming });
       const ref = await adapter.launchTaskGraph({
         runId: "run-1",
         title: "Run",
@@ -638,7 +648,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
         ],
       }), "utf8");
 
-      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root, terminationTiming: fastTerminationTiming });
       const handle: SubagentRunHandle = {
         runId: "run-restored",
         asyncId: "run-restored",
@@ -689,9 +699,9 @@ describe("PiRunnerAdapter task graph boundary", () => {
         runId: "run-stale-pid", asyncId: "run-stale-pid", sessionId: "test", asyncDir, resultId,
         resultPath, resultReservationPath: `${resultPath}.reservation`, assignments: [],
       };
-      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root });
+      const adapter = new PiRunnerAdapter({ piBin: "true", dataRoot: root, terminationTiming: fastTerminationTiming });
       await expect(adapter.isRunAlive(handle)).resolves.toBe(false);
-      await expect(adapter.stopRun(handle, { cwd: process.cwd(), sessionId: "test", pi: {} as never })).resolves.toBe(true);
+      await expect(adapter.stopRun(handle, { cwd: process.cwd(), sessionId: "test", pi: {} as never })).resolves.toBe(false);
       expect(() => process.kill(child.pid!, 0)).not.toThrow();
     } finally {
       child.kill("SIGKILL");
@@ -741,5 +751,32 @@ describe("PiRunnerAdapter task graph boundary", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("getRunResult prefers canonical child.report for new launches and legacy rawOutput for old results", async () => {
+    const report = {
+      taskRunId: "task-run-1",
+      groupId: "main",
+      taskId: "t1",
+      assignmentId: "a1",
+      status: "completed",
+      summary: "canonical only",
+      criteriaEvidence: [{ criteriaIndex: 0, evidence: "ok" }],
+    };
+    await withLaunchedAdapter("run-canonical", {
+      state: "complete",
+      success: true,
+      results: [{ stepId: "a1", status: "completed", summary: "canonical only", report }],
+    }, async (adapter, handle) => {
+      await expect(adapter.getRunResult(handle)).resolves.toBe(JSON.stringify(report));
+    });
+
+    await withLaunchedAdapter("run-legacy", {
+      state: "complete",
+      success: true,
+      rawOutput: "legacy root output",
+    }, async (adapter, handle) => {
+      await expect(adapter.getRunResult(handle)).resolves.toBe("legacy root output");
+    });
   });
 });
