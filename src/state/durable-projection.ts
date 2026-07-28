@@ -8,6 +8,7 @@ import {
 } from "../defaults.js";
 import type {
   ArtifactRef,
+  AssignmentUsage,
   TaskResultRecord,
   TaskRunRecord,
   TaskRunStatus,
@@ -57,6 +58,7 @@ interface AssignmentArchiveInputBase {
   followUps: string[];
   runId: string;
   completedAt: number;
+  usage?: AssignmentUsage;
 }
 
 type AssignmentArchiveInputResult =
@@ -217,6 +219,7 @@ function archiveMetadata(input: AssignmentArchiveInput): AssignmentArchiveV1 {
     runId: input.runId,
     ...archiveResultState(input),
     completedAt: input.completedAt,
+    ...(input.usage === undefined ? {} : { usage: input.usage }),
     detailOmitted: true,
   };
 }
@@ -241,6 +244,7 @@ export function projectAssignmentArchive(input: AssignmentArchiveInput): Assignm
     runId: input.runId,
     ...archiveResultState(input),
     completedAt: input.completedAt,
+    ...(input.usage === undefined ? {} : { usage: input.usage }),
   };
   try {
     return utf8Bytes({ storeVersion: 1, kind: "assignment", payload: archive }) <= MAX_ASSIGNMENT_ARCHIVE_BYTES

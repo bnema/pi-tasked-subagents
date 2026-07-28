@@ -32,6 +32,25 @@ function completeReport({ taskRun, assignment }: ReturnType<typeof setup>): Suba
 }
 
 describe("task result reducer", () => {
+  test("stores assignment usage when provided", () => {
+    const fixture = setup();
+    const usage = {
+      input: 10,
+      output: 5,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      totalTokens: 15,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      assistantCalls: 1,
+      toolCalls: 0,
+      models: ["gpt-4"],
+    };
+    const result = applySubagentTaskReport(fixture.taskRun, completeReport(fixture), { now: 3, usage });
+    expect(result.applied).toBe(true);
+    expect(fixture.assignment.usage).toEqual(usage);
+  });
+
   test("applies evidence and completes task when all criteria are covered", () => {
     const fixture = setup();
     const { taskRun, assignment } = fixture;

@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 
 import { MAX_RECENT_COMPLETED } from "../defaults.js";
+import { formatUsageSummary } from "../assignment-usage.js";
 import type { AssignmentArchiveV1, RestoredCompletedHistoryV1 } from "../state/durable-types.js";
 import type { AgentProfile } from "../launcher/agent-profiles.js";
 import type { TaskAssignmentRecord, TaskGroupRecord, TaskRecord, TaskRunRecord, TaskedSubagentsState } from "../types.js";
@@ -445,6 +446,8 @@ function formatAssignmentDetail(taskRun: TaskRunRecord, assignment: TaskAssignme
   const lines = [`Assignment: ${assignment.id}`, `  status: ${statusLabel(assignment.status)}`, assignment.supersededByAssignmentId ? `  historical: superseded by ${assignment.supersededByAssignmentId}` : undefined, `  taskRun: ${taskRun.id} · ${taskRun.title}`, assignment.groupId ? `  group: ${assignment.groupId}` : undefined, `  task: ${assignment.taskId}`, `  agent: ${assignment.agent}`]
     .filter((line): line is string => Boolean(line));
   if (assignment.result?.summary) lines.push(`  result: ${assignment.result.summary}`);
+  const usageLine = formatUsageSummary(assignment.usage);
+  if (usageLine) lines.push(`  usage: ${usageLine}`);
   if (assignment.resolvedExternally) lines.push(`  resolved externally: ${assignment.resolvedExternally.reason}`);
   if (assignment.result?.followUps.length) {
     lines.push("", "Follow-ups:");
@@ -460,6 +463,7 @@ export function formatResultReport(state: TaskedSubagentsState, targetId: string
   if (assignments.length === 0) return `No assignments for result target: ${targetId}. Use /tasked-subagents inspect ${targetId} for details.`;
   if (assignments.length === 1) {
     const assignment = findAssignment(state, assignments[0].id);
+    // Never dump the whole launch/result file here; assignment metadata is the compact fallback.
     return assignment ? formatAssignmentDetail(assignment.taskRun, assignment.assignment) : `Assignment not found: ${targetId}.`;
   }
   return [

@@ -25,6 +25,21 @@ import { canonicalJson, utf8Bytes } from "../src/state/canonical-json.js";
 import type { AssignmentArchiveV1 } from "../src/state/durable-types.js";
 import { syntheticState, syntheticTaskRun } from "./persistence-fixtures.js";
 
+function sampleUsage() {
+  return {
+    input: 100,
+    output: 50,
+    cacheRead: 10,
+    cacheWrite: 5,
+    reasoning: 2,
+    totalTokens: 167,
+    cost: { input: 0.001, output: 0.002, cacheRead: 0.0001, cacheWrite: 0.0002, total: 0.0033 },
+    assistantCalls: 1,
+    toolCalls: 2,
+    models: ["gpt-4"],
+  };
+}
+
 function archiveRef(index: number, completedAt = index): ArchiveRef {
   return {
     assignmentId: `assignment-${index}`,
@@ -174,6 +189,31 @@ describe("durable projection", () => {
     expect(first.artifacts.every((artifact) => utf8Bytes(artifact.path) <= MAX_ARCHIVE_ARTIFACT_PATH_BYTES)).toBe(true);
     expect(first.followUps).toHaveLength(MAX_ARCHIVE_FOLLOW_UPS);
     expect(first.followUps.every((followUp) => utf8Bytes(followUp) <= MAX_ARCHIVE_FOLLOW_UP_BYTES)).toBe(true);
+  });
+
+  it("preserves assignment usage on durable task runs and archives", () => {
+    const run = syntheticTaskRun(1, "completed");
+    run.assignments[0].usage = sampleUsage();
+    const projected = projectTaskRun(run);
+    expect(projected).toEqual({ ok: true, value: expect.anything() });
+    if (!projected.ok) return;
+    expect(projected.value.assignments[0].usage).toEqual(sampleUsage());
+
+    const archive = projectAssignmentArchive({
+      assignmentId: "assignment-1",
+      taskRunId: "task-run-1",
+      taskId: "task-1",
+      status: "completed",
+      summary: "summary",
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: [],
+      runId: "run-1",
+      resultId: "result-1",
+      completedAt: 1,
+      usage: sampleUsage(),
+    });
+    expect(archive).toMatchObject({ usage: sampleUsage() });
   });
 
   it("falls back to metadata only when normalized archive detail remains too large", () => {

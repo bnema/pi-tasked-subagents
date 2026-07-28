@@ -1,4 +1,4 @@
-import type { ArtifactRef, AssignmentStatus, TaskResultRecord } from "../types.js";
+import type { ArtifactRef, AssignmentStatus, AssignmentUsage, TaskResultRecord } from "../types.js";
 
 export type TerminalAssignmentArchiveStatus = Extract<AssignmentStatus, "completed" | "failed" | "skipped" | "cancelled">;
 
@@ -84,12 +84,14 @@ export type AssignmentArchiveDetailV1 = AssignmentArchiveIdentityV1 & Assignment
   criteriaEvidence: TaskResultRecord["criteriaEvidence"];
   artifacts: ArtifactRef[];
   followUps: string[];
+  usage?: AssignmentUsage;
   detailOmitted?: never;
 };
 
 /** Last-resort archive that retains exact identities but no unbounded detail. */
 export type AssignmentArchiveMetadataOnlyV1 = AssignmentArchiveIdentityV1 & AssignmentArchiveResultStateV1 & {
   detailOmitted: true;
+  usage?: AssignmentUsage;
 };
 
 export type AssignmentArchiveV1 = AssignmentArchiveDetailV1 | AssignmentArchiveMetadataOnlyV1;

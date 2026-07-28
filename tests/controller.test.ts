@@ -1146,6 +1146,159 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     await expect(controller.getRunResult(assignmentId, first.archiveId)).resolves.toBe("first authoritative output");
   });
 
+  test("assignment-scoped result excludes sibling output and fails closed on bad JSON", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-scoped-result-");
+    const store = new DurableObjectStore(dataRoot);
+    const firstId = "assignment-one";
+    const secondId = "assignment-two";
+    const resultId = "d".repeat(32);
+    const reportFor = (assignmentId: string, summary: string) => JSON.stringify({
+      taskRunId: "run-shared",
+      taskId: "task",
+      assignmentId,
+      status: "completed",
+      summary,
+      criteriaEvidence: [{ criteriaIndex: 0, evidence: `${assignmentId}-evidence` }],
+      followUps: [`${assignmentId}-follow-up`],
+      artifacts: [{ label: `${assignmentId}-art`, path: `/tmp/${assignmentId}` }],
+    });
+    const sharedResult = {
+      state: "complete",
+      success: true,
+      results: [
+        { stepId: firstId, rawOutput: reportFor(firstId, "first sibling summary") },
+        { stepId: secondId, rawOutput: reportFor(secondId, "second sibling summary") },
+      ],
+    };
+    await mkdir(join(dataRoot, "results", "pi-tasked-subagents"), { recursive: true });
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${resultId}.json`), JSON.stringify(sharedResult));
+
+    const createArchive = async (assignmentId: string, summary: string) => {
+      const archive = projectAssignmentArchive({
+        assignmentId,
+        taskRunId: "run-shared",
+        taskId: "task",
+        status: "completed",
+        summary,
+        criteriaEvidence: [{ criteriaIndex: 0, criterionId: "C1", evidence: `${assignmentId}-archive-evidence` }],
+        artifacts: [],
+        followUps: [],
+        runId: "dispatch-shared",
+        resultId,
+        completedAt: 1,
+      });
+      const archiveId = await store.put("assignment", archive, 256 * 1024);
+      await store.linkAssignmentArchive("pi-tasked-subagents", assignmentId, archiveId);
+      return { archive, archiveId };
+    };
+    const first = await createArchive(firstId, "first archive summary");
+    const second = await createArchive(secondId, "second archive summary");
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { dataRoot }));
+    controller.restoreState({ version: 4, taskRuns: [], updatedAt: 1 }, [
+      {
+        assignmentId: secondId,
+        assignmentIdHash: sha256Hex(secondId),
+        archiveId: second.archiveId,
+        resultId,
+        taskRunId: "run-shared",
+        completedAt: 1,
+      },
+      {
+        assignmentId: firstId,
+        assignmentIdHash: sha256Hex(firstId),
+        archiveId: first.archiveId,
+        resultId,
+        taskRunId: "run-shared",
+        completedAt: 1,
+      },
+    ]);
+
+    const scoped = await controller.getRunResult(secondId);
+    expect(scoped).toContain("second sibling summary");
+    expect(scoped).toContain("assignment-two-evidence");
+    expect(scoped).not.toContain("first sibling summary");
+    expect(scoped).not.toContain("assignment-one-evidence");
+
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${resultId}.json`), JSON.stringify({
+      results: [{ stepId: firstId, rawOutput: reportFor(firstId, "only first") }],
+    }));
+    const fallback = await controller.getRunResult(secondId);
+    expect(fallback).toContain("Assignment: assignment-two");
+    expect(fallback).toContain("second archive summary");
+    expect(fallback).not.toContain("only first");
+
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${resultId}.json`), "{ not-json");
+    await expect(controller.getRunResult(secondId)).resolves.toBe(
+      "Result is unavailable: the durable result exceeds its size limit.",
+    );
+
+    await writeFile(
+      join(dataRoot, "results", "pi-tasked-subagents", `${resultId}.json`),
+      `${"{\"results\":["}${"x".repeat(2 * 1024 * 1024 + 8)}`,
+    );
+    await expect(controller.getRunResult(secondId)).resolves.toBe(
+      "Result is unavailable: the durable result exceeds its size limit.",
+    );
+  });
+
+  test("assignment-scoped result prefers canonical child.report over legacy rawOutput", async () => {
+    const dataRoot = await createControllerDataRoot("tasked-canonical-result-");
+    const store = new DurableObjectStore(dataRoot);
+    const assignmentId = "assignment-canonical";
+    const resultId = "e".repeat(32);
+    const report = {
+      taskRunId: "run-shared",
+      taskId: "task",
+      assignmentId,
+      status: "completed" as const,
+      summary: "canonical summary",
+      criteriaEvidence: [{ criteriaIndex: 0, evidence: "canonical evidence" }],
+      followUps: [],
+      artifacts: [],
+    };
+    await mkdir(join(dataRoot, "results", "pi-tasked-subagents"), { recursive: true });
+    await writeFile(join(dataRoot, "results", "pi-tasked-subagents", `${resultId}.json`), JSON.stringify({
+      state: "complete",
+      success: true,
+      results: [{
+        stepId: assignmentId,
+        status: "completed",
+        summary: "canonical summary",
+        report,
+        rawOutput: JSON.stringify({ ...report, summary: "legacy summary" }),
+      }],
+    }));
+    const archive = projectAssignmentArchive({
+      assignmentId,
+      taskRunId: "run-shared",
+      taskId: "task",
+      status: "completed",
+      summary: "archive summary",
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: [],
+      runId: "dispatch-shared",
+      resultId,
+      completedAt: 1,
+    });
+    const archiveId = await store.put("assignment", archive, 256 * 1024);
+    await store.linkAssignmentArchive("pi-tasked-subagents", assignmentId, archiveId);
+    const controller = asTaskRunApi(new TaskedSubagentsController(fakePi(), { dataRoot }));
+    controller.restoreState({ version: 4, taskRuns: [], updatedAt: 1 }, [{
+      assignmentId,
+      assignmentIdHash: sha256Hex(assignmentId),
+      archiveId,
+      resultId,
+      taskRunId: "run-shared",
+      completedAt: 1,
+    }]);
+
+    const scoped = await controller.getRunResult(assignmentId);
+    expect(scoped).toContain("canonical summary");
+    expect(scoped).toContain("canonical evidence");
+    expect(scoped).not.toContain("legacy summary");
+  });
+
   test("restore fencing preserves selected archive result lookup when tree restore later fails", async () => {
     const dataRoot = await createControllerDataRoot("tasked-result-");
     const store = new DurableObjectStore(dataRoot);
