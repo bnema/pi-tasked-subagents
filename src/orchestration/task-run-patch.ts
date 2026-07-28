@@ -22,6 +22,7 @@ function taskToInput(task: TaskRecord): TaskInput {
     dependsOn: task.dependsOn,
     agentHint: task.agentHint,
     filesHint: task.filesHint,
+    skills: task.skills,
     cwd: task.cwd,
     retries: task.retries,
     outputMode: task.outputMode,

@@ -11,6 +11,7 @@ import {
   applyPublishedTerminalResult,
   armRunnerTermination,
   buildTerminalPublicationPayload,
+  buildPiArgs,
   canonicalizeChildResult,
   evaluateTaskGraphCondition,
   getReadyTaskGraphStepIds,
@@ -64,6 +65,31 @@ async function waitForProcessIdentity(pid: number, timeoutMs = 1_000): Promise<v
   }
   throw new Error("process identity was not ready");
 }
+
+describe("child Pi argument construction", () => {
+  test("passes explicit skills while allowing discovery to be disabled", () => {
+    const args = buildPiArgs({
+      id: "task-1",
+      agent: "delegate",
+      prompt: "Complete the task.",
+      cwd: process.cwd(),
+      sessionDir: "/tmp/child-session",
+      outputFile: "output.log",
+      taskSummary: "Complete the task.",
+      skills: ["/repo/.agents/skills/testing", "/repo/.agents/skills/review"],
+      inheritSkills: false,
+    });
+
+    expect(args).toEqual([
+      "--mode", "json",
+      "--session-dir", "/tmp/child-session",
+      "--no-skills",
+      "--skill", "/repo/.agents/skills/testing",
+      "--skill", "/repo/.agents/skills/review",
+      "Complete the task.",
+    ]);
+  });
+});
 
 describe("runner process identities", () => {
   test("registers a child error listener before awaiting process identity I/O", async () => {

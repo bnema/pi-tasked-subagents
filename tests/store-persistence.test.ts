@@ -175,6 +175,15 @@ describe("task-run state store", () => {
     expect(restored.taskRuns[0].tasks[0].expansionMode).toBe("append_tasks");
   });
 
+  test("preserves explicit task skills when restoring task-run state", () => {
+    const skilledState: TaskedSubagentsState = structuredClone(currentState);
+    skilledState.taskRuns[0].tasks[0].skills = ["/repo/.agents/skills/testing"];
+
+    const restored = deserializeState(serializeState(skilledState));
+
+    expect(restored.taskRuns[0].tasks[0].skills).toEqual(["/repo/.agents/skills/testing"]);
+  });
+
   test("preserves valid assignment supersession metadata when restoring state", () => {
     const supersededState: TaskedSubagentsState = structuredClone(currentState);
     const old = supersededState.taskRuns[0].assignments[0];

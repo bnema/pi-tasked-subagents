@@ -72,6 +72,18 @@ Targeted `clear` removes one inactive TaskRun. `clear scope=all` cancels active 
 
 Use `patch_task_run` when triage or planning discovers additional groups or tasks for the same visible TaskRun. This appends new task ids and new or updated groups without replacing completed tasks or assignment history.
 
+Tasks may request explicit Pi skills by path. Each child remains a fresh Pi session, and the runner passes these paths through as repeatable `--skill` arguments:
+
+```json
+{
+  "text": "Implement the feature",
+  "criteria": ["The feature is tested"],
+  "skills": ["/path/to/.agents/skills/test-driven-development"]
+}
+```
+
+Skill discovery remains enabled by default; explicit skills can be combined with an agent profile that sets `inheritSkills: false` when only the requested skills should load.
+
 Planner tasks may opt into expansion with `expansionMode: "append_tasks"`. Those tasks can return `taskRunPatch` in their final JSON report, and the controller appends groups and tasks as visible TaskRun records before dispatch continues.
 
 ## Session state and results

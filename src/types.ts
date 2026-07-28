@@ -89,6 +89,7 @@ export interface TaskInput {
   dependsOn?: string[];
   agentHint?: string;
   filesHint?: string[];
+  skills?: string[];
   cwd?: string;
   retries?: number;
   outputMode?: OutputMode;
@@ -208,6 +209,7 @@ export interface TaskRecord {
   assignmentIds: string[];
   agentHint?: string;
   filesHint?: string[];
+  skills?: string[];
   cwd?: string;
   retries?: number;
   outputMode?: OutputMode;
@@ -417,6 +419,7 @@ export interface LaunchTaskEntry {
   prompt: string;
   taskSummary: string;
   dependsOn?: string[];
+  skills?: string[];
   retries?: number;
   outputMode?: OutputMode;
   outputSchema?: string;

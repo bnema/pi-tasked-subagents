@@ -564,6 +564,7 @@ export class PiRunnerAdapter implements SubagentRuntime<RunnerRuntimeContext> {
         taskSummary: entry.taskSummary,
         prompt: entry.prompt,
         cwd,
+        skills: entry.skills,
         sessionDir: childSessionDir(asyncDir, index),
         outputFile: childOutputFile(index),
         retries: entry.retries,

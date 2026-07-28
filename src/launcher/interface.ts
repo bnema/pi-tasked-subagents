@@ -48,6 +48,7 @@ export interface RunnerChildConfig {
   taskSummary: string;
   prompt: string;
   cwd: string;
+  skills?: string[];
   sessionDir: string;
   outputFile: string;
   retries?: number;

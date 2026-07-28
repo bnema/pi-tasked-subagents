@@ -315,7 +315,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
         title: "Run",
         taskSummary: "Run",
         tasks: [
-          { assignmentId: " a1 ", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do" },
+          { assignmentId: " a1 ", taskRunId: "task-run-1", groupId: "main", taskId: "t1", agent: "delegate", prompt: "do", taskSummary: "do", skills: ["/repo/.agents/skills/testing"] },
           { assignmentId: "a2", taskRunId: "task-run-1", groupId: "main", taskId: "t2", agent: "delegate", prompt: "do", taskSummary: "do", cwd: "   ", dependsOn: [" a1 "] },
         ],
       }, { cwd: process.cwd(), sessionId: "test", pi: {} as never });
@@ -323,6 +323,7 @@ describe("PiRunnerAdapter task graph boundary", () => {
       const config = JSON.parse(await readFile(path.join(handle.asyncDir, "config.json"), "utf8"));
       expect(handle.assignments.map((assignment) => assignment.assignmentId)).toEqual(["a1", "a2"]);
       expect(config.children.map((child: { id: string }) => child.id)).toEqual(["a1", "a2"]);
+      expect(config.children[0].skills).toEqual(["/repo/.agents/skills/testing"]);
       expect(config.children[1].dependsOn).toEqual(["a1"]);
       expect(config.children[1].cwd).toBe(process.cwd());
     } finally {

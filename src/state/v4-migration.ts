@@ -469,6 +469,10 @@ function strictStringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(nonEmptyString) && new Set(value).size === value.length;
 }
 
+function strictStringListAllowDuplicates(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(nonEmptyString);
+}
+
 function strictLaunchRef(value: unknown, assignmentId: string): boolean {
   const input = record(value);
   if (!input || !nonEmptyString(input.runId) || !nonEmptyString(input.asyncId) || !Array.isArray(input.assignments) ||
@@ -548,6 +552,7 @@ function losslessV4Graph(raw: unknown, normalized: TaskedSubagentsState): boolea
         !hasOptionalString(task, "groupId") || !hasOptionalString(task, "agentHint") || !hasOptionalString(task, "cwd") ||
         !hasOptionalString(task, "outputSchema") || !hasOptionalString(task, "when") || !hasOptionalString(task, "continuation") ||
         (task.filesHint !== undefined && !strictStringList(task.filesHint)) ||
+        (task.skills !== undefined && !strictStringListAllowDuplicates(task.skills)) ||
         (task.retries !== undefined && (!Number.isInteger(task.retries) || (task.retries as number) < 0)) ||
         (task.outputMode !== undefined && task.outputMode !== "text" && task.outputMode !== "json") ||
         (task.expansionMode !== undefined && task.expansionMode !== "append_tasks") ||

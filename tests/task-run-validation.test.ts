@@ -181,6 +181,21 @@ describe("task-run validation", () => {
     );
   });
 
+  test("accepts and normalizes explicit skill paths for tasks", () => {
+    const input = validInput({
+      tasks: [{
+        ...validTask(),
+        skills: [" /repo/.agents/skills/testing ", "/repo/.agents/skills/review"],
+      } as unknown as TaskInput],
+    });
+
+    expect(validateTaskRunInput(input)).toEqual([]);
+    const normalized = normalizeTaskRunInput(input, { taskRunId: "run-1", now: 1 });
+    const task = normalized.taskRun?.tasks[0] as ({ skills?: string[] } | undefined);
+
+    expect(task?.skills).toEqual(["/repo/.agents/skills/testing", "/repo/.agents/skills/review"]);
+  });
+
   test("accepts append task expansion mode", () => {
     expect(validateTaskRunInput(validInput({
       tasks: [validTask({ id: "triage", expansionMode: "append_tasks" })],
@@ -201,6 +216,7 @@ describe("task-run validation", () => {
           criteria: "Done." as unknown as string[],
           dependsOn: "upstream" as unknown as string[],
           filesHint: ["src/types.ts", 42] as unknown as string[],
+          skills: ["/repo/.agents/skills/testing", 42] as unknown as string[],
         }),
       ],
     });
@@ -209,6 +225,7 @@ describe("task-run validation", () => {
       "Task task-1 criteria must be a list",
       "Task task-1 dependencies must be a list",
       "Task task-1 filesHint contains an invalid entry at index 2",
+      "Task task-1 skills contains an invalid entry at index 2",
     ]));
   });
 

@@ -991,12 +991,16 @@ describe("TaskedSubagentsController TaskRun public API", () => {
   test("setTasks creates a TaskRun and dispatches assignments with taskRunId prompts", async () => {
     const runtime = new CompletingRuntime();
     const { controller } = controllerWith(runtime);
+    const input = {
+      ...baseSetTasks,
+      tasks: [{ ...baseSetTasks.tasks[0], skills: ["/repo/.agents/skills/testing"] }],
+    } satisfies SetTasksInput;
 
-    await expect(controller.setTasks(baseSetTasks)).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-1", dispatchScheduled: true });
+    await expect(controller.setTasks(input)).resolves.toMatchObject({ accepted: true, taskRunId: "task-run-1", dispatchScheduled: true });
     await controller.awaitLastWork();
 
     expect(runtime.requests).toHaveLength(1);
-    expect(runtime.requests[0].tasks[0]).toMatchObject({ taskRunId: "task-run-1", groupId: "main", taskId: "task", agent: "delegate" });
+    expect(runtime.requests[0].tasks[0]).toMatchObject({ taskRunId: "task-run-1", groupId: "main", taskId: "task", agent: "delegate", skills: ["/repo/.agents/skills/testing"] });
     expect(runtime.requests[0].tasks[0].prompt).toContain("taskRunId");
     expect(runtime.requests[0].tasks[0].prompt).toContain("task-run-1");
     expect(runtime.requests[0].tasks[0].prompt).not.toContain("planId");
@@ -1608,10 +1612,11 @@ describe("TaskedSubagentsController TaskRun public API", () => {
     });
     await controller.awaitLastWork();
 
-    await expect(controller.editTask({ taskRunId: "task-run-1", targetId: "second", task: { text: "Do second again", criteria: ["Second redone"] } })).resolves.toMatchObject({ edited: true, taskRunId: "task-run-1", taskId: "second", dispatchScheduled: true });
+    await expect(controller.editTask({ taskRunId: "task-run-1", targetId: "second", task: { text: "Do second again", criteria: ["Second redone"], skills: ["/repo/.agents/skills/review"] } })).resolves.toMatchObject({ edited: true, taskRunId: "task-run-1", taskId: "second", dispatchScheduled: true });
     await controller.awaitLastWork();
 
     expect(runtime.requests.at(-1)?.tasks.map((task) => task.taskId)).toEqual(["second"]);
+    expect(runtime.requests.at(-1)?.tasks[0]?.skills).toEqual(["/repo/.agents/skills/review"]);
     const second = controller.getState().taskRuns[0].tasks.find((task) => task.id === "second");
     expect(second).toMatchObject({ text: "Do second again", status: "completed" });
     expect(second?.criteria.map((criterion) => criterion.text)).toEqual(["Second redone"]);

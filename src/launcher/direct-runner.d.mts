@@ -14,5 +14,6 @@ export function resetRunnerTerminationForTests(): void;
 export function isRunnerTerminating(): boolean;
 export function settleOwnedProcessTermination(options?: Record<string, unknown>): Promise<{ quiet: boolean }>;
 export function buildTerminalPublicationPayload(results: Array<Record<string, unknown>>, timestamp?: number): Record<string, unknown>;
+export function buildPiArgs(child: Record<string, unknown>, promptOverride?: string): string[];
 export function canonicalizeChildResult(child: Record<string, unknown>, merged: Record<string, unknown>): Record<string, unknown>;
 export function runTaskGraph(config: Record<string, unknown>, status: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;

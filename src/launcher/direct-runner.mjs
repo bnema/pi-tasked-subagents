@@ -389,6 +389,11 @@ function appendPiChildArgs(args, child) {
   if (Array.isArray(child.tools) && child.tools.length > 0) args.push("--tools", child.tools.join(","));
   if (child.inheritProjectContext === false) args.push("--no-context-files");
   if (child.inheritSkills === false) args.push("--no-skills");
+  if (Array.isArray(child.skills)) {
+    for (const skill of child.skills) {
+      if (typeof skill === "string" && skill.trim()) args.push("--skill", skill.trim());
+    }
+  }
   if (child.systemPrompt) {
     args.push(child.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", child.systemPrompt);
   }

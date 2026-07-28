@@ -188,6 +188,7 @@ export function validateTaskRunInput(input: unknown): string[] {
     const dependsOn = cleanIdentifierList(task.dependsOn, `Task ${taskId} dependency`, `Task ${taskId} dependencies`, errors);
     if (taskIdResult.value) taskDeps.set(taskIdResult.value, dependsOn);
     cleanTextList(task.filesHint, `Task ${taskId} filesHint`, errors);
+    cleanTextList(task.skills, `Task ${taskId} skills`, errors);
     const retries = task.retries;
     if (retries !== undefined && (typeof retries !== "number" || !Number.isInteger(retries) || retries < 0)) {
       errors.push(`Task ${taskId} retries must be a non-negative integer`);
@@ -247,6 +248,7 @@ export function validateTaskRunInput(input: unknown): string[] {
 
 function normalizeTask(taskIndex: number, input: TaskInput, now: number): TaskRecord {
   const filesHint = cleanTextList(input.filesHint);
+  const skills = cleanTextList(input.skills);
   return {
     id: cleanIdentifier(input.id, `Task ${taskIndex + 1} id`, { fallback: generatedTaskId(taskIndex) }).value ?? generatedTaskId(taskIndex),
     groupId: cleanIdentifier(input.group, "Task group reference").value,
@@ -262,6 +264,7 @@ function normalizeTask(taskIndex: number, input: TaskInput, now: number): TaskRe
     assignmentIds: [],
     agentHint: cleanText(input.agentHint) || undefined,
     filesHint: filesHint.length > 0 ? filesHint : undefined,
+    skills: skills.length > 0 ? skills : undefined,
     cwd: cleanText(input.cwd) || undefined,
     retries: input.retries,
     outputMode: input.outputMode === "text" || input.outputMode === "json" ? input.outputMode : undefined,

@@ -402,6 +402,7 @@ export function toLaunchTaskEntries(assignments: TaskAssignmentRecord[], taskRun
       outputMode: task?.outputMode ?? "json",
       outputSchema: task?.outputSchema ?? "SubagentTaskReport JSON object",
       when: task?.when,
+      skills: task?.skills,
       cwd: task?.cwd ?? (assignment as TaskAssignmentWithLaunchDefaults).cwd ?? options.defaultCwd,
     } satisfies LaunchTaskEntry;
   });

@@ -111,6 +111,7 @@ function normalizeTask(raw: unknown): TaskRecord | undefined {
     return undefined;
   }
   const filesHint = stringList(input.filesHint);
+  const skills = stringList(input.skills);
   const resolvedExternally = normalizeResolvedExternally(input.resolvedExternally);
   const criteria = input.criteria.map((criterion, criterionIndex) => {
     if (typeof criterion === "string") {
@@ -129,6 +130,7 @@ function normalizeTask(raw: unknown): TaskRecord | undefined {
     assignmentIds: stringList(input.assignmentIds),
     agentHint: optionalString(input.agentHint),
     filesHint: filesHint.length > 0 ? filesHint : undefined,
+    skills: skills.length > 0 ? skills : undefined,
     cwd: optionalString(input.cwd),
     retries: typeof input.retries === "number" && Number.isInteger(input.retries) && input.retries >= 0 ? input.retries : undefined,
     outputMode: input.outputMode === "json" ? "json" : input.outputMode === "text" ? "text" : undefined,

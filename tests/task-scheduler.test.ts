@@ -391,7 +391,7 @@ describe("task scheduler", () => {
     const taskRun = makeTaskRun({
       groups: [{ id: "main", title: "Main", maxConcurrency: 2 }],
       tasks: [
-        { id: "one", group: "main", text: "Do one", criteria: ["One done"], outputMode: "text", outputSchema: "Plain completion notes" },
+        { id: "one", group: "main", text: "Do one", criteria: ["One done"], skills: ["/repo/.agents/skills/testing"], outputMode: "text", outputSchema: "Plain completion notes" },
         { id: "two", group: "main", text: "Do two", criteria: ["Two done"] },
       ],
     });
@@ -406,6 +406,7 @@ describe("task scheduler", () => {
       taskId: "one",
       outputMode: "text",
       outputSchema: "Plain completion notes",
+      skills: ["/repo/.agents/skills/testing"],
       cwd: "/repo",
     });
     expect(entries[1]).toMatchObject({
