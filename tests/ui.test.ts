@@ -1,7 +1,8 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 
-import type { TaskedSubagentsState } from "../src/types.js";
+import type { TaskAssignmentRecord, TaskedSubagentsState } from "../src/types.js";
+import { GLYPH_ATTENTION, GLYPH_FAILED, GLYPH_PAUSED, GLYPH_QUEUED } from "../src/ui/glyphs.js";
 import { buildFooterStatus } from "../src/ui/status.js";
 import { buildTaskRunChecklistLines, buildWidgetLines, createWidgetContent } from "../src/ui/widget.js";
 import { statusLabel } from "../src/ui/messages.js";
@@ -58,6 +59,113 @@ const state: TaskedSubagentsState = {
 
 function cloneState(input: TaskedSubagentsState): TaskedSubagentsState {
   return JSON.parse(JSON.stringify(input)) as TaskedSubagentsState;
+}
+
+function triageFixture(): TaskedSubagentsState {
+  const s = cloneState(state);
+  const run = s.taskRuns[0];
+  run.title = "Execute stacked native Vim mode tranches";
+  run.groups = [
+    { id: "p1r", title: "Phase 1 reviews", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "p2", title: "Phase 2", status: "running", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "p3", title: "Phase 3", status: "blocked", dependsOn: ["p2"], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "p4", title: "Phase 4", status: "blocked", dependsOn: ["p3"], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+  ];
+  run.tasks = [
+    { id: "t-review", groupId: "p1r", text: "Quality review Phase 1", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["a-review"], createdAt: 1, updatedAt: 1 },
+    { id: "t-impl", groupId: "p2", text: "Implement Task 1 via TDD", status: "running", criteria: [], dependsOn: [], assignmentIds: ["a-impl"], createdAt: 1, updatedAt: 1 },
+    { id: "t-next", groupId: "p2", text: "Implement Task 2 via TDD", status: "ready", criteria: [], dependsOn: ["t-impl"], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+    { id: "t-b1", groupId: "p3", text: "Wire pending dispatch", status: "blocked", criteria: [], dependsOn: ["t-impl"], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+    { id: "t-b2", groupId: "p4", text: "CEF capture", status: "blocked", criteria: [], dependsOn: ["t-b1"], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+  ];
+  run.assignments = [
+    {
+      id: "a-review",
+      taskRunId: run.id,
+      groupId: "p1r",
+      taskId: "t-review",
+      agent: "delegate",
+      prompt: "review",
+      status: "attention",
+      result: {
+        assignmentId: "a-review",
+        status: "attention",
+        summary: "awaiting verdict on p1-quality-review",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        createdAt: 2,
+      },
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "a-impl",
+      taskRunId: run.id,
+      groupId: "p2",
+      taskId: "t-impl",
+      agent: "sonnet",
+      prompt: "impl",
+      status: "running",
+      currentTool: "bash",
+      lastActionSummary: "go test ./...",
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ];
+  return s;
+}
+
+/** Three needs-you tasks with reasons plus hidden blocked work (forces a tail under tight limits). */
+function multiAttentionFixture(): TaskedSubagentsState {
+  const s = cloneState(state);
+  const run = s.taskRuns[0];
+  run.title = "Multi attention wrap-up";
+  run.status = "attention";
+  run.groups = [
+    { id: "a1", title: "Review A", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "a2", title: "Review B", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "a3", title: "Review C", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "later", title: "Later phase", status: "blocked", dependsOn: ["a1", "a2", "a3"], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+  ];
+  run.tasks = [
+    { id: "t-a", groupId: "a1", text: "Actionable head A", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["as-a"], createdAt: 1, updatedAt: 1 },
+    { id: "t-b", groupId: "a2", text: "Actionable head B", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["as-b"], createdAt: 1, updatedAt: 1 },
+    { id: "t-c", groupId: "a3", text: "Actionable head C", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["as-c"], createdAt: 1, updatedAt: 1 },
+    { id: "t-wait", groupId: "later", text: "Hidden blocked work", status: "blocked", criteria: [], dependsOn: ["t-a", "t-b", "t-c"], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+  ];
+  const attentionAssignment = (
+    taskRunId: string,
+    assignmentId: string,
+    groupId: string,
+    taskId: string,
+    summary: string,
+  ): TaskAssignmentRecord => ({
+    id: assignmentId,
+    taskRunId,
+    groupId,
+    taskId,
+    agent: "delegate",
+    prompt: `review-${taskId.slice("t-".length)}`,
+    status: "attention",
+    result: {
+      assignmentId,
+      status: "attention",
+      summary,
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: [],
+      createdAt: 2,
+    },
+    createdAt: 1,
+    updatedAt: 1,
+  });
+  run.assignments = [
+    attentionAssignment(run.id, "as-a", "a1", "t-a", "reason for A"),
+    attentionAssignment(run.id, "as-b", "a2", "t-b", "reason for B"),
+    attentionAssignment(run.id, "as-c", "a3", "t-c", "reason for C"),
+  ];
+  return s;
 }
 
 describe("ui", () => {
@@ -117,24 +225,22 @@ describe("ui", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const assignmentLine = lines.find((line) => line.includes("delegate"));
 
-    expect(assignmentLine).toContain("task");
+    expect(assignmentLine).toContain("Do task");
   });
 
-  test("widget renders task run, group, and active assignment in place of the task text", () => {
+  test("widget renders task run, group, and task identity inline with the active assignment", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
     const assignmentLine = lines.find((line) => line.includes("delegate"));
     expect(rendered).toContain("Task run");
-    expect(rendered).toContain("Main group");
-    expect(rendered).not.toContain("Do task");
-    expect(rendered).not.toContain(" · ");
-    expect(assignmentLine).not.toContain("0/1");
-    expect(assignmentLine).toContain("a1");
-    expect(assignmentLine).toContain("delegate");
+    expect(rendered).toContain("Main group · Do task");
+    expect(rendered).toContain("delegate");
     expect(rendered).toContain("tool: bash");
     expect(rendered).toContain("last: reading src/orchestration/controller.ts");
     expect(rendered).toContain("tool start: rg");
     expect(rendered.split("reading src/orchestration/controller.ts")).toHaveLength(2);
+    expect(assignmentLine).not.toContain("a1");
+    expect(assignmentLine).not.toContain("0/1");
   });
 
   test("widget annotates an idle completed action with its age once no tool is active", () => {
@@ -183,22 +289,48 @@ describe("ui", () => {
 
     const rendered = buildWidgetLines(oneOff, 10, undefined, { now: 61_000 }).join("\n");
 
-    expect(rendered).toContain("Ungrouped");
-    expect(rendered).not.toContain("Do task");
+    expect(rendered).not.toContain("Ungrouped");
+    expect(rendered).toContain("Do task");
     expect(rendered).toContain("delegate");
     expect(rendered).toContain("tool: bash");
   });
 
-  test("widget hides the task text and renders the active assignment line at task depth", () => {
+  test("widget tail counts blocked ungrouped work as waiting task only, not waiting group", () => {
+    const s = cloneState(state);
+    const run = s.taskRuns[0];
+    run.title = "Ungrouped blocked";
+    run.status = "pending";
+    run.groups = [];
+    run.tasks = [{
+      id: "t-blocked",
+      text: "Waiting on upstream",
+      status: "blocked",
+      criteria: [],
+      dependsOn: [],
+      assignmentIds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+    run.assignments = [];
+
+    const lines = buildWidgetLines(s, 10, undefined, { now: 61_000 });
+    const tail = lines[lines.length - 1];
+
+    expect(tail).toContain("1 task waiting");
+    expect(tail).not.toContain("group waiting");
+    expect(tail).toContain("0 done");
+  });
+
+  test("widget retains task identity while rendering the active assignment at task depth", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
     const assignmentLine = lines.find((line) => line.includes("delegate"));
 
-    expect(rendered).not.toContain("Do task");
+    expect(rendered).toContain("Main group · Do task");
     expect(assignmentLine).toBeDefined();
     expect(assignmentLine).toContain("delegate");
-    expect(assignmentLine).toContain("a1");
-    expect(assignmentLine?.startsWith("   └ ")).toBe(true);
+    expect(assignmentLine).not.toContain("a1");
+    expect(assignmentLine?.startsWith("└ ")).toBe(true);
   });
 
   test("widget keeps the criteria progress counter on the active assignment line", () => {
@@ -212,18 +344,215 @@ describe("ui", () => {
     const assignmentLine = lines.find((line) => line.includes("delegate"));
 
     expect(assignmentLine).toContain("1/2");
-    expect(lines.join("\n")).not.toContain("Do task");
+    expect(assignmentLine).toContain("Main group · Do task");
+  });
+
+  test("blocked renders muted queued rather than warning paused in compact widget and checklist", () => {
+    const blocked = cloneState(state);
+    blocked.taskRuns[0].groups[0].status = "blocked";
+    blocked.taskRuns[0].tasks[0].status = "blocked";
+    blocked.taskRuns[0].tasks[0].text = "Waiting on upstream task";
+    blocked.taskRuns[0].tasks[0].assignmentIds = [];
+    blocked.taskRuns[0].assignments = [];
+    const trackingTheme = {
+      fg: (colorName: string, text: string) => `${colorName}:${text}`,
+    };
+
+    const lines = buildWidgetLines(blocked, 10, trackingTheme);
+    const widget = lines.join("\n");
+    expect(lines[0]).toContain("Task run");
+    expect(lines[lines.length - 1]).toContain("1 group waiting · 1 task · 0 done");
+    expect(widget).not.toContain("warning:");
+    expect(widget).not.toContain(GLYPH_PAUSED);
+
+    const checklistLine = buildTaskRunChecklistLines(blocked.taskRuns[0], 20).find((line) => line.includes("Waiting on upstream task"));
+    expect(checklistLine).toBeDefined();
+    expect(checklistLine).toContain(GLYPH_QUEUED);
+    expect(checklistLine).not.toContain(GLYPH_PAUSED);
+  });
+
+  test("widget reserves tail summary line when line budget is tight", () => {
+    const lines = buildWidgetLines(triageFixture(), 4, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(lines[1]).toContain("Phase 1 reviews · Quality review Phase 1");
+    expect(lines[2]).toContain("awaiting verdict on p1-quality-review");
+    expect(lines[3]).toContain("3 groups waiting · 4 tasks · 0 done");
+    expect(rendered).not.toContain("Implement Task 1 via TDD");
+    expect(rendered).not.toContain("Implement Task 2 via TDD");
+    expect(rendered).not.toContain("sonnet");
+    expect(rendered).not.toContain("tool: bash");
+    expect(rendered).not.toContain("next:");
+  });
+
+  test("widget limit 4 preserves multiple needs-you heads before reason children when tail is reserved", () => {
+    const lines = buildWidgetLines(multiAttentionFixture(), 4, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toContain("Multi attention wrap-up");
+    expect(lines[1]).toContain("Review A · Actionable head A");
+    expect(lines[2]).toContain("Review B · Actionable head B");
+    expect(lines[3]).toMatch(/\b2 groups waiting\b/u);
+    expect(rendered).not.toContain("Actionable head C");
+    // Reason children may be omitted so same-tier heads survive under the reserved tail.
+    expect(rendered).not.toContain("reason for A");
+    expect(rendered).not.toContain("reason for B");
+    expect(rendered).not.toContain("reason for C");
+  });
+
+  test("widget limit 1 returns only the summary and never appends a tail", () => {
+    const lines = buildWidgetLines(triageFixture(), 1, undefined, { now: 61_000 });
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(lines.join("\n")).not.toContain("waiting");
+  });
+
+  test("widget limit 2 with only an active task keeps the active head", () => {
+    const lines = buildWidgetLines(state, 2, undefined, { now: 61_000 });
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("Tasked");
+    expect(lines[1]).toContain("Main group · Do task");
+  });
+
+  test("widget limit 2 preserves needs-you head instead of replacing it with waiting tail", () => {
+    const lines = buildWidgetLines(triageFixture(), 2, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(lines[1]).toContain("Phase 1 reviews · Quality review Phase 1");
+    expect(rendered).not.toContain("groups waiting");
+    expect(rendered).not.toContain("tasks waiting");
+    expect(rendered).not.toMatch(/\bwaiting\b/u);
+    expect(rendered).not.toMatch(/\bdone\b/u);
+  });
+
+  test("widget limit 3 preserves needs-you ahead of active and next-up", () => {
+    const lines = buildWidgetLines(triageFixture(), 3, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(rendered).toContain("Phase 1 reviews · Quality review Phase 1");
+    expect(rendered).not.toContain("Implement Task 1 via TDD");
+    expect(rendered).not.toContain("next:");
+    expect(rendered).not.toContain("sonnet");
+  });
+
+  test("one attention task and many blocked phases render as triage, not a tree", () => {
+    const lines = buildWidgetLines(triageFixture(), 14, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines[1]).toContain("Phase 1 reviews · Quality review Phase 1");
+    expect(lines[2]).toContain("awaiting verdict on p1-quality-review");
+    expect(rendered).toContain("Phase 2 · Implement Task 1 via TDD");
+    expect(rendered).toContain("sonnet");
+    expect(rendered).toContain("tool: bash");
+    expect(rendered).toContain("next: Phase 2 · Implement Task 2 via TDD · after Implement Task 1 via TDD");
+    expect(lines[lines.length - 1]).toContain("2 groups waiting · 2 tasks · 0 done");
+    expect(rendered).not.toContain("Wire pending dispatch");
+    expect(rendered).not.toContain("CEF capture");
+  });
+
+  test("widget tail excludes cancelled-only groups from waiting group count", () => {
+    const s = cloneState(state);
+    const run = s.taskRuns[0];
+    run.title = "Tail count honesty";
+    run.status = "attention";
+    run.groups = [
+      { id: "attention-g", title: "Needs review", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+      { id: "cancelled-g", title: "Aborted work", status: "cancelled", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+      { id: "waiting-g", title: "Later phase", status: "blocked", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    ];
+    run.tasks = [
+      { id: "t-attn", groupId: "attention-g", text: "Review output", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["a-attn"], createdAt: 1, updatedAt: 1 },
+      { id: "t-cancel", groupId: "cancelled-g", text: "Cancelled task", status: "cancelled", criteria: [], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+      { id: "t-wait", groupId: "waiting-g", text: "Future work", status: "blocked", criteria: [], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+    ];
+    run.assignments = [{
+      id: "a-attn",
+      taskRunId: run.id,
+      groupId: "attention-g",
+      taskId: "t-attn",
+      agent: "delegate",
+      prompt: "review",
+      status: "attention",
+      result: {
+        assignmentId: "a-attn",
+        status: "attention",
+        summary: "needs human input",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        createdAt: 2,
+      },
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    const lines = buildWidgetLines(s, 4, undefined, { now: 61_000 });
+    const tail = lines[lines.length - 1];
+
+    expect(lines[1]).toContain("Needs review · Review output");
+    expect(tail).toContain("1 group waiting");
+    expect(tail).not.toContain("2 groups waiting");
+    expect(tail).not.toMatch(/Aborted work/u);
+  });
+
+  test("failed authoritative assignment renders failed glyph when task status is still attention", () => {
+    const mismatched = cloneState(state);
+    mismatched.taskRuns[0].status = "attention";
+    mismatched.taskRuns[0].tasks[0].status = "attention";
+    mismatched.taskRuns[0].tasks[0].text = "Stale attention task with failed assignment";
+    mismatched.taskRuns[0].assignments[0].status = "failed";
+    mismatched.taskRuns[0].assignments[0].result = {
+      assignmentId: "a1",
+      status: "failed",
+      summary: "assignment failed before task status caught up",
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: [],
+      createdAt: 2,
+    };
+
+    const lines = buildWidgetLines(mismatched, 10, undefined, { now: 61_000 });
+    const taskLine = lines.find((line) => line.includes("Stale attention task with failed assignment"));
+
+    expect(taskLine).toBeDefined();
+    expect(taskLine).toContain(GLYPH_FAILED);
+    expect(taskLine).not.toContain(GLYPH_ATTENTION);
+  });
+
+  test("attention reason falls back to stale note then last action", () => {
+    const s = triageFixture();
+    const review = s.taskRuns[0].assignments[0];
+    delete review.result;
+    review.staleEscalatedAt = 100_000;
+    review.lastActionAt = 40_000;
+    expect(buildWidgetLines(s, 14, undefined, { now: 160_000 }).join("\n")).toContain("no activity for 2m");
+
+    delete review.staleEscalatedAt;
+    review.lastActionSummary = "tool end: bash";
+    expect(buildWidgetLines(s, 14, undefined, { now: 160_000 }).join("\n")).toContain("last: tool end: bash");
   });
 
   test("widget still renders the task text when there is no active assignment", () => {
     const ready = cloneState(state);
     ready.taskRuns[0].tasks[0].status = "ready";
     ready.taskRuns[0].tasks[0].assignmentIds = [];
+    ready.taskRuns[0].tasks[0].dependsOn = ["external-task"];
     ready.taskRuns[0].assignments = [];
 
     const rendered = buildWidgetLines(ready, 10, undefined, { now: 61_000 }).join("\n");
 
+    expect(rendered).toContain("next:");
     expect(rendered).toContain("Do task");
+    expect(rendered).toContain("after external-task");
   });
 
   test("widget indents activity lines exactly one level under the active assignment line", () => {
@@ -231,16 +560,19 @@ describe("ui", () => {
     const assignmentLine = lines.find((line) => line.includes("delegate"));
     const activityLine = lines.find((line) => line.includes("tool: bash"));
 
-    expect(assignmentLine?.startsWith("   └ ")).toBe(true);
-    expect(activityLine?.startsWith("      ├ ")).toBe(true);
+    expect(assignmentLine?.startsWith("└ ")).toBe(true);
+    expect(activityLine?.startsWith("   ├ ")).toBe(true);
   });
 
-  test("widget keeps full assignment labels when they fit", () => {
+  test("widget omits assignment IDs while retaining task and agent labels", () => {
     const labeled = cloneState(state);
     labeled.taskRuns[0].tasks[0].assignmentIds = ["manual-review-a1"];
     labeled.taskRuns[0].assignments[0].id = "manual-review-a1";
 
-    expect(buildWidgetLines(labeled, 10, undefined, { now: 61_000 }).join("\n")).toContain("manual-review-a1");
+    const rendered = buildWidgetLines(labeled, 10, undefined, { now: 61_000 }).join("\n");
+    expect(rendered).toContain("Main group · Do task");
+    expect(rendered).toContain("delegate");
+    expect(rendered).not.toContain("manual-review-a1");
   });
 
   test("widget keeps long assignment and activity labels compact while preserving tool timeline", () => {
@@ -257,7 +589,6 @@ describe("ui", () => {
     const lines = buildWidgetLines(compact, 12, undefined, { now: 23_000 });
     const rendered = lines.join("\n");
 
-    expect(rendered).toContain("a1");
     expect(rendered).not.toContain("task-run-1-tdd-implementation-project-picker-filter-ux-a1");
     expect(rendered).toContain("senior-engineer");
     expect(rendered).toContain("tool: bash");
@@ -293,12 +624,12 @@ describe("ui", () => {
 
     const lines = buildWidgetLines(pendingReduction, 12, undefined, { now: 61_000 });
     const runLine = lines.find((line) => line.includes("Tasked"));
-    const groupLine = lines.find((line) => line.includes("Main group"));
+    const rendered = lines.join("\n");
 
-    expect(runLine).toContain("1/8");
-    expect(groupLine).toContain("1/8");
-    expect(lines.join("\n")).toContain("1 completed");
-    expect(lines.join("\n")).not.toContain("Task 1");
+    expect(runLine).toMatch(/\b1\/8\b/u);
+    expect(rendered).toMatch(/\b1 done\b/u);
+    expect(rendered).toMatch(/\b7 tasks\b/u);
+    expect(rendered).not.toContain("Task 1");
   });
 
   test("widget collapses completed sibling groups so unfinished tasks stay visible", () => {
@@ -355,14 +686,13 @@ describe("ui", () => {
     const rendered = buildWidgetLines(focused, 12, undefined, { now: 61_000 }).join("\n");
 
     expect(rendered).toContain("13/15");
-    expect(rendered).toContain("5/7");
-    expect(rendered).toContain("8 completed");
-    expect(rendered).toContain("5 completed");
-    expect(rendered).toContain("Needs attention after smoke run");
-    expect(rendered).not.toContain("Still running smoke task");
+    expect(rendered).toContain("13 done");
+    expect(rendered).toContain("Active wave · Needs attention after smoke run");
+    expect(rendered).toContain("Active wave · Still running smoke task");
     expect(rendered).toContain("tool: bash");
     expect(rendered).not.toContain("Completed task 1");
     expect(rendered).not.toContain("Active completed task 1");
+    expect(rendered).not.toContain("Completed wave");
   });
 
   test("full checklist renders completed triage with pending generated review tasks", () => {

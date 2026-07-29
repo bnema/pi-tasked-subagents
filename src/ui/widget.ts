@@ -15,7 +15,6 @@ import {
   GLYPH_PAUSED,
   GLYPH_GROUP,
   GLYPH_QUEUED,
-  GLYPH_READY,
   GLYPH_RUNNING,
   GLYPH_TASKED_SUBAGENTS,
   GLYPH_TREE_BRANCH,
@@ -39,6 +38,7 @@ export const COMPACT_WIDGET_MAX_WIDTH = 88;
 
 const SUMMARY_TITLE_WIDTH = 48;
 const GROUP_TITLE_WIDTH = 44;
+const GROUP_PREFIX_WIDTH = 18;
 const TASK_TITLE_WIDTH = 46;
 const ACTIVITY_TEXT_WIDTH = 50;
 const ASSIGNMENT_ID_WIDTH = 24;
@@ -73,18 +73,19 @@ function joinParts(parts: Array<string | undefined>): string {
 function statusColor(status: string): string {
   switch (status) {
     case "running":
-    case "ready":
     case "queued":
       return "accent";
     case "completed":
     case "skipped":
       return "success";
     case "attention":
-    case "blocked":
     case "paused":
     case "failed":
     case "cancelled":
       return "warning";
+    case "ready":
+    case "blocked":
+    case "pending":
     default:
       return "muted";
   }
@@ -92,16 +93,24 @@ function statusColor(status: string): string {
 
 function statusGlyph(status: string): string {
   switch (status) {
-    case "running": return GLYPH_RUNNING;
-    case "ready": return GLYPH_READY;
+    case "running":
+    case "queued":
+      return GLYPH_RUNNING;
     case "completed":
-    case "skipped": return GLYPH_DONE;
-    case "attention": return GLYPH_ATTENTION;
+    case "skipped":
+      return GLYPH_DONE;
+    case "attention":
+      return GLYPH_ATTENTION;
     case "failed":
-    case "cancelled": return GLYPH_FAILED;
+    case "cancelled":
+      return GLYPH_FAILED;
+    case "paused":
+      return GLYPH_PAUSED;
+    case "ready":
     case "blocked":
-    case "paused": return GLYPH_PAUSED;
-    default: return GLYPH_QUEUED;
+    case "pending":
+    default:
+      return GLYPH_QUEUED;
   }
 }
 
@@ -196,34 +205,6 @@ function widgetGroups(taskRun: TaskRunRecord): WidgetGroupView[] {
     : taskRun.groups;
 }
 
-function groupHasUnfinishedWork(taskRun: TaskRunRecord, group: WidgetGroupView): boolean {
-  return tasksForGroup(taskRun, group.id).some((task) => !taskDisplaysDone(taskRun, task));
-}
-
-function groupIsInteresting(taskRun: TaskRunRecord, group: WidgetGroupView): boolean {
-  return group.status !== "pending" || tasksForGroup(taskRun, group.id).some((task) => task.status !== "pending");
-}
-
-function visibleGroups(taskRun: TaskRunRecord): WidgetGroupView[] {
-  const groups = widgetGroups(taskRun);
-  const unfinished = groups.filter((group) => groupHasUnfinishedWork(taskRun, group));
-  const interestingUnfinished = unfinished.filter((group) => groupIsInteresting(taskRun, group));
-  if (interestingUnfinished.length > 0) return interestingUnfinished;
-  const interesting = groups.filter((group) => groupIsInteresting(taskRun, group));
-  return interesting.length > 0 ? interesting : groups;
-}
-
-function visibleTasks(taskRun: TaskRunRecord, group: WidgetGroupView): TaskRecord[] {
-  const unfinished = tasksForGroup(taskRun, group.id).filter((task) => !taskDisplaysDone(taskRun, task));
-  const activeOrNeedsAttention = unfinished.filter((task) => task.status !== "pending");
-  if (activeOrNeedsAttention.length > 0) return activeOrNeedsAttention;
-  return unfinished;
-}
-
-function completedTaskCount(taskRun: TaskRunRecord, group: WidgetGroupView): number {
-  return tasksForGroup(taskRun, group.id).filter((task) => taskDisplaysDone(taskRun, task)).length;
-}
-
 function buildSummaryLine(taskRun: TaskRunRecord, theme?: WidgetThemeLike, options: WidgetBuildOptions = {}): string {
   const progress = taskRunTaskProgress(taskRun);
   return joinParts([
@@ -234,8 +215,54 @@ function buildSummaryLine(taskRun: TaskRunRecord, theme?: WidgetThemeLike, optio
   ]);
 }
 
-function buildGroupLine(taskRun: TaskRunRecord, group: WidgetGroupView, isLast: boolean, theme?: WidgetThemeLike): string {
-  return `${linePrefix(isLast, theme)}${color(GLYPH_GROUP, "accent", theme)} ${bold(shortTitle(group.title, GROUP_TITLE_WIDTH), theme)} ${statusProgressLabel(group.status, groupProgress(taskRun, group), theme)}`;
+function groupTitleForTask(taskRun: TaskRunRecord, task: TaskRecord): string | undefined {
+  return taskRun.groups.find((group) => group.id === task.groupId)?.title;
+}
+
+function triageTaskTitle(taskRun: TaskRunRecord, task: TaskRecord, theme?: WidgetThemeLike): string {
+  const groupTitle = groupTitleForTask(taskRun, task);
+  const title = shortTitle(task.text, TASK_TITLE_WIDTH);
+  return groupTitle ? `${muted(`${shortTitle(groupTitle, GROUP_PREFIX_WIDTH)} · `, theme)}${title}` : title;
+}
+
+function taskNeedsAttention(taskRun: TaskRunRecord, task: TaskRecord): boolean {
+  if (taskDisplaysDone(taskRun, task) || task.status === "cancelled") return false;
+  const assignment = assignmentForTask(taskRun, task);
+  return task.status === "attention" || task.status === "failed"
+    || assignment?.status === "attention" || assignment?.status === "failed" || assignment?.status === "paused";
+}
+
+function attentionReason(assignment: TaskAssignmentRecord | undefined, now: number): string | undefined {
+  if (!assignment) return undefined;
+  if (assignment.result && assignment.result.status !== "completed" && assignment.result.summary) {
+    return compactActivityText(assignment.result.summary);
+  }
+  if (assignment.staleEscalatedAt !== undefined && assignment.lastActionAt !== undefined) {
+    return `no activity for ${formatCompactDuration(now - assignment.lastActionAt)}`;
+  }
+  return assignment.lastActionSummary ? compactActivityText(`last: ${assignment.lastActionSummary}`) : undefined;
+}
+
+function buildTailLine(taskRun: TaskRunRecord, shownTaskIds: Set<string>, theme?: WidgetThemeLike): string | undefined {
+  const done = taskRun.tasks.filter((task) => taskDisplaysDone(taskRun, task)).length;
+  const waitingTasks = taskRun.tasks.filter((task) =>
+    !taskDisplaysDone(taskRun, task) && task.status !== "cancelled" && !shownTaskIds.has(task.id));
+  const waitingGroupCount = taskRun.groups.filter((group) => {
+    const tasks = tasksForGroup(taskRun, group.id);
+    const waitingInGroup = tasks.filter((task) =>
+      !taskDisplaysDone(taskRun, task) && task.status !== "cancelled");
+    return waitingInGroup.length > 0 && !waitingInGroup.some((task) => shownTaskIds.has(task.id));
+  }).length;
+  const parts: string[] = [];
+  if (waitingGroupCount > 0) parts.push(`${waitingGroupCount} ${waitingGroupCount === 1 ? "group" : "groups"} waiting`);
+  if (waitingTasks.length > 0) {
+    const plural = waitingTasks.length === 1 ? "task" : "tasks";
+    parts.push(waitingGroupCount === 0
+      ? `${waitingTasks.length} ${plural} waiting`
+      : `${waitingTasks.length} ${plural}`);
+  }
+  if (done > 0 || parts.length > 0) parts.push(`${done} done`);
+  return parts.length > 0 ? `${color(GLYPH_TREE_LAST, "muted", theme)} ${muted(parts.join(" · "), theme)}` : undefined;
 }
 
 function formatElapsed(startedAt: number | undefined, currentTime: number): string | undefined {
@@ -301,79 +328,6 @@ function assignmentActivityItems(assignment: TaskAssignmentRecord, now: number):
   }
   for (const activity of recentActivity) add(activity);
   return items;
-}
-
-function taskActivityLines(
-  assignment: TaskAssignmentRecord | undefined,
-  task: TaskRecord,
-  parentLast: boolean,
-  taskLast: boolean,
-  theme?: WidgetThemeLike,
-  options: WidgetBuildOptions = {},
-): string[] {
-  if (!assignment || (assignment.status !== "running" && assignment.status !== "queued")) return [];
-  const assignmentPrefix = `${childPrefix(parentLast, theme)}${linePrefix(taskLast, theme)}`;
-  const activityChildPrefix = `${childPrefix(parentLast, theme)}${childPrefix(taskLast, theme)}`;
-  const currentTime = options.now ?? Date.now();
-  const elapsed = formatElapsed(assignment.createdAt, currentTime);
-  const activityItems = assignmentActivityItems(assignment, currentTime);
-  const assignmentLine = `${assignmentPrefix}${joinParts([
-    colorStatus(assignment.status, theme),
-    muted(task.id, theme),
-    muted(assignment.agent, theme),
-    muted(shortAssignmentId(assignment.id), theme),
-    elapsed ? muted(elapsed, theme) : undefined,
-    criteriaProgressCounter(task, theme),
-  ])}`;
-
-  return [
-    assignmentLine,
-    ...activityItems.map((item, index) => `${activityChildPrefix}${linePrefix(index === activityItems.length - 1, theme)}${muted(item, theme)}`),
-  ];
-}
-
-function buildTaskLine(taskRun: TaskRunRecord, group: WidgetGroupView, task: TaskRecord, parentLast: boolean, isLast: boolean, theme?: WidgetThemeLike): string {
-  const assignment = assignmentForTask(taskRun, task);
-  const criteria = taskCriteriaProgress(task);
-  const agent = assignment?.agent ?? task.agentHint ?? group.agentHint;
-  const hasActivityDetails = assignment?.status === "queued" || assignment?.status === "running";
-  return `${childPrefix(parentLast, theme)}${linePrefix(isLast, theme)}${shortTitle(task.text, TASK_TITLE_WIDTH)} ${joinParts([
-    statusProgressLabel(task.status, criteria, theme, { hideZeroProgress: true }),
-    agent && !hasActivityDetails ? muted(agent, theme) : undefined,
-  ])}`;
-}
-
-function buildCompletedTasksLine(count: number, parentLast: boolean, isLast: boolean, theme?: WidgetThemeLike): string | undefined {
-  if (count <= 0) return undefined;
-  return `${childPrefix(parentLast, theme)}${linePrefix(isLast, theme)}${color(GLYPH_DONE, "success", theme)} ${muted(`${count} completed`, theme)}`;
-}
-
-function groupKey(group: WidgetGroupView): string {
-  return group.id === undefined ? "ungrouped" : `group:${group.id}`;
-}
-
-function hiddenGroupCounts(taskRun: TaskRunRecord, groups: WidgetGroupView[]): { completed: number; completedTasks: number; other: number } {
-  const visibleKeys = new Set(groups.map(groupKey));
-  let completed = 0;
-  let completedTasks = 0;
-  let other = 0;
-  for (const group of widgetGroups(taskRun)) {
-    if (visibleKeys.has(groupKey(group))) continue;
-    if (group.status === "completed") {
-      completed += 1;
-      completedTasks += completedTaskCount(taskRun, group);
-    } else other += 1;
-  }
-  return { completed, completedTasks, other };
-}
-
-function buildHiddenLine(hidden: { completed: number; completedTasks: number; other: number }, theme?: WidgetThemeLike): string | undefined {
-  const parts = [
-    hidden.completed > 0 ? `${hidden.completed} ${hidden.completed === 1 ? "group" : "groups"} completed` : undefined,
-    hidden.completedTasks > 0 ? `${hidden.completedTasks} completed` : undefined,
-    hidden.other > 0 ? `+${hidden.other}` : undefined,
-  ].filter(Boolean);
-  return parts.length > 0 ? `${color(GLYPH_TREE_LAST, "muted", theme)} ${muted(parts.join(", "), theme)}` : undefined;
 }
 
 function pushLimited(lines: string[], line: string, limit: number): boolean {
@@ -482,47 +436,161 @@ export function buildWidgetLines(
   const taskRun = currentTaskRun(state);
   if (!taskRun) return [];
 
-  const lines = [buildSummaryLine(taskRun, theme, options)];
-  const groups = visibleGroups(taskRun);
-  const hidden = hiddenGroupCounts(taskRun, groups);
-  const hasHiddenGroups = hidden.completed > 0 || hidden.other > 0;
+  const now = options.now ?? Date.now();
+  const summary = buildSummaryLine(taskRun, theme, options);
+  const needsYou = taskRun.tasks.filter((task) => taskNeedsAttention(taskRun, task));
+  const active = taskRun.tasks.filter((task) => {
+    if (taskNeedsAttention(taskRun, task) || taskDisplaysDone(taskRun, task)) return false;
+    const assignment = assignmentForTask(taskRun, task);
+    return assignment?.status === "running" || assignment?.status === "queued";
+  });
+  const nextUp = taskRun.tasks.find((task) =>
+    task.status === "ready" && !needsYou.includes(task) && !active.includes(task));
+  interface TriageSection {
+    tier: "needs-you" | "active" | "next-up";
+    taskId: string;
+    head: string;
+    children: string[];
+  }
+  const sections: TriageSection[] = [];
 
-  for (let groupIndex = 0; groupIndex < groups.length && lines.length < limit; groupIndex += 1) {
-    const group = groups[groupIndex];
-    const groupIsLast = groupIndex === groups.length - 1 && !hasHiddenGroups;
-    lines.push(buildGroupLine(taskRun, group, groupIsLast, theme));
-    const tasks = visibleTasks(taskRun, group);
-    const completedCount = completedTaskCount(taskRun, group);
-    const hasCompletedSummary = completedCount > 0;
-    for (let taskIndex = 0; taskIndex < tasks.length && lines.length < limit; taskIndex += 1) {
-      const task = tasks[taskIndex];
-      const isLastVisibleTask = taskIndex === tasks.length - 1;
-      const reserveCompletedSummary = hasCompletedSummary && isLastVisibleTask && lines.length + 1 < limit;
-      const taskIsLast = isLastVisibleTask && !reserveCompletedSummary;
-      const activityLimit = reserveCompletedSummary ? limit - 1 : limit;
-      const assignment = assignmentForTask(taskRun, task);
-      const isActive = assignment !== undefined && (assignment.status === "running" || assignment.status === "queued");
-      if (isActive) {
-        const activeLines = taskActivityLines(assignment, task, groupIsLast, taskIsLast, theme, options);
-        lines.push(activeLines[0]);
-        for (let index = 1; index < activeLines.length && lines.length < activityLimit; index += 1) {
-          lines.push(activeLines[index]);
+  for (const task of needsYou) {
+    const assignment = assignmentForTask(taskRun, task);
+    const displayStatus = assignment?.status === "paused"
+      ? "paused"
+      : (assignment?.status === "failed" || task.status === "failed")
+        ? "failed"
+        : "attention";
+    const children: string[] = [];
+    const reason = attentionReason(assignment, now);
+    if (reason) children.push(muted(reason, theme));
+    sections.push({
+      tier: "needs-you",
+      taskId: task.id,
+      head: joinParts([colorStatus(displayStatus, theme), triageTaskTitle(taskRun, task, theme)]),
+      children,
+    });
+  }
+
+  for (const task of active) {
+    const assignment = assignmentForTask(taskRun, task)!;
+    const elapsed = formatElapsed(assignment.createdAt, now);
+    sections.push({
+      tier: "active",
+      taskId: task.id,
+      head: joinParts([
+        colorStatus(assignment.status, theme),
+        triageTaskTitle(taskRun, task, theme),
+        muted(assignment.agent, theme),
+        elapsed ? muted(elapsed, theme) : undefined,
+        criteriaProgressCounter(task, theme),
+      ]),
+      children: assignmentActivityItems(assignment, now).map((item) => muted(item, theme)),
+    });
+  }
+
+  if (nextUp) {
+    const dependencyTitles = nextUp.dependsOn.map((dependencyId) => {
+      const dependency = taskRun.tasks.find((task) => task.id === dependencyId);
+      return dependency ? shortTitle(dependency.text, TASK_TITLE_WIDTH) : dependencyId;
+    });
+    const after = dependencyTitles.length > 0 ? ` · after ${dependencyTitles.join(", ")}` : "";
+    sections.push({
+      tier: "next-up",
+      taskId: nextUp.id,
+      head: joinParts([
+        colorStatus("ready", theme),
+        muted("next:", theme),
+        `${triageTaskTitle(taskRun, nextUp, theme)}${muted(after, theme)}`,
+      ]),
+      children: [],
+    });
+  }
+
+  const tierOrder: Array<TriageSection["tier"]> = ["needs-you", "active", "next-up"];
+
+  function sectionLineCount(section: TriageSection): number {
+    return 1 + section.children.length;
+  }
+
+  function shownTaskIdsFrom(included: TriageSection[]): Set<string> {
+    return new Set(included.map((section) => section.taskId));
+  }
+
+  /** Prefer higher tiers; within a tier admit heads before optional children; never admit lower tiers past an unfit higher head. */
+  function allocateBodyLines(bodyBudget: number): TriageSection[] {
+    const included: TriageSection[] = [];
+    let budget = bodyBudget;
+    for (const tier of tierOrder) {
+      const tierSections = sections.filter((candidate) => candidate.tier === tier);
+      if (tierSections.length === 0) continue;
+      if (budget <= 0) return included;
+
+      const admitted: TriageSection[] = [];
+      for (const section of tierSections) {
+        if (budget < 1) break;
+        admitted.push({ ...section, children: [] });
+        budget -= 1;
+      }
+
+      for (let index = 0; index < admitted.length; index += 1) {
+        const children: string[] = [];
+        for (const child of tierSections[index].children) {
+          if (budget < 1) break;
+          children.push(child);
+          budget -= 1;
         }
-      } else {
-        lines.push(buildTaskLine(taskRun, group, task, groupIsLast, taskIsLast, theme));
+        admitted[index] = { ...admitted[index], children };
+      }
+
+      included.push(...admitted);
+      if (admitted.length < tierSections.length) return included;
+    }
+    return included;
+  }
+
+  function renderBodyLines(included: TriageSection[], hasTail: boolean): string[] {
+    const body: string[] = [];
+    for (let index = 0; index < included.length; index += 1) {
+      const section = included[index];
+      const sectionLast = index === included.length - 1 && !hasTail;
+      body.push(`${linePrefix(sectionLast, theme)}${section.head}`);
+      for (let childIndex = 0; childIndex < section.children.length; childIndex += 1) {
+        const childLast = childIndex === section.children.length - 1;
+        body.push(`${childPrefix(sectionLast, theme)}${linePrefix(childLast, theme)}${section.children[childIndex]}`);
       }
     }
-    if (lines.length < limit) {
-      const completedLine = buildCompletedTasksLine(completedCount, groupIsLast, true, theme);
-      if (completedLine) lines.push(completedLine);
+    return body;
+  }
+
+  // Summary always consumes the first line; never append a tail when limit leaves no body slot.
+  if (limit === 1) {
+    return [truncateToWidth(summary, COMPACT_WIDGET_MAX_WIDTH, "…")];
+  }
+
+  const bodyBudget = limit - 1;
+  let included = allocateBodyLines(bodyBudget);
+  let shownTaskIds = shownTaskIdsFrom(included);
+  let tail = buildTailLine(taskRun, shownTaskIds, theme);
+  const remainingBudget = bodyBudget - included.reduce((sum, section) => sum + sectionLineCount(section), 0);
+
+  if (tail && remainingBudget === 0) {
+    const reservedBudget = bodyBudget - 1;
+    if (reservedBudget > 0) {
+      const reserved = allocateBodyLines(reservedBudget);
+      const reservedShown = shownTaskIdsFrom(reserved);
+      const reservedTail = buildTailLine(taskRun, reservedShown, theme);
+      if (reservedTail) {
+        included = reserved;
+        tail = reservedTail;
+      }
+    } else {
+      tail = undefined;
     }
   }
 
-  if (lines.length < limit) {
-    const hiddenLine = buildHiddenLine(hidden, theme);
-    if (hiddenLine) lines.push(hiddenLine);
-  }
-
+  const lines = [summary, ...renderBodyLines(included, Boolean(tail))];
+  if (tail && lines.length < limit) lines.push(tail);
   return lines.slice(0, limit).map((line) => truncateToWidth(line, COMPACT_WIDGET_MAX_WIDTH, "…"));
 }
 
