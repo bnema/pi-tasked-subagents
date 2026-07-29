@@ -439,12 +439,6 @@ export function buildWidgetLines(
   });
   const nextUp = taskRun.tasks.find((task) =>
     task.status === "ready" && !needsYou.includes(task) && !active.includes(task));
-  const selectedTaskIds = new Set([
-    ...needsYou.map((task) => task.id),
-    ...active.map((task) => task.id),
-    ...(nextUp ? [nextUp.id] : []),
-  ]);
-
   interface TriageSection {
     tier: "needs-you" | "active" | "next-up";
     taskId: string;
@@ -508,18 +502,38 @@ export function buildWidgetLines(
     return 1 + section.children.length;
   }
 
-  function allocateBodyLines(bodyBudget: number): { included: TriageSection[] } {
+  function shownTaskIdsFrom(included: TriageSection[]): Set<string> {
+    return new Set(included.map((section) => section.taskId));
+  }
+
+  /** Prefer higher tiers; trim children before skipping a section; never admit lower tiers past an unfit higher head. */
+  function allocateBodyLines(bodyBudget: number): TriageSection[] {
     const included: TriageSection[] = [];
     let budget = bodyBudget;
     for (const tier of tierOrder) {
       for (const section of sections.filter((candidate) => candidate.tier === tier)) {
+        if (budget <= 0) return included;
         const lineCount = sectionLineCount(section);
-        if (lineCount > budget) continue;
-        included.push(section);
-        budget -= lineCount;
+        if (lineCount <= budget) {
+          included.push(section);
+          budget -= lineCount;
+          continue;
+        }
+        if (budget >= 1) {
+          console.debug("widget: trimming triage section children to fit line budget", {
+            tier: section.tier,
+            taskId: section.taskId,
+            budget,
+            fullLines: lineCount,
+          });
+          included.push({ ...section, children: [] });
+          budget -= 1;
+          continue;
+        }
+        return included;
       }
     }
-    return { included };
+    return included;
   }
 
   function renderBodyLines(included: TriageSection[], hasTail: boolean): string[] {
@@ -536,22 +550,34 @@ export function buildWidgetLines(
     return body;
   }
 
+  // Summary always consumes the first line; never append a tail when limit leaves no body slot.
+  if (limit === 1) {
+    return [truncateToWidth(summary, COMPACT_WIDGET_MAX_WIDTH, "…")];
+  }
+
   let bodyBudget = limit - 1;
-  let { included } = allocateBodyLines(bodyBudget);
-  let tail = buildTailLine(taskRun, selectedTaskIds, theme);
+  let included = allocateBodyLines(bodyBudget);
+  let shownTaskIds = shownTaskIdsFrom(included);
+  let tail = buildTailLine(taskRun, shownTaskIds, theme);
   let remainingBudget = bodyBudget - included.reduce((sum, section) => sum + sectionLineCount(section), 0);
 
   if (tail && remainingBudget === 0) {
-    const reserved = allocateBodyLines(bodyBudget - 1);
-    if (buildTailLine(taskRun, selectedTaskIds, theme)) {
-      included = reserved.included;
-      tail = buildTailLine(taskRun, selectedTaskIds, theme);
+    const reservedBudget = bodyBudget - 1;
+    const reserved = allocateBodyLines(reservedBudget);
+    const reservedShown = shownTaskIdsFrom(reserved);
+    const reservedTail = buildTailLine(taskRun, reservedShown, theme);
+    if (reservedTail) {
+      included = reserved;
+      tail = reservedTail;
     }
   }
 
   const lines = [summary, ...renderBodyLines(included, Boolean(tail))];
-  if (tail) lines.push(tail);
-  return lines.map((line) => truncateToWidth(line, COMPACT_WIDGET_MAX_WIDTH, "…"));
+  if (tail && lines.length < limit) lines.push(tail);
+  if (lines.length > limit) {
+    console.debug("widget: truncating overflow lines to limit", { limit, produced: lines.length });
+  }
+  return lines.slice(0, limit).map((line) => truncateToWidth(line, COMPACT_WIDGET_MAX_WIDTH, "…"));
 }
 
 function hasActiveAssignment(state: TaskedSubagentsState): boolean {

@@ -298,12 +298,41 @@ describe("ui", () => {
     expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
     expect(lines[1]).toContain("Phase 1 reviews · Quality review Phase 1");
     expect(lines[2]).toContain("awaiting verdict on p1-quality-review");
-    expect(lines[3]).toContain("2 groups waiting · 2 tasks · 0 done");
+    expect(lines[3]).toContain("3 groups waiting · 4 tasks · 0 done");
     expect(rendered).not.toContain("Implement Task 1 via TDD");
     expect(rendered).not.toContain("Implement Task 2 via TDD");
     expect(rendered).not.toContain("sonnet");
     expect(rendered).not.toContain("tool: bash");
     expect(rendered).not.toContain("next:");
+  });
+
+  test("widget limit 1 returns only the summary and never appends a tail", () => {
+    const lines = buildWidgetLines(triageFixture(), 1, undefined, { now: 61_000 });
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(lines.join("\n")).not.toContain("waiting");
+  });
+
+  test("widget limit 2 with only an active task keeps the head or a collapsed tail", () => {
+    const lines = buildWidgetLines(state, 2, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("Tasked");
+    expect(rendered.includes("Main group · Do task") || /tasks|waiting/.test(rendered)).toBe(true);
+  });
+
+  test("widget limit 3 preserves needs-you ahead of active and next-up", () => {
+    const lines = buildWidgetLines(triageFixture(), 3, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(rendered).toContain("Phase 1 reviews · Quality review Phase 1");
+    expect(rendered).not.toContain("Implement Task 1 via TDD");
+    expect(rendered).not.toContain("next:");
+    expect(rendered).not.toContain("sonnet");
   });
 
   test("one attention task and many blocked phases render as triage, not a tree", () => {
