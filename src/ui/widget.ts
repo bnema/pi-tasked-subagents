@@ -439,9 +439,15 @@ export function buildWidgetLines(
   });
   const nextUp = taskRun.tasks.find((task) =>
     task.status === "ready" && !needsYou.includes(task) && !active.includes(task));
-  const shownTaskIds = new Set([...needsYou, ...active, ...(nextUp ? [nextUp] : [])].map((task) => task.id));
+  const selectedTaskIds = new Set([
+    ...needsYou.map((task) => task.id),
+    ...active.map((task) => task.id),
+    ...(nextUp ? [nextUp.id] : []),
+  ]);
 
   interface TriageSection {
+    tier: "needs-you" | "active" | "next-up";
+    taskId: string;
     head: string;
     children: string[];
   }
@@ -458,6 +464,8 @@ export function buildWidgetLines(
     const reason = attentionReason(assignment, now);
     if (reason) children.push(muted(reason, theme));
     sections.push({
+      tier: "needs-you",
+      taskId: task.id,
       head: joinParts([colorStatus(displayStatus, theme), triageTaskTitle(taskRun, task, theme)]),
       children,
     });
@@ -467,6 +475,8 @@ export function buildWidgetLines(
     const assignment = assignmentForTask(taskRun, task)!;
     const elapsed = formatElapsed(assignment.createdAt, now);
     sections.push({
+      tier: "active",
+      taskId: task.id,
       head: joinParts([
         colorStatus(assignment.status, theme),
         triageTaskTitle(taskRun, task, theme),
@@ -481,6 +491,8 @@ export function buildWidgetLines(
   if (nextUp) {
     const after = nextUp.dependsOn.length > 0 ? ` · after ${nextUp.dependsOn.join(", ")}` : "";
     sections.push({
+      tier: "next-up",
+      taskId: nextUp.id,
       head: joinParts([
         colorStatus("ready", theme),
         muted("next:", theme),
@@ -490,21 +502,56 @@ export function buildWidgetLines(
     });
   }
 
-  const tail = buildTailLine(taskRun, shownTaskIds, theme);
-  const body: string[] = [];
-  for (let index = 0; index < sections.length; index += 1) {
-    const section = sections[index];
-    const sectionLast = index === sections.length - 1 && !tail;
-    body.push(`${linePrefix(sectionLast, theme)}${section.head}`);
-    for (let childIndex = 0; childIndex < section.children.length; childIndex += 1) {
-      const childLast = childIndex === section.children.length - 1;
-      body.push(`${childPrefix(sectionLast, theme)}${linePrefix(childLast, theme)}${section.children[childIndex]}`);
+  const tierOrder: Array<TriageSection["tier"]> = ["needs-you", "active", "next-up"];
+
+  function sectionLineCount(section: TriageSection): number {
+    return 1 + section.children.length;
+  }
+
+  function allocateBodyLines(bodyBudget: number): { included: TriageSection[] } {
+    const included: TriageSection[] = [];
+    let budget = bodyBudget;
+    for (const tier of tierOrder) {
+      for (const section of sections.filter((candidate) => candidate.tier === tier)) {
+        const lineCount = sectionLineCount(section);
+        if (lineCount > budget) continue;
+        included.push(section);
+        budget -= lineCount;
+      }
+    }
+    return { included };
+  }
+
+  function renderBodyLines(included: TriageSection[], hasTail: boolean): string[] {
+    const body: string[] = [];
+    for (let index = 0; index < included.length; index += 1) {
+      const section = included[index];
+      const sectionLast = index === included.length - 1 && !hasTail;
+      body.push(`${linePrefix(sectionLast, theme)}${section.head}`);
+      for (let childIndex = 0; childIndex < section.children.length; childIndex += 1) {
+        const childLast = childIndex === section.children.length - 1;
+        body.push(`${childPrefix(sectionLast, theme)}${linePrefix(childLast, theme)}${section.children[childIndex]}`);
+      }
+    }
+    return body;
+  }
+
+  let bodyBudget = limit - 1;
+  let { included } = allocateBodyLines(bodyBudget);
+  let tail = buildTailLine(taskRun, selectedTaskIds, theme);
+  let remainingBudget = bodyBudget - included.reduce((sum, section) => sum + sectionLineCount(section), 0);
+
+  if (tail && remainingBudget === 0) {
+    const reserved = allocateBodyLines(bodyBudget - 1);
+    if (buildTailLine(taskRun, selectedTaskIds, theme)) {
+      included = reserved.included;
+      tail = buildTailLine(taskRun, selectedTaskIds, theme);
     }
   }
 
-  const lines = [summary, ...body];
+  const lines = [summary, ...renderBodyLines(included, Boolean(tail))];
   if (tail) lines.push(tail);
-  return lines.slice(0, limit).map((line) => truncateToWidth(line, COMPACT_WIDGET_MAX_WIDTH, "…"));
+  return lines.map((line) => truncateToWidth(line, COMPACT_WIDGET_MAX_WIDTH, "…"));
 }
 
 function hasActiveAssignment(state: TaskedSubagentsState): boolean {

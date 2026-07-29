@@ -290,6 +290,22 @@ describe("ui", () => {
     expect(checklistLine).not.toContain(GLYPH_PAUSED);
   });
 
+  test("widget reserves tail summary line when line budget is tight", () => {
+    const lines = buildWidgetLines(triageFixture(), 4, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(lines[1]).toContain("Phase 1 reviews · Quality review Phase 1");
+    expect(lines[2]).toContain("awaiting verdict on p1-quality-review");
+    expect(lines[3]).toContain("2 groups waiting · 2 tasks · 0 done");
+    expect(rendered).not.toContain("Implement Task 1 via TDD");
+    expect(rendered).not.toContain("Implement Task 2 via TDD");
+    expect(rendered).not.toContain("sonnet");
+    expect(rendered).not.toContain("tool: bash");
+    expect(rendered).not.toContain("next:");
+  });
+
   test("one attention task and many blocked phases render as triage, not a tree", () => {
     const lines = buildWidgetLines(triageFixture(), 14, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
