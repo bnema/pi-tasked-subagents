@@ -255,7 +255,12 @@ function buildTailLine(taskRun: TaskRunRecord, shownTaskIds: Set<string>, theme?
   }).length;
   const parts: string[] = [];
   if (waitingGroupCount > 0) parts.push(`${waitingGroupCount} ${waitingGroupCount === 1 ? "group" : "groups"} waiting`);
-  if (waitingTasks.length > 0) parts.push(`${waitingTasks.length} ${waitingTasks.length === 1 ? "task" : "tasks"}`);
+  if (waitingTasks.length > 0) {
+    const plural = waitingTasks.length === 1 ? "task" : "tasks";
+    parts.push(waitingGroupCount === 0
+      ? `${waitingTasks.length} ${plural} waiting`
+      : `${waitingTasks.length} ${plural}`);
+  }
   if (done > 0 || parts.length > 0) parts.push(`${done} done`);
   return parts.length > 0 ? `${color(GLYPH_TREE_LAST, "muted", theme)} ${muted(parts.join(" · "), theme)}` : undefined;
 }

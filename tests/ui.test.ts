@@ -416,7 +416,7 @@ describe("ui", () => {
     expect(lines.join("\n")).not.toContain("waiting");
   });
 
-  test("widget limit 2 with only an active task keeps the head or a collapsed tail", () => {
+  test("widget limit 2 with only an active task keeps the active head", () => {
     const lines = buildWidgetLines(state, 2, undefined, { now: 61_000 });
 
     expect(lines).toHaveLength(2);
