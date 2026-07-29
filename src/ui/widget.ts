@@ -508,26 +508,34 @@ export function buildWidgetLines(
     return new Set(included.map((section) => section.taskId));
   }
 
-  /** Prefer higher tiers; trim children before skipping a section; never admit lower tiers past an unfit higher head. */
+  /** Prefer higher tiers; within a tier admit heads before optional children; never admit lower tiers past an unfit higher head. */
   function allocateBodyLines(bodyBudget: number): TriageSection[] {
     const included: TriageSection[] = [];
     let budget = bodyBudget;
     for (const tier of tierOrder) {
-      for (const section of sections.filter((candidate) => candidate.tier === tier)) {
-        if (budget <= 0) return included;
-        const lineCount = sectionLineCount(section);
-        if (lineCount <= budget) {
-          included.push(section);
-          budget -= lineCount;
-          continue;
-        }
-        if (budget >= 1) {
-          included.push({ ...section, children: [] });
-          budget -= 1;
-          continue;
-        }
-        return included;
+      const tierSections = sections.filter((candidate) => candidate.tier === tier);
+      if (tierSections.length === 0) continue;
+      if (budget <= 0) return included;
+
+      const admitted: TriageSection[] = [];
+      for (const section of tierSections) {
+        if (budget < 1) break;
+        admitted.push({ ...section, children: [] });
+        budget -= 1;
       }
+
+      for (let index = 0; index < admitted.length; index += 1) {
+        const children: string[] = [];
+        for (const child of tierSections[index].children) {
+          if (budget < 1) break;
+          children.push(child);
+          budget -= 1;
+        }
+        admitted[index] = { ...admitted[index], children };
+      }
+
+      included.push(...admitted);
+      if (admitted.length < tierSections.length) return included;
     }
     return included;
   }

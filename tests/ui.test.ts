@@ -116,6 +116,89 @@ function triageFixture(): TaskedSubagentsState {
   return s;
 }
 
+/** Three needs-you tasks with reasons plus hidden blocked work (forces a tail under tight limits). */
+function multiAttentionFixture(): TaskedSubagentsState {
+  const s = cloneState(state);
+  const run = s.taskRuns[0];
+  run.title = "Multi attention wrap-up";
+  run.status = "attention";
+  run.groups = [
+    { id: "a1", title: "Review A", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "a2", title: "Review B", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "a3", title: "Review C", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    { id: "later", title: "Later phase", status: "blocked", dependsOn: ["a1", "a2", "a3"], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+  ];
+  run.tasks = [
+    { id: "t-a", groupId: "a1", text: "Actionable head A", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["as-a"], createdAt: 1, updatedAt: 1 },
+    { id: "t-b", groupId: "a2", text: "Actionable head B", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["as-b"], createdAt: 1, updatedAt: 1 },
+    { id: "t-c", groupId: "a3", text: "Actionable head C", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["as-c"], createdAt: 1, updatedAt: 1 },
+    { id: "t-wait", groupId: "later", text: "Hidden blocked work", status: "blocked", criteria: [], dependsOn: ["t-a", "t-b", "t-c"], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+  ];
+  run.assignments = [
+    {
+      id: "as-a",
+      taskRunId: run.id,
+      groupId: "a1",
+      taskId: "t-a",
+      agent: "delegate",
+      prompt: "review-a",
+      status: "attention",
+      result: {
+        assignmentId: "as-a",
+        status: "attention",
+        summary: "reason for A",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        createdAt: 2,
+      },
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "as-b",
+      taskRunId: run.id,
+      groupId: "a2",
+      taskId: "t-b",
+      agent: "delegate",
+      prompt: "review-b",
+      status: "attention",
+      result: {
+        assignmentId: "as-b",
+        status: "attention",
+        summary: "reason for B",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        createdAt: 2,
+      },
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "as-c",
+      taskRunId: run.id,
+      groupId: "a3",
+      taskId: "t-c",
+      agent: "delegate",
+      prompt: "review-c",
+      status: "attention",
+      result: {
+        assignmentId: "as-c",
+        status: "attention",
+        summary: "reason for C",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        createdAt: 2,
+      },
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ];
+  return s;
+}
+
 describe("ui", () => {
   test("labels statuses", () => {
     expect(statusLabel("running")).toBe("RUNNING");
@@ -307,6 +390,23 @@ describe("ui", () => {
     expect(rendered).not.toContain("sonnet");
     expect(rendered).not.toContain("tool: bash");
     expect(rendered).not.toContain("next:");
+  });
+
+  test("widget limit 4 preserves multiple needs-you heads before reason children when tail is reserved", () => {
+    const lines = buildWidgetLines(multiAttentionFixture(), 4, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toContain("Multi attention wrap-up");
+    expect(lines[1]).toContain("Review A · Actionable head A");
+    expect(lines[2]).toContain("Review B · Actionable head B");
+    expect(lines[3]).toContain("waiting");
+    expect(lines[3]).toMatch(/group.*waiting|waiting/u);
+    expect(rendered).not.toContain("Actionable head C");
+    // Reason children may be omitted so same-tier heads survive under the reserved tail.
+    expect(rendered).not.toContain("reason for A");
+    expect(rendered).not.toContain("reason for B");
+    expect(rendered).not.toContain("reason for C");
   });
 
   test("widget limit 1 returns only the summary and never appends a tail", () => {
