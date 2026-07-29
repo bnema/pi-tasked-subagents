@@ -15,9 +15,11 @@ import {
   canonicalizeChildResult,
   evaluateTaskGraphCondition,
   getReadyTaskGraphStepIds,
+  isTerminalTurnEnd,
   parseStructuredStepOutput,
   renderTaskGraphTemplate,
   renderTerminationSignal,
+  recoverTerminalChildExit,
   resetRunnerTerminationForTests,
   runTaskGraph,
   settleOwnedProcessTermination,
@@ -91,7 +93,58 @@ describe("child Pi argument construction", () => {
   });
 });
 
+describe("terminal child exit recovery", () => {
+  test("arms only for terminal Pi turns", () => {
+    expect(isTerminalTurnEnd({ type: "turn_end", message: { stopReason: "stop" } })).toBe(true);
+    expect(isTerminalTurnEnd({ type: "turn_end", message: { stopReason: "error" } })).toBe(true);
+    expect(isTerminalTurnEnd({ type: "turn_end", message: { stopReason: "aborted" } })).toBe(true);
+    expect(isTerminalTurnEnd({ type: "turn_end", message: { stopReason: "length" } })).toBe(true);
+    expect(isTerminalTurnEnd({ type: "turn_end", message: { stopReason: "toolUse" } })).toBe(false);
+    expect(isTerminalTurnEnd({ type: "turn_end" })).toBe(false);
+    expect(isTerminalTurnEnd({ type: "message_end", message: { stopReason: "stop" } })).toBe(false);
+  });
+});
+
 describe("runner process identities", () => {
+  test("recovers after a terminal turn when the Pi child does not exit", async () => {
+    const childExit = new Promise<number>(() => undefined);
+    const terminated: Array<{ pid: number; startTime: string }> = [];
+
+    const recovered = await recoverTerminalChildExit(
+      childExit,
+      { pid: 42, startTime: "100" },
+      {
+        graceMs: 1,
+        terminate: async (identity) => {
+          terminated.push(identity);
+          return "exited";
+        },
+      },
+    );
+
+    expect(recovered).toBe(true);
+    expect(terminated).toEqual([{ pid: 42, startTime: "100" }]);
+  });
+
+  test("does not terminate a Pi child that exits during the terminal grace period", async () => {
+    let terminateCalled = false;
+
+    const recovered = await recoverTerminalChildExit(
+      Promise.resolve(0),
+      { pid: 42, startTime: "100" },
+      {
+        graceMs: 1,
+        terminate: async () => {
+          terminateCalled = true;
+          return "exited";
+        },
+      },
+    );
+
+    expect(recovered).toBe(false);
+    expect(terminateCalled).toBe(false);
+  });
+
   test("registers a child error listener before awaiting process identity I/O", async () => {
     const child = new EventEmitter();
     const exit = waitForChildExit(child);
@@ -683,6 +736,54 @@ describe("assignment usage accumulation", () => {
   });
 });
 
+async function runFakePiTask(scriptBody: string, runId: string) {
+  const asyncDir = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-fake-pi-"));
+  const report = sampleReport("a1");
+  const fakePi = path.join(asyncDir, "fake-pi.mjs");
+  await writeFile(fakePi, `#!/usr/bin/env node
+const report = ${JSON.stringify(report)};
+${scriptBody}
+`, "utf8");
+  await chmod(fakePi, 0o700);
+  const statusPath = path.join(asyncDir, "status.json");
+  const resultPath = path.join(asyncDir, "result.json");
+  const reservationPath = `${resultPath}.reservation`;
+  const status = {
+    runId,
+    mode: "task_graph",
+    state: "running",
+    steps: [{ index: 0, id: "a1", status: "pending" }],
+  };
+  const config = {
+    runId,
+    sessionId: "session-test",
+    mode: "task_graph",
+    piBin: fakePi,
+    asyncDir,
+    statusPath,
+    eventsPath: path.join(asyncDir, "events.jsonl"),
+    resultPath,
+    resultReservationPath: reservationPath,
+    storageRoot: asyncDir,
+    children: [{
+      ...childConfig("a1"),
+      sessionDir: path.join(asyncDir, "child-0"),
+      outputFile: "output-0.log",
+    }],
+  };
+  await writeFile(reservationPath, JSON.stringify({
+    sessionId: "session-test",
+    runId,
+    resultId: "00112233445566778899aabbccddeeff",
+  }), "utf8");
+
+  try {
+    return { results: await runTaskGraph(config, status), status, report };
+  } finally {
+    await rm(asyncDir, { recursive: true, force: true });
+  }
+}
+
 describe("canonical task graph integration", () => {
   test("runTaskGraph publishes canonical children and never writes output-N.log", async () => {
     const asyncDir = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-canonical-"));
@@ -743,4 +844,92 @@ console.log(JSON.stringify({
       await rm(asyncDir, { recursive: true, force: true });
     }
   });
+
+  test("recovers a Pi child that stays alive after emitting a terminal turn", async () => {
+    const asyncDir = await mkdtemp(path.join(os.tmpdir(), "pi-tasked-subagents-terminal-exit-"));
+    const report = sampleReport("a1");
+    const fakePi = path.join(asyncDir, "fake-pi.mjs");
+    await writeFile(fakePi, `#!/usr/bin/env node
+const report = ${JSON.stringify(report)};
+const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(report) }] };
+console.log(JSON.stringify({ type: "message_end", message }));
+console.log(JSON.stringify({ type: "turn_end", message }));
+setInterval(() => {}, 60_000);
+`, "utf8");
+    await chmod(fakePi, 0o700);
+    const statusPath = path.join(asyncDir, "status.json");
+    const resultPath = path.join(asyncDir, "result.json");
+    const reservationPath = `${resultPath}.reservation`;
+    const status = {
+      runId: "run-terminal-exit",
+      mode: "task_graph",
+      state: "running",
+      steps: [{ index: 0, id: "a1", status: "pending" }],
+    };
+    const config = {
+      runId: "run-terminal-exit",
+      sessionId: "session-test",
+      mode: "task_graph",
+      piBin: fakePi,
+      asyncDir,
+      statusPath,
+      eventsPath: path.join(asyncDir, "events.jsonl"),
+      resultPath,
+      resultReservationPath: reservationPath,
+      storageRoot: asyncDir,
+      children: [{
+        ...childConfig("a1"),
+        sessionDir: path.join(asyncDir, "child-0"),
+        outputFile: "output-0.log",
+      }],
+    };
+    await writeFile(reservationPath, JSON.stringify({
+      sessionId: "session-test",
+      runId: "run-terminal-exit",
+      resultId: "fedcba9876543210fedcba9876543210",
+    }), "utf8");
+
+    try {
+      const results = await runTaskGraph(config, status);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ stepId: "a1", status: "completed", report });
+      expect(status.steps[0]).toMatchObject({
+        status: "completed",
+        exitCode: 0,
+        lastActionSummary: "terminal child exit recovered",
+      });
+    } finally {
+      await rm(asyncDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("preserves a natural nonzero exit after a terminal turn", async () => {
+    const { status } = await runFakePiTask(`
+const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(report) }] };
+console.log(JSON.stringify({ type: "message_end", message }));
+console.log(JSON.stringify({ type: "turn_end", message }));
+process.exitCode = 7;
+`, "run-terminal-nonzero");
+
+    expect(status.steps[0]).toMatchObject({
+      status: "failed",
+      exitCode: 7,
+      error: "pi exited with code 7",
+    });
+  });
+
+  test("does not terminate a child after a nonterminal tool-use turn", async () => {
+    const { results, report } = await runFakePiTask(`
+const toolTurn = { role: "assistant", stopReason: "toolUse", content: [] };
+console.log(JSON.stringify({ type: "turn_end", message: toolTurn }));
+setTimeout(() => {
+  const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(report) }] };
+  console.log(JSON.stringify({ type: "message_end", message }));
+  console.log(JSON.stringify({ type: "turn_end", message }));
+}, 2_200);
+`, "run-tool-use-before-terminal");
+
+    expect(results[0]).toMatchObject({ stepId: "a1", status: "completed", report });
+  }, 10_000);
 });

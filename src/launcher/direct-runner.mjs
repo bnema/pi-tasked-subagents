@@ -55,6 +55,10 @@ function summarizeOutput(text, maxLength = 400) {
     : `${singleLine.slice(0, maxLength - 1).trimEnd()}…`;
 }
 
+function toErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function utf8Bytes(value) {
   return Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value), "utf8");
 }
@@ -427,6 +431,42 @@ export function waitForChildExit(childProcess) {
   });
 }
 
+const DEFAULT_TERMINAL_CHILD_EXIT_GRACE_MS = 2_000;
+const DEFAULT_TERMINAL_CHILD_TERMINATION_OPTIONS = {
+  graceMs: 2_000,
+  pollMs: 50,
+  forceWaitMs: 2_000,
+};
+
+/** Recover a one-shot Pi child that emitted a terminal turn but leaked runtime handles. */
+export function isTerminalTurnEnd(event) {
+  return event?.type === "turn_end"
+    && ["stop", "error", "aborted", "length"].includes(event?.message?.stopReason);
+}
+
+function unrefDelay(ms, value) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(value), ms);
+    timer.unref?.();
+  });
+}
+
+export async function recoverTerminalChildExit(childExit, identity, options = {}) {
+  const graceMs = options.graceMs ?? DEFAULT_TERMINAL_CHILD_EXIT_GRACE_MS;
+  const terminate = options.terminate ?? terminateProcessIdentity;
+  const exitState = await Promise.race([
+    childExit.then(() => "exited", () => "exited"),
+    unrefDelay(graceMs, "stalled"),
+  ]);
+  if (exitState === "exited" || !identity) return false;
+
+  const outcome = await terminate(
+    identity,
+    options.terminationOptions ?? DEFAULT_TERMINAL_CHILD_TERMINATION_OPTIONS,
+  );
+  return outcome === "exited" || outcome === "forced";
+}
+
 async function runChild(config, statusPath, status, child, index, promptOverride, attemptNumber = 1) {
   const step = status.steps[index];
   prepareStepForStart(status, step);
@@ -448,12 +488,16 @@ async function runChild(config, statusPath, status, child, index, promptOverride
   void childExit.catch(() => undefined);
   step.pid = childProcess.pid;
   step.pidStartTime = childProcess.pid === undefined ? undefined : (await captureProcessIdentity(childProcess.pid))?.startTime;
+  const childIdentity = step.pid === undefined || step.pidStartTime === undefined
+    ? undefined
+    : { pid: step.pid, startTime: step.pidStartTime };
   await updateStatus(statusPath, status);
 
   let stdoutBuffer = "";
   let stderrBuffer = "";
   let finalOutput = "";
   let toolCount = 0;
+  let terminalExitRecovery;
   const usageAccumulator = createUsageAccumulator(step.startedAt);
 
   const processLine = async (line) => {
@@ -503,6 +547,10 @@ async function runChild(config, statusPath, status, child, index, promptOverride
 
     if (event.type === "turn_end") {
       markStepAction(status, step, "turn end");
+      if (isTerminalTurnEnd(event) && !terminalExitRecovery) {
+        terminalExitRecovery = recoverTerminalChildExit(childExit, childIdentity);
+        void terminalExitRecovery.catch(() => undefined);
+      }
       await updateStatus(statusPath, status);
     }
   };
@@ -523,7 +571,9 @@ async function runChild(config, statusPath, status, child, index, promptOverride
     stderrBuffer += chunk.toString();
   });
 
-  const exitCode = await childExit;
+  const observedExitCode = await childExit;
+  const recoveredTerminalExit = terminalExitRecovery ? await terminalExitRecovery : false;
+  const exitCode = recoveredTerminalExit ? 0 : observedExitCode;
 
   const trailingStdout = stdoutBuffer;
   stdoutBuffer = "";
@@ -532,6 +582,7 @@ async function runChild(config, statusPath, status, child, index, promptOverride
   step.endedAt = now();
   step.exitCode = exitCode;
   step.currentTool = undefined;
+  if (recoveredTerminalExit) markStepAction(status, step, "terminal child exit recovered");
 
   let structuredOutput;
   let summary;

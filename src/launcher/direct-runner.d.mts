@@ -4,6 +4,16 @@ export function parseStructuredStepOutput(output: unknown, outputMode?: string):
 export function getReadyTaskGraphStepIds(steps: Array<{ id?: string; status?: string; dependsOn?: string[] }>, maxConcurrency: number): string[];
 export function applyPublishedTerminalResult(status: Record<string, unknown>, result: Record<string, unknown>, fallbackTimestamp?: number): Record<string, unknown>;
 export function waitForChildExit(childProcess: { once(event: "error", listener: (error: Error) => void): unknown; once(event: "close", listener: (code: number | null) => void): unknown }): Promise<number>;
+export function isTerminalTurnEnd(event: unknown): boolean;
+export function recoverTerminalChildExit(
+  childExit: Promise<number>,
+  identity: { pid: number; startTime: string } | undefined,
+  options?: {
+    graceMs?: number;
+    terminationOptions?: Record<string, unknown>;
+    terminate?: (identity: { pid: number; startTime: string }, options?: Record<string, unknown>) => Promise<string>;
+  },
+): Promise<boolean>;
 export function terminateTrackedSteps(
   steps?: Array<{ pid?: number; pidStartTime?: string }>,
   options?: Record<string, unknown>,
