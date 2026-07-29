@@ -259,7 +259,7 @@ describe("ui", () => {
     expect(assignmentLine).toContain("Do task");
   });
 
-  test("widget renders task run, group, and active assignment in place of the task text", () => {
+  test("widget renders task run, group, and task identity inline with the active assignment", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
     const assignmentLine = lines.find((line) => line.includes("delegate"));
@@ -326,7 +326,7 @@ describe("ui", () => {
     expect(rendered).toContain("tool: bash");
   });
 
-  test("widget hides the task text and renders the active assignment line at task depth", () => {
+  test("widget retains task identity while rendering the active assignment at task depth", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
     const assignmentLine = lines.find((line) => line.includes("delegate"));
@@ -554,7 +554,7 @@ describe("ui", () => {
     expect(activityLine?.startsWith("   ├ ")).toBe(true);
   });
 
-  test("widget keeps full assignment labels when they fit", () => {
+  test("widget omits assignment IDs while retaining task and agent labels", () => {
     const labeled = cloneState(state);
     labeled.taskRuns[0].tasks[0].assignmentIds = ["manual-review-a1"];
     labeled.taskRuns[0].assignments[0].id = "manual-review-a1";
