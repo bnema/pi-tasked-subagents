@@ -350,6 +350,51 @@ describe("ui", () => {
     expect(rendered).not.toContain("CEF capture");
   });
 
+  test("widget tail excludes cancelled-only groups from waiting group count", () => {
+    const s = cloneState(state);
+    const run = s.taskRuns[0];
+    run.title = "Tail count honesty";
+    run.status = "attention";
+    run.groups = [
+      { id: "attention-g", title: "Needs review", status: "attention", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+      { id: "cancelled-g", title: "Aborted work", status: "cancelled", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+      { id: "waiting-g", title: "Later phase", status: "blocked", dependsOn: [], maxConcurrency: 1, createdAt: 1, updatedAt: 1 },
+    ];
+    run.tasks = [
+      { id: "t-attn", groupId: "attention-g", text: "Review output", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["a-attn"], createdAt: 1, updatedAt: 1 },
+      { id: "t-cancel", groupId: "cancelled-g", text: "Cancelled task", status: "cancelled", criteria: [], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+      { id: "t-wait", groupId: "waiting-g", text: "Future work", status: "blocked", criteria: [], dependsOn: [], assignmentIds: [], createdAt: 1, updatedAt: 1 },
+    ];
+    run.assignments = [{
+      id: "a-attn",
+      taskRunId: run.id,
+      groupId: "attention-g",
+      taskId: "t-attn",
+      agent: "delegate",
+      prompt: "review",
+      status: "attention",
+      result: {
+        assignmentId: "a-attn",
+        status: "attention",
+        summary: "needs human input",
+        criteriaEvidence: [],
+        artifacts: [],
+        followUps: [],
+        createdAt: 2,
+      },
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    const lines = buildWidgetLines(s, 4, undefined, { now: 61_000 });
+    const tail = lines[lines.length - 1];
+
+    expect(lines[1]).toContain("Needs review · Review output");
+    expect(tail).toContain("1 group waiting");
+    expect(tail).not.toContain("2 groups waiting");
+    expect(tail).not.toMatch(/Aborted work/u);
+  });
+
   test("failed authoritative assignment renders failed glyph when task status is still attention", () => {
     const mismatched = cloneState(state);
     mismatched.taskRuns[0].status = "attention";

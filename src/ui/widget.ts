@@ -249,7 +249,9 @@ function buildTailLine(taskRun: TaskRunRecord, shownTaskIds: Set<string>, theme?
     !taskDisplaysDone(taskRun, task) && task.status !== "cancelled" && !shownTaskIds.has(task.id));
   const waitingGroupCount = widgetGroups(taskRun).filter((group) => {
     const tasks = tasksForGroup(taskRun, group.id);
-    return tasks.some((task) => !taskDisplaysDone(taskRun, task)) && !tasks.some((task) => shownTaskIds.has(task.id));
+    const waitingInGroup = tasks.filter((task) =>
+      !taskDisplaysDone(taskRun, task) && task.status !== "cancelled");
+    return waitingInGroup.length > 0 && !waitingInGroup.some((task) => shownTaskIds.has(task.id));
   }).length;
   const parts: string[] = [];
   if (waitingGroupCount > 0) parts.push(`${waitingGroupCount} ${waitingGroupCount === 1 ? "group" : "groups"} waiting`);
@@ -520,12 +522,6 @@ export function buildWidgetLines(
           continue;
         }
         if (budget >= 1) {
-          console.debug("widget: trimming triage section children to fit line budget", {
-            tier: section.tier,
-            taskId: section.taskId,
-            budget,
-            fullLines: lineCount,
-          });
           included.push({ ...section, children: [] });
           budget -= 1;
           continue;
@@ -574,9 +570,6 @@ export function buildWidgetLines(
 
   const lines = [summary, ...renderBodyLines(included, Boolean(tail))];
   if (tail && lines.length < limit) lines.push(tail);
-  if (lines.length > limit) {
-    console.debug("widget: truncating overflow lines to limit", { limit, produced: lines.length });
-  }
   return lines.slice(0, limit).map((line) => truncateToWidth(line, COMPACT_WIDGET_MAX_WIDTH, "…"));
 }
 
