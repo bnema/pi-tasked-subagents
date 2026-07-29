@@ -2,6 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 
 import type { TaskedSubagentsState } from "../src/types.js";
+import { GLYPH_PAUSED, GLYPH_QUEUED } from "../src/ui/glyphs.js";
 import { buildFooterStatus } from "../src/ui/status.js";
 import { buildTaskRunChecklistLines, buildWidgetLines, createWidgetContent } from "../src/ui/widget.js";
 import { statusLabel } from "../src/ui/messages.js";
@@ -213,6 +214,29 @@ describe("ui", () => {
 
     expect(assignmentLine).toContain("1/2");
     expect(lines.join("\n")).not.toContain("Do task");
+  });
+
+  test("blocked renders muted queued rather than warning paused in compact widget and checklist", () => {
+    const blocked = cloneState(state);
+    blocked.taskRuns[0].groups[0].status = "blocked";
+    blocked.taskRuns[0].tasks[0].status = "blocked";
+    blocked.taskRuns[0].tasks[0].text = "Waiting on upstream task";
+    blocked.taskRuns[0].tasks[0].assignmentIds = [];
+    blocked.taskRuns[0].assignments = [];
+    const trackingTheme = {
+      fg: (colorName: string, text: string) => `${colorName}:${text}`,
+    };
+
+    const widgetLine = buildWidgetLines(blocked, 10, trackingTheme).find((line) => line.includes("Waiting on upstream task"));
+    expect(widgetLine).toBeDefined();
+    expect(widgetLine).toContain(`muted:${GLYPH_QUEUED}`);
+    expect(widgetLine).not.toContain("warning:");
+    expect(widgetLine).not.toContain(GLYPH_PAUSED);
+
+    const checklistLine = buildTaskRunChecklistLines(blocked.taskRuns[0], 20).find((line) => line.includes("Waiting on upstream task"));
+    expect(checklistLine).toBeDefined();
+    expect(checklistLine).toContain(GLYPH_QUEUED);
+    expect(checklistLine).not.toContain(GLYPH_PAUSED);
   });
 
   test("widget still renders the task text when there is no active assignment", () => {

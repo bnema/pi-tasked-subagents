@@ -15,7 +15,6 @@ import {
   GLYPH_PAUSED,
   GLYPH_GROUP,
   GLYPH_QUEUED,
-  GLYPH_READY,
   GLYPH_RUNNING,
   GLYPH_TASKED_SUBAGENTS,
   GLYPH_TREE_BRANCH,
@@ -73,18 +72,19 @@ function joinParts(parts: Array<string | undefined>): string {
 function statusColor(status: string): string {
   switch (status) {
     case "running":
-    case "ready":
     case "queued":
       return "accent";
     case "completed":
     case "skipped":
       return "success";
     case "attention":
-    case "blocked":
     case "paused":
     case "failed":
     case "cancelled":
       return "warning";
+    case "ready":
+    case "blocked":
+    case "pending":
     default:
       return "muted";
   }
@@ -92,16 +92,24 @@ function statusColor(status: string): string {
 
 function statusGlyph(status: string): string {
   switch (status) {
-    case "running": return GLYPH_RUNNING;
-    case "ready": return GLYPH_READY;
+    case "running":
+    case "queued":
+      return GLYPH_RUNNING;
     case "completed":
-    case "skipped": return GLYPH_DONE;
-    case "attention": return GLYPH_ATTENTION;
+    case "skipped":
+      return GLYPH_DONE;
+    case "attention":
+      return GLYPH_ATTENTION;
     case "failed":
-    case "cancelled": return GLYPH_FAILED;
+    case "cancelled":
+      return GLYPH_FAILED;
+    case "paused":
+      return GLYPH_PAUSED;
+    case "ready":
     case "blocked":
-    case "paused": return GLYPH_PAUSED;
-    default: return GLYPH_QUEUED;
+    case "pending":
+    default:
+      return GLYPH_QUEUED;
   }
 }
 
