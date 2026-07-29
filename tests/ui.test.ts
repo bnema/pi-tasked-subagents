@@ -459,6 +459,8 @@ describe("ui", () => {
     expect(lines[1]).toContain("Phase 1 reviews · Quality review Phase 1");
     expect(rendered).not.toContain("groups waiting");
     expect(rendered).not.toContain("tasks waiting");
+    expect(rendered).not.toMatch(/\bwaiting\b/u);
+    expect(rendered).not.toMatch(/\bdone\b/u);
   });
 
   test("widget limit 3 preserves needs-you ahead of active and next-up", () => {
