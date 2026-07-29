@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 
-import type { TaskedSubagentsState } from "../src/types.js";
+import type { TaskAssignmentRecord, TaskedSubagentsState } from "../src/types.js";
 import { GLYPH_ATTENTION, GLYPH_FAILED, GLYPH_PAUSED, GLYPH_QUEUED } from "../src/ui/glyphs.js";
 import { buildFooterStatus } from "../src/ui/status.js";
 import { buildTaskRunChecklistLines, buildWidgetLines, createWidgetContent } from "../src/ui/widget.js";
@@ -134,67 +134,36 @@ function multiAttentionFixture(): TaskedSubagentsState {
     { id: "t-c", groupId: "a3", text: "Actionable head C", status: "attention", criteria: [], dependsOn: [], assignmentIds: ["as-c"], createdAt: 1, updatedAt: 1 },
     { id: "t-wait", groupId: "later", text: "Hidden blocked work", status: "blocked", criteria: [], dependsOn: ["t-a", "t-b", "t-c"], assignmentIds: [], createdAt: 1, updatedAt: 1 },
   ];
+  const attentionAssignment = (
+    taskRunId: string,
+    assignmentId: string,
+    groupId: string,
+    taskId: string,
+    summary: string,
+  ): TaskAssignmentRecord => ({
+    id: assignmentId,
+    taskRunId,
+    groupId,
+    taskId,
+    agent: "delegate",
+    prompt: `review-${taskId.slice("t-".length)}`,
+    status: "attention",
+    result: {
+      assignmentId,
+      status: "attention",
+      summary,
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: [],
+      createdAt: 2,
+    },
+    createdAt: 1,
+    updatedAt: 1,
+  });
   run.assignments = [
-    {
-      id: "as-a",
-      taskRunId: run.id,
-      groupId: "a1",
-      taskId: "t-a",
-      agent: "delegate",
-      prompt: "review-a",
-      status: "attention",
-      result: {
-        assignmentId: "as-a",
-        status: "attention",
-        summary: "reason for A",
-        criteriaEvidence: [],
-        artifacts: [],
-        followUps: [],
-        createdAt: 2,
-      },
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    {
-      id: "as-b",
-      taskRunId: run.id,
-      groupId: "a2",
-      taskId: "t-b",
-      agent: "delegate",
-      prompt: "review-b",
-      status: "attention",
-      result: {
-        assignmentId: "as-b",
-        status: "attention",
-        summary: "reason for B",
-        criteriaEvidence: [],
-        artifacts: [],
-        followUps: [],
-        createdAt: 2,
-      },
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    {
-      id: "as-c",
-      taskRunId: run.id,
-      groupId: "a3",
-      taskId: "t-c",
-      agent: "delegate",
-      prompt: "review-c",
-      status: "attention",
-      result: {
-        assignmentId: "as-c",
-        status: "attention",
-        summary: "reason for C",
-        criteriaEvidence: [],
-        artifacts: [],
-        followUps: [],
-        createdAt: 2,
-      },
-      createdAt: 1,
-      updatedAt: 1,
-    },
+    attentionAssignment(run.id, "as-a", "a1", "t-a", "reason for A"),
+    attentionAssignment(run.id, "as-b", "a2", "t-b", "reason for B"),
+    attentionAssignment(run.id, "as-c", "a3", "t-c", "reason for C"),
   ];
   return s;
 }
@@ -484,7 +453,7 @@ describe("ui", () => {
     expect(rendered).toContain("Phase 2 · Implement Task 1 via TDD");
     expect(rendered).toContain("sonnet");
     expect(rendered).toContain("tool: bash");
-    expect(rendered).toContain("next: Phase 2 · Implement Task 2 via TDD · after t-impl");
+    expect(rendered).toContain("next: Phase 2 · Implement Task 2 via TDD · after Implement Task 1 via TDD");
     expect(lines[lines.length - 1]).toContain("2 groups waiting · 2 tasks · 0 done");
     expect(rendered).not.toContain("Wire pending dispatch");
     expect(rendered).not.toContain("CEF capture");
@@ -576,12 +545,14 @@ describe("ui", () => {
     const ready = cloneState(state);
     ready.taskRuns[0].tasks[0].status = "ready";
     ready.taskRuns[0].tasks[0].assignmentIds = [];
+    ready.taskRuns[0].tasks[0].dependsOn = ["external-task"];
     ready.taskRuns[0].assignments = [];
 
     const rendered = buildWidgetLines(ready, 10, undefined, { now: 61_000 }).join("\n");
 
     expect(rendered).toContain("next:");
     expect(rendered).toContain("Do task");
+    expect(rendered).toContain("after external-task");
   });
 
   test("widget indents activity lines exactly one level under the active assignment line", () => {

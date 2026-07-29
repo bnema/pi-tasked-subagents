@@ -490,7 +490,11 @@ export function buildWidgetLines(
   }
 
   if (nextUp) {
-    const after = nextUp.dependsOn.length > 0 ? ` · after ${nextUp.dependsOn.join(", ")}` : "";
+    const dependencyTitles = nextUp.dependsOn.map((dependencyId) => {
+      const dependency = taskRun.tasks.find((task) => task.id === dependencyId);
+      return dependency ? shortTitle(dependency.text, TASK_TITLE_WIDTH) : dependencyId;
+    });
+    const after = dependencyTitles.length > 0 ? ` · after ${dependencyTitles.join(", ")}` : "";
     sections.push({
       tier: "next-up",
       taskId: nextUp.id,
