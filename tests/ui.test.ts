@@ -280,7 +280,10 @@ describe("ui", () => {
       fg: (colorName: string, text: string) => `${colorName}:${text}`,
     };
 
-    const widget = buildWidgetLines(blocked, 10, trackingTheme).join("\n");
+    const lines = buildWidgetLines(blocked, 10, trackingTheme);
+    const widget = lines.join("\n");
+    expect(lines[0]).toContain("Task run");
+    expect(lines[lines.length - 1]).toContain("1 group waiting · 1 task · 0 done");
     expect(widget).not.toContain("warning:");
     expect(widget).not.toContain(GLYPH_PAUSED);
 
@@ -316,11 +319,10 @@ describe("ui", () => {
 
   test("widget limit 2 with only an active task keeps the head or a collapsed tail", () => {
     const lines = buildWidgetLines(state, 2, undefined, { now: 61_000 });
-    const rendered = lines.join("\n");
 
     expect(lines).toHaveLength(2);
     expect(lines[0]).toContain("Tasked");
-    expect(rendered.includes("Main group · Do task") || /tasks|waiting/.test(rendered)).toBe(true);
+    expect(lines[1]).toContain("Main group · Do task");
   });
 
   test("widget limit 3 preserves needs-you ahead of active and next-up", () => {

@@ -551,11 +551,11 @@ export function buildWidgetLines(
     return [truncateToWidth(summary, COMPACT_WIDGET_MAX_WIDTH, "…")];
   }
 
-  let bodyBudget = limit - 1;
+  const bodyBudget = limit - 1;
   let included = allocateBodyLines(bodyBudget);
   let shownTaskIds = shownTaskIdsFrom(included);
   let tail = buildTailLine(taskRun, shownTaskIds, theme);
-  let remainingBudget = bodyBudget - included.reduce((sum, section) => sum + sectionLineCount(section), 0);
+  const remainingBudget = bodyBudget - included.reduce((sum, section) => sum + sectionLineCount(section), 0);
 
   if (tail && remainingBudget === 0) {
     const reservedBudget = bodyBudget - 1;
