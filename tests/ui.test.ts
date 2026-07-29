@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 
 import type { TaskedSubagentsState } from "../src/types.js";
-import { GLYPH_PAUSED, GLYPH_QUEUED } from "../src/ui/glyphs.js";
+import { GLYPH_ATTENTION, GLYPH_FAILED, GLYPH_PAUSED, GLYPH_QUEUED } from "../src/ui/glyphs.js";
 import { buildFooterStatus } from "../src/ui/status.js";
 import { buildTaskRunChecklistLines, buildWidgetLines, createWidgetContent } from "../src/ui/widget.js";
 import { statusLabel } from "../src/ui/messages.js";
@@ -303,6 +303,30 @@ describe("ui", () => {
     expect(lines[lines.length - 1]).toContain("2 groups waiting · 2 tasks · 0 done");
     expect(rendered).not.toContain("Wire pending dispatch");
     expect(rendered).not.toContain("CEF capture");
+  });
+
+  test("failed authoritative assignment renders failed glyph when task status is still attention", () => {
+    const mismatched = cloneState(state);
+    mismatched.taskRuns[0].status = "attention";
+    mismatched.taskRuns[0].tasks[0].status = "attention";
+    mismatched.taskRuns[0].tasks[0].text = "Stale attention task with failed assignment";
+    mismatched.taskRuns[0].assignments[0].status = "failed";
+    mismatched.taskRuns[0].assignments[0].result = {
+      assignmentId: "a1",
+      status: "failed",
+      summary: "assignment failed before task status caught up",
+      criteriaEvidence: [],
+      artifacts: [],
+      followUps: [],
+      createdAt: 2,
+    };
+
+    const lines = buildWidgetLines(mismatched, 10, undefined, { now: 61_000 });
+    const taskLine = lines.find((line) => line.includes("Stale attention task with failed assignment"));
+
+    expect(taskLine).toBeDefined();
+    expect(taskLine).toContain(GLYPH_FAILED);
+    expect(taskLine).not.toContain(GLYPH_ATTENTION);
   });
 
   test("attention reason falls back to stale note then last action", () => {

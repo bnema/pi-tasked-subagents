@@ -449,7 +449,11 @@ export function buildWidgetLines(
 
   for (const task of needsYou) {
     const assignment = assignmentForTask(taskRun, task);
-    const displayStatus = assignment?.status === "paused" ? "paused" : (task.status === "failed" ? "failed" : "attention");
+    const displayStatus = assignment?.status === "paused"
+      ? "paused"
+      : (assignment?.status === "failed" || task.status === "failed")
+        ? "failed"
+        : "attention";
     const children: string[] = [];
     const reason = attentionReason(assignment, now);
     if (reason) children.push(muted(reason, theme));
