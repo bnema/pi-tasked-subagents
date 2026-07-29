@@ -400,8 +400,7 @@ describe("ui", () => {
     expect(lines[0]).toContain("Multi attention wrap-up");
     expect(lines[1]).toContain("Review A · Actionable head A");
     expect(lines[2]).toContain("Review B · Actionable head B");
-    expect(lines[3]).toContain("waiting");
-    expect(lines[3]).toMatch(/group.*waiting|waiting/u);
+    expect(lines[3]).toMatch(/\b2 groups waiting\b/u);
     expect(rendered).not.toContain("Actionable head C");
     // Reason children may be omitted so same-tier heads survive under the reserved tail.
     expect(rendered).not.toContain("reason for A");
@@ -617,9 +616,9 @@ describe("ui", () => {
     const runLine = lines.find((line) => line.includes("Tasked"));
     const rendered = lines.join("\n");
 
-    expect(runLine).toContain("1/8");
-    expect(rendered).toContain("1 done");
-    expect(rendered).toContain("7 tasks");
+    expect(runLine).toMatch(/\b1\/8\b/u);
+    expect(rendered).toMatch(/\b1 done\b/u);
+    expect(rendered).toMatch(/\b7 tasks\b/u);
     expect(rendered).not.toContain("Task 1");
   });
 
