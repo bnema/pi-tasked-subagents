@@ -424,6 +424,17 @@ describe("ui", () => {
     expect(lines[1]).toContain("Main group · Do task");
   });
 
+  test("widget limit 2 preserves needs-you head instead of replacing it with waiting tail", () => {
+    const lines = buildWidgetLines(triageFixture(), 2, undefined, { now: 61_000 });
+    const rendered = lines.join("\n");
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("Execute stacked native Vim mode tranches");
+    expect(lines[1]).toContain("Phase 1 reviews · Quality review Phase 1");
+    expect(rendered).not.toContain("groups waiting");
+    expect(rendered).not.toContain("tasks waiting");
+  });
+
   test("widget limit 3 preserves needs-you ahead of active and next-up", () => {
     const lines = buildWidgetLines(triageFixture(), 3, undefined, { now: 61_000 });
     const rendered = lines.join("\n");

@@ -572,12 +572,16 @@ export function buildWidgetLines(
 
   if (tail && remainingBudget === 0) {
     const reservedBudget = bodyBudget - 1;
-    const reserved = allocateBodyLines(reservedBudget);
-    const reservedShown = shownTaskIdsFrom(reserved);
-    const reservedTail = buildTailLine(taskRun, reservedShown, theme);
-    if (reservedTail) {
-      included = reserved;
-      tail = reservedTail;
+    if (reservedBudget > 0) {
+      const reserved = allocateBodyLines(reservedBudget);
+      const reservedShown = shownTaskIdsFrom(reserved);
+      const reservedTail = buildTailLine(taskRun, reservedShown, theme);
+      if (reservedTail) {
+        included = reserved;
+        tail = reservedTail;
+      }
+    } else {
+      tail = undefined;
     }
   }
 
