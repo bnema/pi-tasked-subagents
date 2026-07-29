@@ -247,7 +247,7 @@ function buildTailLine(taskRun: TaskRunRecord, shownTaskIds: Set<string>, theme?
   const done = taskRun.tasks.filter((task) => taskDisplaysDone(taskRun, task)).length;
   const waitingTasks = taskRun.tasks.filter((task) =>
     !taskDisplaysDone(taskRun, task) && task.status !== "cancelled" && !shownTaskIds.has(task.id));
-  const waitingGroupCount = widgetGroups(taskRun).filter((group) => {
+  const waitingGroupCount = taskRun.groups.filter((group) => {
     const tasks = tasksForGroup(taskRun, group.id);
     const waitingInGroup = tasks.filter((task) =>
       !taskDisplaysDone(taskRun, task) && task.status !== "cancelled");

@@ -326,6 +326,32 @@ describe("ui", () => {
     expect(rendered).toContain("tool: bash");
   });
 
+  test("widget tail counts blocked ungrouped work as waiting task only, not waiting group", () => {
+    const s = cloneState(state);
+    const run = s.taskRuns[0];
+    run.title = "Ungrouped blocked";
+    run.status = "pending";
+    run.groups = [];
+    run.tasks = [{
+      id: "t-blocked",
+      text: "Waiting on upstream",
+      status: "blocked",
+      criteria: [],
+      dependsOn: [],
+      assignmentIds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+    run.assignments = [];
+
+    const lines = buildWidgetLines(s, 10, undefined, { now: 61_000 });
+    const tail = lines[lines.length - 1];
+
+    expect(tail).toContain("1 task waiting");
+    expect(tail).not.toContain("group waiting");
+    expect(tail).toContain("0 done");
+  });
+
   test("widget retains task identity while rendering the active assignment at task depth", () => {
     const lines = buildWidgetLines(state, 10, undefined, { now: 61_000 });
     const rendered = lines.join("\n");
